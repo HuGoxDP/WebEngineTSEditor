@@ -12,7 +12,7 @@ design/   JSX/CSS design mockup — visual reference guiding the app's redesign
 ```
 
 - `app/` was extracted from the engine repo (`WebEngineTS/editor/`). It depends on the
-  engine through `"WebEngineTS": "file:../../WebEngineTS"` and imports engine types via the
+  engine through the packed `"WebEngineTS": "./WebEngineTS-0.1.0.tgz"` and imports engine types via the
   bare `"WebEngineTS"` specifier (`SceneSerializer`, `GameObject`, component types, …).
 - `design/` is a static React/JSX + CSS mockup (`wets/`, `wets.css`, `WETS Editor.html`,
   `_preview.png`) — not wired to a build; use it as the styling/UX target.

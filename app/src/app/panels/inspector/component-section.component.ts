@@ -23,7 +23,7 @@ import { HistoryService } from '../../services/history.service';
 import { SceneService } from '../../services/scene.service';
 import { IconComponent } from '../../icon.component';
 import { ContextMenuComponent, type CtxItem } from '../../context-menu/context-menu.component';
-import type { Component as EngineComponent, GameObject } from 'WebEngineTS';
+import type { Component as EngineComponent } from 'WebEngineTS';
 
 /**
  * Renders one `@Serializable` component as a `.comp` section using the
