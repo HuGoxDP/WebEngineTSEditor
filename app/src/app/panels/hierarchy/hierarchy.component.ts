@@ -7,25 +7,16 @@ import {
     signal,
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
-import {
-    AmbientLight,
-    AudioListener,
-    AudioSource,
-    Camera,
-    Canvas as UICanvas,
-    DirectionalLight,
-    GameObject,
-    ParticleSystem,
-    PointLight,
-    SceneSerializer,
-    SpotLight,
-    type Component as EngineComponent,
-} from 'WebEngineTS';
+import { GameObject, SceneManager } from 'WebEngineTS';
 import { SceneService } from '../../services/scene.service';
 import { SelectionService } from '../../services/selection.service';
 import { HistoryService } from '../../services/history.service';
+import { ClipboardService } from '../../services/clipboard.service';
+import { CommandsService } from '../../services/commands.service';
 import { IconComponent } from '../../icon.component';
 import { ContextMenuComponent, type CtxItem } from '../../context-menu/context-menu.component';
+import { I18nService } from '../../i18n/i18n.service';
+import { TPipe } from '../../i18n/t.pipe';
 
 interface HierarchyNode {
     go: GameObject;
@@ -35,28 +26,26 @@ interface HierarchyNode {
     icon: string;
 }
 
-type CtorOf<T> = new (...args: any[]) => T;
-
 @Component({
     selector: 'app-hierarchy',
     standalone: true,
-    imports: [FormsModule, IconComponent, ContextMenuComponent],
+    imports: [FormsModule, IconComponent, ContextMenuComponent, TPipe],
     changeDetection: ChangeDetectionStrategy.OnPush,
     template: `
         <div class="hier-toolbar">
-            <button class="create-btn" (click)="openCreateMenu($event)" title="Create">
+            <button class="create-btn" (click)="openCreateMenu($event)" [title]="'hier.create' | t">
                 <wets-icon name="plus"></wets-icon>
                 <span class="caret">▾</span>
             </button>
             <div class="h-search">
                 <wets-icon name="search"></wets-icon>
-                <span class="cat">All <span style="font-size: 8px; opacity: 0.6;">▾</span></span>
+                <span class="cat">{{ 'hier.all' | t }} <span style="font-size: 8px; opacity: 0.6;">▾</span></span>
                 <span class="h-divider"></span>
                 <input type="text" placeholder=""
                     [ngModel]="filter()"
                     (ngModelChange)="filter.set($event)">
             </div>
-            <button class="panel-mode-btn" title="Panel mode">
+            <button class="panel-mode-btn" [title]="'hier.panelMode' | t">
                 <wets-icon name="rect"></wets-icon>
             </button>
         </div>
@@ -77,9 +66,9 @@ type CtorOf<T> = new (...args: any[]) => T;
                 <span class="go-ico">
                     <wets-icon name="gameobject"></wets-icon>
                 </span>
-                <span class="label">MainScene</span>
+                <span class="label">{{ sceneName() }}</span>
                 @if (history.canUndo()) {
-                    <span class="dirty" title="Unsaved changes"></span>
+                    <span class="dirty" [title]="'hier.unsaved' | t"></span>
                 }
             </li>
 
@@ -138,8 +127,17 @@ export class HierarchyComponent {
     public readonly scene = inject(SceneService);
     public readonly selection = inject(SelectionService);
     public readonly history = inject(HistoryService);
+    private readonly _clipboard = inject(ClipboardService);
+    private readonly _cmd = inject(CommandsService);
+    private readonly _i18n = inject(I18nService);
 
     public readonly filter = signal('');
+
+    /** Name of the scene shown as the tree's root row. */
+    public readonly sceneName = computed(() => {
+        this.scene.revision();
+        return SceneManager.activeScene.name;
+    });
 
     /** Instance id of the GO being renamed inline; -1 = none. */
     public readonly editingId = signal<number>(-1);
@@ -181,13 +179,10 @@ export class HierarchyComponent {
     public readonly menuX = signal(0);
     public readonly menuY = signal(0);
     public readonly menuItems = signal<CtxItem[]>([]);
-    /** GameObject the menu was opened against (null = empty area). */
-    private _ctxTarget: GameObject | null = null;
 
     public openMenuAt(e: MouseEvent, target: GameObject | null): void {
         e.preventDefault();
         e.stopPropagation();
-        this._ctxTarget = target;
         if (target) this.selection.select(target);
         this.menuItems.set(this._buildItems(target));
         this.menuX.set(e.clientX);
@@ -200,7 +195,6 @@ export class HierarchyComponent {
     public openCreateMenu(e: MouseEvent): void {
         e.preventDefault();
         e.stopPropagation();
-        this._ctxTarget = null;
         const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
         this.menuItems.set(this._buildItems(null));
         this.menuX.set(rect.left);
@@ -211,134 +205,19 @@ export class HierarchyComponent {
     // ── Menu builder ───────────────────────────────────────
 
     private _buildItems(target: GameObject | null): CtxItem[] {
+        const t = this._i18n.t.bind(this._i18n);
         const onTarget = !!target;
-        const items: CtxItem[] = [];
-
-        // Edit ops (mostly stubs — only Rename / Duplicate / Delete are wired)
-        items.push({ label: 'Cut',          shortcut: 'Ctrl+X', disabled: true });
-        items.push({ label: 'Copy',         shortcut: 'Ctrl+C', disabled: true });
-        items.push({ label: 'Paste',        shortcut: 'Ctrl+V', disabled: true });
-        items.push({ separator: true, label: null });
-        items.push({
-            label: 'Rename',
-            disabled: !onTarget,
-            action: () => this._rename(target!),
-        });
-        items.push({
-            label: 'Duplicate',
-            shortcut: 'Ctrl+D',
-            disabled: !onTarget,
-            action: () => this._duplicate(target!),
-        });
-        items.push({
-            label: 'Delete',
-            shortcut: 'Del',
-            disabled: !onTarget,
-            action: () => this._delete(target!),
-        });
-        items.push({ separator: true, label: null });
-
-        // Create
-        items.push({
-            label: 'Create Empty',
-            shortcut: 'Ctrl+Shift+N',
-            action: () => this._createEmpty(),
-        });
-
-        items.push({
-            label: 'Light',
-            children: [
-                { label: 'Directional Light', action: () => this._createWith('Directional Light', DirectionalLight as CtorOf<EngineComponent>) },
-                { label: 'Point Light',       action: () => this._createWith('Point Light',       PointLight       as CtorOf<EngineComponent>) },
-                { label: 'Spot Light',        action: () => this._createWith('Spot Light',        SpotLight        as CtorOf<EngineComponent>) },
-                { label: 'Ambient Light',     action: () => this._createWith('Ambient Light',     AmbientLight     as CtorOf<EngineComponent>) },
-            ],
-        });
-
-        items.push({
-            label: 'Audio',
-            children: [
-                { label: 'Audio Source',   action: () => this._createWith('Audio Source',   AudioSource   as CtorOf<EngineComponent>) },
-                { label: 'Audio Listener', action: () => this._createWith('Audio Listener', AudioListener as CtorOf<EngineComponent>) },
-            ],
-        });
-
-        items.push({
-            label: 'Effects',
-            children: [
-                { label: 'Particle System', action: () => this._createWith('Particle System', ParticleSystem as CtorOf<EngineComponent>) },
-            ],
-        });
-
-        items.push({
-            label: 'UI',
-            children: [
-                { label: 'Canvas', action: () => this._createWith('Canvas', UICanvas as CtorOf<EngineComponent>) },
-            ],
-        });
-
-        items.push({
-            label: 'Camera',
-            action: () => this._createWith('Camera', Camera as CtorOf<EngineComponent>),
-        });
-
-        return items;
-    }
-
-    // ── Actions ────────────────────────────────────────────
-
-    private _createEmpty(): void {
-        this.history.record('Create GameObject', () => {
-            const parent = this._ctxTarget;
-            const go = this.scene.createEmpty('GameObject');
-            if (parent) go.transform.parent = parent.transform;
-            this.selection.select(go);
-        });
-    }
-
-    private _createWith(name: string, ctor: CtorOf<EngineComponent>): void {
-        this.history.record(`Create ${name}`, () => {
-            const parent = this._ctxTarget;
-            const go = this.scene.createEmpty(name);
-            if (parent) go.transform.parent = parent.transform;
-            go.addComponent(ctor as any);
-            this.selection.select(go);
-        });
-    }
-
-    private _rename(go: GameObject): void {
-        const next = window.prompt('New name', go.name);
-        if (next === null || next === '') return;
-        this.history.record('Rename', () => {
-            this.scene.rename(go, next);
-        });
-    }
-
-    private _duplicate(go: GameObject): void {
-        this.history.record('Duplicate', () => {
-            const json = SceneSerializer.serializeGameObject(go);
-            // Append " (Clone)" to the name like Unity does.
-            json.name = `${json.name} (Clone)`;
-            const copy = SceneSerializer.deserializeGameObject(json);
-            const parent = go.transform.parent;
-            if (parent) copy.transform.parent = parent;
-            this.scene.notify();
-            this.selection.select(copy);
-        });
-    }
-
-    private _delete(go: GameObject): void {
-        this.history.record('Delete GameObject', () => {
-            if (this.selection.selected() === go) this.selection.clear();
-            this.scene.destroy(go);
-        });
-    }
-
-    public onCreate(): void {
-        // Compatibility — kept for any direct callers; opens the menu next to the button.
-        // Most callers should use openCreateMenu(MouseEvent).
-        this._ctxTarget = null;
-        this._createEmpty();
+        return [
+            { label: t('edit.cut'),   shortcut: 'Ctrl+X', disabled: !onTarget, action: () => this._cmd.cut() },
+            { label: t('edit.copy'),  shortcut: 'Ctrl+C', disabled: !onTarget, action: () => this._cmd.copy() },
+            { label: t('edit.paste'), shortcut: 'Ctrl+V', disabled: !this._clipboard.hasContent(), action: () => this._cmd.paste() },
+            { separator: true, label: null },
+            { label: t('edit.rename'), disabled: !onTarget, action: () => void this._cmd.rename(target!) },
+            { label: t('edit.duplicate'), shortcut: 'Ctrl+D', disabled: !onTarget, action: () => this._cmd.duplicate([target!]) },
+            { label: t('edit.delete'), shortcut: 'Del', disabled: !onTarget, action: () => this._cmd.deleteObjects([target!]) },
+            { separator: true, label: null },
+            ...this._cmd.createMenu(target),
+        ];
     }
 
     // ── Multi-select click handling ────────────────────────

@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "start": "ng serve --port 4200",
-    "build": "ng build"
+    "build": "ng build",
+    "e2e": "node e2e/run.mjs"
   },
   "dependencies": {
     "@angular/common": "^19.1.0",

@@ -52,6 +52,30 @@
   --panel-border: 1px solid var(--line);
 }
 
+/* ─── theme and density ──────────────────────────────────────
+   Set on <html> by SettingsService. Values come from design/wets/app.jsx. */
+:root[data-theme="light"] {
+  --bg-0: #f3f4f7;
+  --bg-1: #ffffff;
+  --bg-2: #eceef3;
+  --bg-3: #e2e4ea;
+  --bg-4: #d3d6de;
+  --bg-5: #bec2cc;
+  --line: #dcdee4;
+  --line-2: #c8ccd4;
+  --fg-0: #1e2026;
+  --fg-1: #41434a;
+  --fg-2: #6b6e77;
+  --fg-3: #9a9da5;
+  --accent-bg: rgba(255, 159, 42, 0.16);
+  --accent-bg-strong: rgba(255, 159, 42, 0.28);
+}
+:root[data-density="comfy"] {
+  --row-h: 26px;
+  --ctrl-h: 24px;
+  --pad: 8px;
+}
+
 /* ─── base ───────────────────────────────────────────────── */
 * { box-sizing: border-box; }
 html, body, app-root {
@@ -640,7 +664,8 @@ body.resizing { cursor: inherit !important; user-select: none; }
 }
 .vp-overlay-tl {
   position: absolute;
-  left: 12px; top: 10px;
+  /* Right of the tool palette (12px + 34px wide), which it used to sit under. */
+  left: 54px; top: 12px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -650,17 +675,19 @@ body.resizing { cursor: inherit !important; user-select: none; }
   z-index: 4;
   pointer-events: none;
 }
+/* The canvas is dark in every theme, so these chips carry their own dark
+   palette rather than the theme's — light-theme text on them was unreadable. */
 .vp-overlay-tl .chip {
   background: rgba(20,22,27,0.7);
   backdrop-filter: blur(4px);
-  border: 1px solid var(--line);
+  border: 1px solid rgba(255,255,255,0.12);
   border-radius: var(--radius);
   padding: 2px 6px;
   display: inline-flex; gap: 6px;
   width: fit-content;
 }
-.vp-overlay-tl .chip .k { color: var(--fg-3); }
-.vp-overlay-tl .chip .v { color: var(--fg-0); }
+.vp-overlay-tl .chip .k { color: #7e8089; }
+.vp-overlay-tl .chip .v { color: #e8e8ea; }
 
 /* ─── Inspector ──────────────────────────────────────────── */
 .insp-head {

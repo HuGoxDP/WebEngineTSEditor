@@ -1,20 +1,21 @@
 import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
 import { ConsoleService } from '../../services/console.service';
 import { IconComponent } from '../../icon.component';
+import { TPipe } from '../../i18n/t.pipe';
 
 /** Editor console — captured `console.*` output with filters. */
 @Component({
     selector: 'app-console',
     standalone: true,
-    imports: [IconComponent],
+    imports: [IconComponent, TPipe],
     changeDetection: ChangeDetectionStrategy.OnPush,
     template: `
         <div class="cons">
             <div class="cons-toolbar">
-                <button class="cons-btn" (click)="logs.clear()">Clear</button>
+                <button class="cons-btn" (click)="logs.clear()">{{ 'cons.clear' | t }}</button>
                 <button class="cons-toggle"
                     [class.on]="logs.collapse()"
-                    (click)="logs.collapse.set(!logs.collapse())">Collapse</button>
+                    (click)="logs.collapse.set(!logs.collapse())">{{ 'cons.collapse' | t }}</button>
                 <div class="cons-spacer"></div>
                 <button class="cons-toggle info"
                     [class.on]="logs.showInfo()"
@@ -54,7 +55,7 @@ import { IconComponent } from '../../icon.component';
                         <span class="src">{{ e.source }}</span>
                     </div>
                 } @empty {
-                    <div class="cons-empty">Console is empty.</div>
+                    <div class="cons-empty">{{ 'cons.empty' | t }}</div>
                 }
             </div>
         </div>

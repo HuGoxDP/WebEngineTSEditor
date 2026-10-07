@@ -18,29 +18,28 @@ import { ComponentRegistryService } from '../../services/component-registry.serv
 import { HistoryService } from '../../services/history.service';
 import { ComponentSectionComponent } from './component-section.component';
 import { IconComponent } from '../../icon.component';
+import { I18nService } from '../../i18n/i18n.service';
+import { TPipe } from '../../i18n/t.pipe';
 
 interface EulerDeg { x: number; y: number; z: number; }
 
 @Component({
     selector: 'app-inspector',
     standalone: true,
-    imports: [FormsModule, ComponentSectionComponent, IconComponent],
+    imports: [FormsModule, ComponentSectionComponent, IconComponent, TPipe],
     changeDetection: ChangeDetectionStrategy.OnPush,
     template: `
         @if (!go()) {
-            <div class="insp-empty">Select a GameObject to inspect.</div>
+            <div class="insp-empty">{{ 'insp.empty' | t }}</div>
         } @else if (multi()) {
             <div class="insp-multi">
-                <strong>{{ selection.count() }} GameObjects selected</strong>
-                <div class="hint">
-                    Multi-edit isn't supported yet.
-                    Pick a single object to edit its properties.
-                </div>
+                <strong>{{ multiLabel() }}</strong>
+                <div class="hint">{{ 'insp.multiHint' | t }}</div>
             </div>
         } @else {
             <!-- Head: enable · icon · name · static -->
             <div class="insp-head">
-                <div class="enable on" title="Active in hierarchy"></div>
+                <div class="enable on" [title]="'insp.active' | t"></div>
                 <div class="ico">
                     <wets-icon name="gameobject"></wets-icon>
                 </div>
@@ -48,15 +47,15 @@ interface EulerDeg { x: number; y: number; z: number; }
                     [ngModel]="go()!.name"
                     (ngModelChange)="onRename($event)"
                     spellcheck="false">
-                <span class="dim" style="font-size: 10px; color: var(--fg-2);">Static</span>
+                <span class="dim" style="font-size: 10px; color: var(--fg-2);">{{ 'insp.static' | t }}</span>
             </div>
 
             <!-- Meta row: Tag · Layer (placeholders for now) -->
             <div class="insp-meta">
-                <span>Tag</span>
+                <span>{{ 'insp.tag' | t }}</span>
                 <div class="pill">{{ go()!.name }} <span>▾</span></div>
-                <span>Layer</span>
-                <div class="pill">Default <span>▾</span></div>
+                <span>{{ 'insp.layer' | t }}</span>
+                <div class="pill">{{ 'insp.default' | t }} <span>▾</span></div>
             </div>
 
             <div class="insp-body">
@@ -72,7 +71,7 @@ interface EulerDeg { x: number; y: number; z: number; }
                         </span>
                         <span class="title">Transform</span>
                         <div class="actions">
-                            <span class="a-btn" title="Reset">
+                            <span class="a-btn" [title]="'insp.reset' | t">
                                 <wets-icon name="reset"></wets-icon>
                             </span>
                             <span class="a-btn">
@@ -82,7 +81,7 @@ interface EulerDeg { x: number; y: number; z: number; }
                     </div>
                     <div class="comp-body">
                         <div class="field">
-                            <label>Position</label>
+                            <label>{{ 'insp.position' | t }}</label>
                             <div class="vec n3">
                                 <span class="axis x">X</span>
                                 <div class="wrap">
@@ -103,7 +102,7 @@ interface EulerDeg { x: number; y: number; z: number; }
                         </div>
 
                         <div class="field">
-                            <label>Rotation</label>
+                            <label>{{ 'insp.rotation' | t }}</label>
                             <div class="vec n3">
                                 <span class="axis x">X</span>
                                 <div class="wrap">
@@ -124,7 +123,7 @@ interface EulerDeg { x: number; y: number; z: number; }
                         </div>
 
                         <div class="field">
-                            <label>Scale</label>
+                            <label>{{ 'insp.scale' | t }}</label>
                             <div class="vec n3">
                                 <span class="axis x">X</span>
                                 <div class="wrap">
@@ -156,13 +155,13 @@ interface EulerDeg { x: number; y: number; z: number; }
                     @if (!addOpen()) {
                         <button class="add-comp" (click)="addOpen.set(true)">
                             <wets-icon name="plus"></wets-icon>
-                            <span>Add Component</span>
+                            <span>{{ 'insp.addComponent' | t }}</span>
                         </button>
                     } @else {
                         <div class="add-menu">
                             <input
                                 type="text"
-                                placeholder="Search components..."
+                                [placeholder]="'insp.searchComponents' | t"
                                 [ngModel]="addFilter()"
                                 (ngModelChange)="addFilter.set($event)"
                                 (keydown.escape)="addOpen.set(false)"
@@ -173,10 +172,10 @@ interface EulerDeg { x: number; y: number; z: number; }
                                     <li (click)="onAddComponent(c)">{{ c.name }}</li>
                                 }
                                 @if (filteredComponents().length === 0) {
-                                    <li class="empty-hint">No components match.</li>
+                                    <li class="empty-hint">{{ 'insp.noMatch' | t }}</li>
                                 }
                             </ul>
-                            <button class="cancel" (click)="addOpen.set(false)">Cancel</button>
+                            <button class="cancel" (click)="addOpen.set(false)">{{ 'dialog.cancel' | t }}</button>
                         </div>
                     }
                 </div>
@@ -199,6 +198,9 @@ export class InspectorComponent {
 
     /** True when more than one GameObject is selected. */
     public readonly multi = computed<boolean>(() => this._selection.count() > 1);
+
+    private readonly _i18n = inject(I18nService);
+    public readonly multiLabel = computed(() => this._i18n.tp('insp.multi', this._selection.count()));
 
     public readonly pos = computed(() => {
         const g = this.go();

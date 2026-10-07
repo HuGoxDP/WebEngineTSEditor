@@ -12,7 +12,12 @@ import {
 } from '@angular/core';
 import { IconComponent } from '../../icon.component';
 import { ContextMenuComponent, type CtxItem } from '../../context-menu/context-menu.component';
+import { CommandsService } from '../../services/commands.service';
 import { ProjectService, type ProjectEntry } from '../../services/project.service';
+import { SettingsService } from '../../services/settings.service';
+import { DialogService } from '../../dialogs/dialog.service';
+import { I18nService } from '../../i18n/i18n.service';
+import { TPipe } from '../../i18n/t.pipe';
 
 /** Images above this size are not decoded just to draw a 52px thumbnail. */
 const THUMB_MAX_BYTES = 8 * 1024 * 1024;
@@ -28,49 +33,43 @@ const THUMB_MAX_BYTES = 8 * 1024 * 1024;
 @Component({
     selector: 'app-project',
     standalone: true,
-    imports: [IconComponent, ContextMenuComponent],
+    imports: [IconComponent, ContextMenuComponent, TPipe],
     changeDetection: ChangeDetectionStrategy.OnPush,
     template: `
         @switch (project.status()) {
             @case ('unsupported') {
                 <div class="proj-empty">
-                    <div class="title">Project folders are not available in this browser</div>
-                    <div class="hint">
-                        The editor keeps projects on your computer, which needs Chrome or Edge
-                        and a page opened over HTTPS or from localhost.
-                    </div>
+                    <div class="title">{{ 'proj.unsupportedTitle' | t }}</div>
+                    <div class="hint">{{ 'proj.unsupportedHint' | t }}</div>
                 </div>
             }
             @case ('closed') {
                 <div class="proj-empty">
-                    <div class="title">No project open</div>
-                    <div class="hint">
-                        A project is a folder on your computer. Nothing is uploaded
-                        until you publish a scenario.
-                    </div>
+                    <div class="title">{{ 'proj.noneTitle' | t }}</div>
+                    <div class="hint">{{ 'proj.noneHint' | t }}</div>
                     <button class="proj-btn primary" (click)="onOpenProject()">
                         <wets-icon name="folder"></wets-icon>
-                        <span>Open project folder…</span>
+                        <span>{{ 'proj.openFolder' | t }}</span>
                     </button>
                 </div>
             }
             @case ('needs-permission') {
                 <div class="proj-empty">
                     <div class="title">{{ project.name() }}</div>
-                    <div class="hint">The browser asks for access to the folder again after a reload.</div>
+                    <div class="hint">{{ 'proj.reconnectHint' | t }}</div>
                     <div class="row">
                         <button class="proj-btn primary" (click)="onReconnect()">
                             <wets-icon name="folder"></wets-icon>
-                            <span>Reconnect</span>
+                            <span>{{ 'proj.reconnect' | t }}</span>
                         </button>
-                        <button class="proj-btn" (click)="onOpenProject()">Open another folder…</button>
+                        <button class="proj-btn" (click)="onOpenProject()">{{ 'proj.openAnother' | t }}</button>
                     </div>
                 </div>
             }
             @case ('open') {
                 <div class="proj">
                     <div class="folders">
-                        <div class="folder-group">PROJECT</div>
+                        <div class="folder-group">{{ 'proj.section' | t }}</div>
                         @for (f of project.folders(); track f.path) {
                             <div class="folder"
                                 [class.active]="active() === f.path"
@@ -95,14 +94,14 @@ const THUMB_MAX_BYTES = 8 * 1024 * 1024;
                                 <span class="c" [class.here]="last" (click)="navigate(c.path)">{{ c.label }}</span>
                                 @if (!last) { <span class="sep">›</span> }
                             }
-                            <span class="counter">{{ entries().length }} items</span>
-                            <button class="proj-btn icon" title="New folder" (click)="onNewFolder()">
+                            <span class="counter">{{ itemsLabel() }}</span>
+                            <button class="proj-btn icon" [title]="'proj.newFolder' | t" (click)="onNewFolder()">
                                 <wets-icon name="plus"></wets-icon>
                             </button>
-                            <button class="proj-btn icon" title="Import files into this folder" (click)="picker.click()">
+                            <button class="proj-btn icon" [title]="'proj.import' | t" (click)="picker.click()">
                                 <wets-icon name="file-new"></wets-icon>
                             </button>
-                            <button class="proj-btn icon" title="Refresh from disk" (click)="project.refresh()">
+                            <button class="proj-btn icon" [title]="'proj.refresh' | t" (click)="project.refresh()">
                                 <wets-icon name="reset"></wets-icon>
                             </button>
                             <input #picker type="file" multiple hidden (change)="onPicked(picker)">
@@ -130,10 +129,10 @@ const THUMB_MAX_BYTES = 8 * 1024 * 1024;
                             }
                             @if (entries().length === 0) {
                                 <div class="empty-grid">
-                                    Empty folder — drop files here.
+                                    {{ 'proj.emptyFolder' | t }}
                                     @if (active() === '' && !isLaidOut()) {
                                         <div class="row">
-                                            <button class="proj-btn" (click)="onInitialize()">Set up as a scenario project</button>
+                                            <button class="proj-btn" (click)="onInitialize()">{{ 'proj.setupLayout' | t }}</button>
                                         </div>
                                     }
                                 </div>
@@ -157,6 +156,10 @@ const THUMB_MAX_BYTES = 8 * 1024 * 1024;
 export class ProjectComponent implements OnDestroy {
 
     public readonly project = inject(ProjectService);
+    private readonly _cmd = inject(CommandsService);
+    private readonly _dialog = inject(DialogService);
+    private readonly _settings = inject(SettingsService);
+    private readonly _i18n = inject(I18nService);
 
     /** A file the user asked to open — the shell decides what opening means. */
     @Output() public readonly openEntry = new EventEmitter<ProjectEntry>();
@@ -178,6 +181,8 @@ export class ProjectComponent implements OnDestroy {
         this.project.revision();
         return this.project.list(this.active());
     });
+
+    public readonly itemsLabel = computed(() => this._i18n.tp('proj.items', this.entries().length));
 
     public readonly crumbs = computed(() => {
         const out = [{ label: this.project.name(), path: '' }];
@@ -243,38 +248,51 @@ export class ProjectComponent implements OnDestroy {
     // ── Project actions ──────────────────────────────────────────────
 
     public onOpenProject(): void {
-        this._run(async () => { await this.project.open(); this.navigate(''); });
+        this._cmd.run(async () => { await this.project.open(); this.navigate(''); });
     }
 
     public onReconnect(): void {
-        this._run(() => this.project.reconnect());
+        this._cmd.run(() => this.project.reconnect());
     }
 
     public onInitialize(): void {
-        this._run(() => this.project.initializeLayout());
+        this._cmd.run(() => this.project.initializeLayout());
     }
 
-    public onNewFolder(): void {
-        const name = prompt('Folder name', 'New Folder')?.trim();
-        if (!name) return;
-        if (/[\\/:*?"<>|]/.test(name) || name === '.' || name === '..') {
-            alert(`"${name}" is not a valid folder name.`);
-            return;
-        }
-        this._run(() => this.project.createFolder(this._join(name)));
+    public async onNewFolder(): Promise<void> {
+        const name = await this._dialog.prompt({
+            title: this._i18n.t('proj.folderTitle'),
+            label: this._i18n.t('proj.folderLabel'),
+            value: this._i18n.t('proj.folderDefault'),
+            confirmLabel: this._i18n.t('proj.create'),
+            cancelLabel: this._i18n.t('dialog.cancel'),
+            validate: v => /[\\/:*?"<>|]/.test(v) || v === '.' || v === '..'
+                ? this._i18n.t('proj.invalidName', { name: v })
+                : null,
+        });
+        if (name === null) return;
+        this._cmd.run(() => this.project.createFolder(this._join(name)));
     }
 
     public onPicked(input: HTMLInputElement): void {
         const files = Array.from(input.files ?? []);
         input.value = '';
-        if (files.length > 0) this._run(() => this.project.importFiles(this.active(), files));
+        if (files.length > 0) this._cmd.run(() => this.project.importFiles(this.active(), files));
     }
 
-    public onDelete(entry: ProjectEntry): void {
-        const what = entry.kind === 'folder' ? 'folder and everything in it' : 'file';
-        if (!confirm(`Delete the ${what} "${entry.path}" from disk? This cannot be undone.`)) return;
+    public async onDelete(entry: ProjectEntry): Promise<void> {
+        if (this._settings.confirmDelete()) {
+            const sure = await this._dialog.confirm({
+                title: this._i18n.t('proj.deleteTitle'),
+                message: this._i18n.t(entry.kind === 'folder' ? 'proj.deleteFolder' : 'proj.deleteFile', { path: entry.path }),
+                confirmLabel: this._i18n.t('proj.delete'),
+                cancelLabel: this._i18n.t('dialog.cancel'),
+                danger: true,
+            });
+            if (!sure) return;
+        }
         this.selected.set(null);
-        this._run(() => this.project.remove(entry.path));
+        this._cmd.run(() => this.project.remove(entry.path));
     }
 
     // ── Drag and drop from the OS ────────────────────────────────────
@@ -290,7 +308,7 @@ export class ProjectComponent implements OnDestroy {
         e.preventDefault();
         this.dropping.set(false);
         const files = Array.from(e.dataTransfer?.files ?? []);
-        if (files.length > 0) this._run(() => this.project.importFiles(this.active(), files));
+        if (files.length > 0) this._cmd.run(() => this.project.importFiles(this.active(), files));
     }
 
     // ── Context menu ─────────────────────────────────────────────────
@@ -300,17 +318,18 @@ export class ProjectComponent implements OnDestroy {
         e.stopPropagation();
         if (entry) this.selected.set(entry.path);
 
+        const t = this._i18n.t.bind(this._i18n);
         const items: CtxItem[] = [];
         if (entry) {
-            items.push({ label: 'Open', action: () => this.onOpenEntry(entry) });
-            items.push({ label: 'Delete', action: () => this.onDelete(entry) });
+            items.push({ label: t('proj.open'), action: () => this.onOpenEntry(entry) });
+            items.push({ label: t('proj.delete'), action: () => void this.onDelete(entry) });
             items.push({ separator: true, label: null });
         }
-        items.push({ label: 'New Folder', action: () => this.onNewFolder() });
-        items.push({ label: 'Refresh', action: () => void this.project.refresh() });
+        items.push({ label: t('proj.newFolderMenu'), action: () => void this.onNewFolder() });
+        items.push({ label: t('proj.refreshMenu'), action: () => void this.project.refresh() });
         items.push({ separator: true, label: null });
-        items.push({ label: 'Open Another Project…', action: () => this.onOpenProject() });
-        items.push({ label: 'Close Project', action: () => void this.project.close() });
+        items.push({ label: t('proj.openAnotherMenu'), action: () => this.onOpenProject() });
+        items.push({ label: t('proj.closeProject'), action: () => this._cmd.closeProject() });
 
         this.ctxItems.set(items);
         this.ctxX.set(e.clientX);
@@ -323,14 +342,6 @@ export class ProjectComponent implements OnDestroy {
     private _join(name: string): string {
         const base = this.active();
         return base ? `${base}/${name}` : name;
-    }
-
-    /** Disk operations fail for ordinary reasons (permission revoked, file locked) — say so. */
-    private _run(action: () => Promise<unknown>): void {
-        action().catch(err => {
-            console.error('[Project]', err);
-            alert(`Project: ${(err as Error)?.message ?? err}`);
-        });
     }
 
     private _thumbRun = 0;

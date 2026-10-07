@@ -171,9 +171,18 @@ export class ViewportService {
         this._camera = null;
     }
 
+    /** Active gizmo tool — drives the toolbar toggle and the viewport overlay. */
+    public readonly tool = signal<GizmoMode>('translate');
+
     /** Sets the gizmo mode. Keyboard shortcuts: W translate, E rotate, R scale. */
     public setGizmoMode(mode: GizmoMode): void {
         this._gizmo?.setMode(mode);
+    }
+
+    /** Switches tool: the signal for the UI, and the gizmo itself. */
+    public setTool(mode: GizmoMode): void {
+        this.tool.set(mode);
+        this.setGizmoMode(mode);
     }
 
     /** The editor camera. Used by selection raycasting in later milestones. */

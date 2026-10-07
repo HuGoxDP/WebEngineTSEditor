@@ -24,6 +24,8 @@ import { SceneService } from '../../services/scene.service';
 import { IconComponent } from '../../icon.component';
 import { ContextMenuComponent, type CtxItem } from '../../context-menu/context-menu.component';
 import type { Component as EngineComponent } from 'WebEngineTS';
+import { I18nService } from '../../i18n/i18n.service';
+import { TPipe } from '../../i18n/t.pipe';
 
 /**
  * Renders one `@Serializable` component as a `.comp` section using the
@@ -33,7 +35,7 @@ import type { Component as EngineComponent } from 'WebEngineTS';
 @Component({
     selector: 'app-component-section',
     standalone: true,
-    imports: [FormsModule, IconComponent, ContextMenuComponent],
+    imports: [FormsModule, IconComponent, ContextMenuComponent, TPipe],
     changeDetection: ChangeDetectionStrategy.OnPush,
     template: `
         <div class="comp">
@@ -47,10 +49,10 @@ import type { Component as EngineComponent } from 'WebEngineTS';
                 </span>
                 <span class="title">{{ typeName }}</span>
                 <div class="actions" (click)="$event.stopPropagation()">
-                    <span class="a-btn" title="Reset" (click)="onReset()">
+                    <span class="a-btn" [title]="'comp.reset' | t" (click)="onReset()">
                         <wets-icon name="reset"></wets-icon>
                     </span>
-                    <span class="a-btn" title="Component menu" #kebab
+                    <span class="a-btn" [title]="'comp.menu' | t" #kebab
                         (click)="openCompMenu($event, kebab)">
                         <wets-icon name="more"></wets-icon>
                     </span>
@@ -217,11 +219,11 @@ import type { Component as EngineComponent } from 'WebEngineTS';
                                     <span class="ref-label" (click)="togglePicker(field)">
                                         {{ gameObjectRefLabel(field) }}
                                     </span>
-                                    <button class="ref-btn" title="Pick"
+                                    <button class="ref-btn" [title]="'comp.pick' | t"
                                         (click)="togglePicker(field)">
                                         <wets-icon name="pick"></wets-icon>
                                     </button>
-                                    <button class="ref-btn" title="Clear"
+                                    <button class="ref-btn" [title]="'comp.clear' | t"
                                         [disabled]="raw(field) === null"
                                         (click)="setRaw(field, null)">
                                         <wets-icon name="cross"></wets-icon>
@@ -230,7 +232,7 @@ import type { Component as EngineComponent } from 'WebEngineTS';
                                 @if (isPickerOpen(field)) {
                                     <ul class="ref-picker">
                                         <li (click)="setGameObjectRef(field, null)">
-                                            <em>(None)</em>
+                                            <em>{{ 'comp.none' | t }}</em>
                                         </li>
                                         @for (entry of allGameObjects(); track entry.go.getInstanceID()) {
                                             <li [style.padding-left.px]="8 + entry.depth * 12"
@@ -249,11 +251,11 @@ import type { Component as EngineComponent } from 'WebEngineTS';
                                         <wets-icon name="folder"></wets-icon>
                                     </span>
                                     <span class="ref-label">{{ assetRefLabel(field) }}</span>
-                                    <button class="ref-btn" title="Pick file"
+                                    <button class="ref-btn" [title]="'comp.pickFile' | t"
                                         (click)="pickAsset(field)">
                                         <wets-icon name="more"></wets-icon>
                                     </button>
-                                    <button class="ref-btn" title="Clear"
+                                    <button class="ref-btn" [title]="'comp.clear' | t"
                                         [disabled]="!raw(field)"
                                         (click)="setRaw(field, null)">
                                         <wets-icon name="cross"></wets-icon>
@@ -281,6 +283,7 @@ export class ComponentSectionComponent {
     private readonly _selection = inject(SelectionService);
     private readonly _history = inject(HistoryService);
     private readonly _scene = inject(SceneService);
+    private readonly _i18n = inject(I18nService);
 
     public readonly open = signal(true);
 
@@ -297,15 +300,15 @@ export class ComponentSectionComponent {
         this.menuX.set(rect.left);
         this.menuY.set(rect.bottom + 2);
         this.menuItems.set([
-            { label: 'Reset',  action: () => this.onReset() },
+            { label: this._i18n.t('comp.reset'),  action: () => this.onReset() },
             { separator: true, label: null },
-            { label: 'Move Up',   disabled: true },
-            { label: 'Move Down', disabled: true },
+            { label: this._i18n.t('comp.moveUp'),   disabled: true },
+            { label: this._i18n.t('comp.moveDown'), disabled: true },
             { separator: true, label: null },
-            { label: 'Copy Component',          disabled: true },
-            { label: 'Paste Component Values', disabled: true },
+            { label: this._i18n.t('comp.copy'),        disabled: true },
+            { label: this._i18n.t('comp.pasteValues'), disabled: true },
             { separator: true, label: null },
-            { label: 'Remove Component', action: () => this.onRemove() },
+            { label: this._i18n.t('comp.remove'), action: () => this.onRemove() },
         ]);
         queueMicrotask(() => this.menuOpen.set(true));
     }
