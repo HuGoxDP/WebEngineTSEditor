@@ -27,6 +27,7 @@ import { ComponentRegistryService } from './services/component-registry.service'
 import { ConsoleService } from './services/console.service';
 import { ClipboardService } from './services/clipboard.service';
 import { LayoutService } from './services/layout.service';
+import { ProjectService, type ProjectEntry } from './services/project.service';
 import { SceneSerializer } from 'WebEngineTS';
 import type { SerializedScene, GameObject } from 'WebEngineTS';
 
@@ -53,9 +54,9 @@ import type { SerializedScene, GameObject } from 'WebEngineTS';
                     >{{ m.name }}</div>
                 }
                 <div class="spacer"></div>
-                <div class="project-tag">
+                <div class="project-tag" [title]="project.scenePath() ?? ''">
                     <span class="dot"></span>
-                    <span>main</span>
+                    <span>{{ project.isOpen() ? project.name() : 'no project' }}</span>
                 </div>
             </header>
 
@@ -257,7 +258,7 @@ import type { SerializedScene, GameObject } from 'WebEngineTS';
                     </div>
                     <div class="pane-body">
                         @if (bottomTab() === 'project') {
-                            <app-project></app-project>
+                            <app-project (openEntry)="onOpenProjectEntry($event)"></app-project>
                         } @else {
                             <app-console></app-console>
                         }
@@ -308,6 +309,7 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     public readonly play = inject(PlayModeService);
     public readonly history = inject(HistoryService);
     private readonly _clipboard = inject(ClipboardService);
+    public readonly project = inject(ProjectService);
 
     constructor() {
         // End the current "edit session" any time the active selection changes
@@ -425,12 +427,18 @@ export class AppComponent implements AfterViewInit, OnDestroy {
     }
 
     private _fileMenu(): CtxItem[] {
+        const supported = this.project.status() !== 'unsupported';
         return [
+            { label: 'Open Project…', disabled: !supported,
+                action: () => void this.project.open().catch(err => alert(`Project: ${err?.message ?? err}`)) },
+            { label: 'Close Project', disabled: !this.project.isOpen(),
+                action: () => void this.project.close() },
+            { separator: true, label: null },
             { label: 'New Scene',  shortcut: 'Ctrl+N',       action: () => this.onNew() },
             { label: 'Open Scene…',shortcut: 'Ctrl+O',       action: () => this.onOpen() },
             { separator: true, label: null },
             { label: 'Save',       shortcut: 'Ctrl+S',       action: () => this.onSave() },
-            { label: 'Save As…',   shortcut: 'Ctrl+Shift+S', action: () => this.onSave() },
+            { label: 'Save As…',   shortcut: 'Ctrl+Shift+S', action: () => this.onSaveAs() },
             { separator: true, label: null },
             { label: 'Build Settings…', disabled: true },
             { label: 'Build',           disabled: true },
@@ -649,6 +657,13 @@ export class AppComponent implements AfterViewInit, OnDestroy {
             return;
         }
 
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+            e.preventDefault();
+            if (e.shiftKey) this.onSaveAs();
+            else            this.onSave();
+            return;
+        }
+
         if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'n') {
             e.preventDefault();
             this.onCreateEmpty();
@@ -803,30 +818,87 @@ export class AppComponent implements AfterViewInit, OnDestroy {
         this.selection.clear();
         this._scene.clear();
         this.history.clear();
+        this.project.scenePath.set(null);
     }
 
+    /**
+     * Saves the scene into the open project — to the file it was opened from,
+     * or `assets/scenes/main.scene.json` the first time. With no project open
+     * there is nowhere to write, so the scene is downloaded instead.
+     */
     public onSave(): void {
-        const json = this._scene.serialize();
-        const fileName = `${json.name || 'scene'}.scene.json`;
-        this._fileIo.saveText(fileName, JSON.stringify(json, null, 2));
+        const text = JSON.stringify(this._scene.serialize(), null, 2);
+        if (!this.project.isOpen()) {
+            this._fileIo.saveText('main.scene.json', text);
+            return;
+        }
+        const path = this.project.scenePath() ?? 'assets/scenes/main.scene.json';
+        this._writeScene(path, text);
+    }
+
+    public onSaveAs(): void {
+        if (!this.project.isOpen()) {
+            this.onSave();
+            return;
+        }
+        const name = prompt('Scene name', 'main')?.trim();
+        if (!name) return;
+        if (/[\\/:*?"<>|]/.test(name)) {
+            alert(`"${name}" is not a valid file name.`);
+            return;
+        }
+        const text = JSON.stringify(this._scene.serialize(), null, 2);
+        this._writeScene(`assets/scenes/${name.replace(/\.scene\.json$/i, '')}.scene.json`, text);
+    }
+
+    private _writeScene(path: string, text: string): void {
+        this.project.write(path, `${text}\n`).then(
+            () => {
+                this.project.scenePath.set(path);
+                console.log(`[Editor] Saved ${path}`);
+            },
+            err => alert(`Could not save ${path}: ${err?.message ?? err}`),
+        );
     }
 
     public async onOpen(): Promise<void> {
         const file = await this._fileIo.openText('.json,.scene.json');
         if (!file) return;
-        let data: SerializedScene;
+        // A scene picked from outside the project has no place in it yet.
+        if (this._loadSceneText(file.name, file.text)) this.project.scenePath.set(null);
+    }
+
+    /** A file double-clicked in the Project panel. Only scenes open so far. */
+    public async onOpenProjectEntry(entry: ProjectEntry): Promise<void> {
+        if (entry.kind !== 'scene') return;
+        if (this._scene.roots().length > 0 && this.history.canUndo() &&
+            !confirm('Discard all unsaved changes?')) return;
+        let text: string;
         try {
-            data = JSON.parse(file.text) as SerializedScene;
-        } catch {
-            alert(`Failed to parse ${file.name}: not valid JSON.`);
+            text = await this.project.readText(entry.path);
+        } catch (err) {
+            alert(`Could not read ${entry.path}: ${(err as Error)?.message ?? err}`);
             return;
         }
+        if (this._loadSceneText(entry.name, text)) this.project.scenePath.set(entry.path);
+    }
+
+    /** Replaces the scene with the one in `text`. Returns false if it is not a scene. */
+    private _loadSceneText(name: string, text: string): boolean {
+        let data: SerializedScene;
+        try {
+            data = JSON.parse(text) as SerializedScene;
+        } catch {
+            alert(`Failed to parse ${name}: not valid JSON.`);
+            return false;
+        }
         if (!data || typeof data !== 'object' || data.version !== 1 || !Array.isArray(data.roots)) {
-            alert(`${file.name} is not a valid scene file.`);
-            return;
+            alert(`${name} is not a valid scene file.`);
+            return false;
         }
         this.selection.clear();
         this._scene.loadFromJSON(data);
         this.history.clear();
+        return true;
     }
 }

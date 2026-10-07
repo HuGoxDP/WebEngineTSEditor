@@ -27,7 +27,15 @@
               "budgets": [
                 { "type": "initial", "maximumWarning": "1mb", "maximumError": "3mb" }
               ],
-              "outputHashing": "all"
+              "outputHashing": "all",
+              "optimization": {
+                "scripts": true,
+                "fonts": false,
+                "styles": {
+                  "minify": true,
+                  "inlineCritical": false
+                }
+              }
             },
             "development": {
               "optimization": false,

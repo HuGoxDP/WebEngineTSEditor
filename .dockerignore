@@ -1,0 +1,17 @@
+# Build context for Dockerfile (context: repo root).
+#
+# app/node_modules must never reach the image: `COPY app/ .` runs after
+# `npm install`, so a host tree built on Windows would overwrite the Alpine one.
+
+.git
+.idea
+.shots
+design
+docs
+README.md
+*.log
+
+app/node_modules
+app/.angular
+app/dist
+app/out-tsc

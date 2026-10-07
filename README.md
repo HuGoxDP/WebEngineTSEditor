@@ -37,6 +37,20 @@ npm start          # ng serve on http://localhost:4200
 npm run build      # production build → app/dist
 ```
 
+## Run in Docker, beside the catalog
+
+The editor is served at `/editor/` on the platform's own port, by an override in the
+platform repo (the base stack still builds without this repository):
+
+```bash
+cd ../testv/virtual-lab
+docker compose -f docker-compose.yml -f docker-compose.editor.yml up --build -d
+# → http://localhost:${FRONTEND_PORT}/editor/
+```
+
+`Dockerfile` here builds the image; routing, headers and the CSP for `/editor/` live in
+`virtual-lab/nginx/editor.conf` and `csp-editor.conf`. See `docs/integration-plan.md` §3.
+
 If you change the engine, rebuild it (`npm run build` in `WebEngineTS`) and reinstall here
 (`npm install`) so the editor picks up the new `dist/`.
 
