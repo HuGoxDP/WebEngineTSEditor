@@ -9,6 +9,7 @@ import { FileIoService } from './file-io.service';
 import { ProjectService, type ProjectEntry } from './project.service';
 import { ViewportService } from '../viewport.service';
 import { DialogService } from '../dialogs/dialog.service';
+import { SettingsDialogComponent } from '../settings/settings-dialog.component';
 import { I18nService, type MessageKey } from '../i18n/i18n.service';
 import type { CtxItem } from '../context-menu/context-menu.component';
 
@@ -190,6 +191,21 @@ export class CommandsService {
     public frameSelection(): void {
         const go = this._selection.selected();
         if (go) this._viewport.frameOnObject(go.transform._internalObject3D);
+    }
+
+    // ── Preferences ──────────────────────────────────────────────────
+
+    private _preferencesOpen = false;
+
+    /** Opens Preferences over whatever is on screen. Asking again while it is open does nothing. */
+    public async openPreferences(): Promise<void> {
+        if (this._preferencesOpen) return;
+        this._preferencesOpen = true;
+        try {
+            await this._dialog.open(() => this._i18n.t('prefs.title'), SettingsDialogComponent);
+        } finally {
+            this._preferencesOpen = false;
+        }
     }
 
     // ── Project ──────────────────────────────────────────────────────

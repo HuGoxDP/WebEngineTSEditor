@@ -150,6 +150,64 @@ scenario("language and theme follow the settings, and survive a reload", async (
     check("no page errors", page.logs.filter(l => !l.includes("404")).length === 0, page.logs.join(" | "));
 });
 
+scenario("preferences: reachable three ways, language switches live, persists", async () => {
+    const page = await newPage("PrefsDemo");
+    const open = () => page.locator(".dlg-head .dlg-title", { hasText: /Preferences|Налаштування/ });
+
+    await page.locator(".menubar .gear").click();
+    check("the gear button opens Preferences", await open().isVisible());
+    // Ctrl+, while it is open must not stack a second one.
+    await page.keyboard.press("Control+,");
+    await page.waitForTimeout(200);
+    check("asking again does not stack dialogs", (await page.locator(".dlg").count()) === 1);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+    check("Esc closes it", (await page.locator(".dlg").count()) === 0);
+
+    await page.keyboard.press("Control+,");
+    check("Ctrl+, opens it", await open().isVisible());
+    await page.keyboard.press("Escape");
+
+    await page.locator(".menubar-item", { hasText: "Edit" }).click();
+    await page.locator(".ctx-item", { hasText: "Preferences" }).click();
+    check("Edit → Preferences opens it", await open().isVisible());
+
+    // Language switches while the dialog is open, scene state is untouched.
+    await page.keyboard.press("Escape");
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.keyboard.press("Control+,");
+    await page.selectOption("#prefs-language", "uk");
+    await page.waitForTimeout(300);
+    check("dialog title follows the language", (await page.locator(".dlg-title").innerText()) === "Налаштування");
+    check("menu bar behind it follows too", (await page.locator(".menubar-item").first().innerText()) === "Файл");
+    await page.locator(".seg button", { hasText: "Світла" }).click();
+    check("theme changes at once", (await page.evaluate(() => document.documentElement.dataset.theme)) === "light");
+    await page.locator(".prefs-tab", { hasText: "Клавіші" }).click();
+    check("shortcuts list is shown", (await page.locator(".prefs-keys tr").count()) > 10);
+    await page.locator(".prefs-tab", { hasText: "Про програму" }).click();
+    check("about shows the engine build", (await page.locator(".prefs-keys").innerText()).includes("0.1.0"));
+    await page.locator(".prefs-tab", { hasText: "Загальні" }).click();
+    await shot(page, "e2e-preferences");
+    await page.locator(".dlg-btn.primary").click();
+    await page.waitForTimeout(200);
+    check("the open scene survived the language change", (await page.locator("app-hierarchy li").count()) >= 2);
+
+    await page.reload({ waitUntil: "load" });
+    await page.waitForTimeout(400);
+    check("language and theme persist", (await page.locator(".menubar-item").first().innerText()) === "Файл"
+        && (await page.evaluate(() => document.documentElement.dataset.theme)) === "light");
+
+    await page.keyboard.press("Control+,");
+    await page.locator(".dlg-btn", { hasText: "Скинути до типових" }).click();
+    await page.waitForTimeout(200);
+    check("reset returns to the browser's language and the dark theme",
+        (await page.locator(".menubar-item").first().innerText()) === "File"
+        && (await page.evaluate(() => document.documentElement.dataset.theme)) === "dark");
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", page.logs.filter(l => !l.includes("404")).length === 0, page.logs.join(" | "));
+});
+
 scenario("dialogs: Esc cancels, Enter confirms, shortcuts stand down", async () => {
     const page = await newPage("DialogDemo");
     await page.locator("canvas").click({ position: { x: 300, y: 300 } });

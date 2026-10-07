@@ -35,7 +35,7 @@ export const DIALOG_REF = new InjectionToken<DialogRef<any>>('DIALOG_REF');
 export type DialogEntry =
     | { id: number; kind: 'ask'; options: AskOptions; resolve: (id: string | null) => void }
     | { id: number; kind: 'prompt'; options: PromptOptions; resolve: (value: string | null) => void }
-    | { id: number; kind: 'custom'; title: string; component: Type<unknown>; inputs: Record<string, unknown>;
+    | { id: number; kind: 'custom'; title: string | (() => string); component: Type<unknown>; inputs: Record<string, unknown>;
         ref: DialogRef; resolve: (value: unknown) => void };
 
 /**
@@ -93,10 +93,11 @@ export class DialogService {
 
     /**
      * Opens a component as a dialog. It receives `inputs` and may inject
-     * {@link DIALOG_REF} to close itself with a result.
+     * {@link DIALOG_REF} to close itself with a result. `title` may be a function,
+     * so a title that is translated follows a language change while the dialog is open.
      */
     public open<R = unknown>(
-        title: string,
+        title: string | (() => string),
         component: Type<unknown>,
         inputs: Record<string, unknown> = {},
     ): Promise<R | undefined> {

@@ -92,7 +92,7 @@ export class MenuModelService {
             { label: this._t('edit.selectAll'), shortcut: 'Ctrl+A', action: () => this._cmd.selectAll() },
             { separator: true, label: null },
             { label: this._t('edit.projectSettings'), disabled: true },
-            { label: this._t('edit.preferences'),     disabled: true },
+            { label: this._t('edit.preferences'), shortcut: 'Ctrl+,', action: () => void this._cmd.openPreferences() },
         ];
     }
 

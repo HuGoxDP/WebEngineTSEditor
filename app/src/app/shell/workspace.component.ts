@@ -16,6 +16,7 @@ import { ConsoleService } from '../services/console.service';
 import { HistoryService } from '../services/history.service';
 import { LayoutService } from '../services/layout.service';
 import { SelectionService } from '../services/selection.service';
+import { SettingsService } from '../services/settings.service';
 import { ShortcutsService } from '../services/shortcuts.service';
 import { HierarchyComponent } from '../panels/hierarchy/hierarchy.component';
 import { InspectorComponent } from '../panels/inspector/inspector.component';
@@ -93,7 +94,7 @@ import { StatusbarComponent } from './statusbar.component';
                             </button>
                             <button class="chip" [title]="'vp.snap' | t">
                                 <wets-icon name="magnet"></wets-icon>
-                                <span>1.0</span>
+                                <span>{{ settings.gridSnap() > 0 ? settings.gridSnap() : '–' }}</span>
                             </button>
                             <div class="vp-sep"></div>
                             <button class="chip active" [title]="'vp.shaded' | t">
@@ -223,6 +224,7 @@ export class WorkspaceComponent implements AfterViewInit, OnDestroy {
 
     public readonly viewport = inject(ViewportService);
     public readonly layout = inject(LayoutService);
+    public readonly settings = inject(SettingsService);
     public readonly cmd = inject(CommandsService);
     public readonly consoleService = inject(ConsoleService);
     private readonly _shortcuts = inject(ShortcutsService);

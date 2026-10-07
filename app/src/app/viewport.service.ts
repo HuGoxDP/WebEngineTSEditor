@@ -10,6 +10,7 @@ import {
     Vector3,
 } from 'WebEngineTS';
 import { SelectionService } from './services/selection.service';
+import { SettingsService } from './services/settings.service';
 
 /** Current mode of the transform gizmo. */
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
@@ -37,6 +38,7 @@ export class ViewportService {
     private _gizmo: TransformControls | null = null;
     private _gizmoHelper: THREE.Object3D | null = null;
     private _selectionEffect: EffectRef | null = null;
+    private _snapEffect: EffectRef | null = null;
     private _outline: THREE.BoxHelper | null = null;
 
     /** Rolling FPS sample, updated each second. */
@@ -51,6 +53,7 @@ export class ViewportService {
         private readonly _zone: NgZone,
         private readonly _selection: SelectionService,
         private readonly _injector: Injector,
+        private readonly _settings: SettingsService,
     ) {}
 
     /** Initializes the viewport on the given canvas. Idempotent. */
@@ -109,6 +112,12 @@ export class ViewportService {
         this._gizmo = gizmo;
         this._gizmoHelper = helper;
 
+        // Snap step from Preferences; 0 means off.
+        this._snapEffect = effect(() => {
+            const step = this._settings.gridSnap();
+            gizmo.setTranslationSnap(step > 0 ? step : null);
+        }, { injector: this._injector });
+
         // Selection outline — a BoxHelper we re-attach on each selection change.
         // Lives in the overlay so it always renders on top of the engine scene.
         this._selectionEffect = effect(() => {
@@ -161,6 +170,8 @@ export class ViewportService {
         this._gizmoHelper = null;
         this._selectionEffect?.destroy();
         this._selectionEffect = null;
+        this._snapEffect?.destroy();
+        this._snapEffect = null;
         this._outline?.dispose();
         this._outline = null;
         this._controls?.dispose();

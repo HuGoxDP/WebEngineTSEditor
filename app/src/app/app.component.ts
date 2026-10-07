@@ -1,4 +1,5 @@
-import { ChangeDetectionStrategy, Component, HostListener } from '@angular/core';
+import { ChangeDetectionStrategy, Component, HostListener, inject } from '@angular/core';
+import { CommandsService } from './services/commands.service';
 import { DialogHostComponent } from './dialogs/dialog-host.component';
 import { TopbarComponent } from './shell/topbar.component';
 import { WorkspaceComponent } from './shell/workspace.component';
@@ -24,6 +25,21 @@ import { WorkspaceComponent } from './shell/workspace.component';
     `,
 })
 export class AppComponent {
+
+    private readonly _cmd = inject(CommandsService);
+
+    /**
+     * Preferences are reachable from every screen and while typing, so this
+     * listens here rather than with the workspace shortcuts, which stand down
+     * in text fields and exist only while the workspace is on screen.
+     */
+    @HostListener('window:keydown', ['$event'])
+    public onWindowKey(e: KeyboardEvent): void {
+        if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key === ',') {
+            e.preventDefault();
+            void this._cmd.openPreferences();
+        }
+    }
 
     /**
      * Suppresses the browser's own context menu inside the editor. Panels that

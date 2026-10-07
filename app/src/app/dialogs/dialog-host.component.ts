@@ -172,7 +172,8 @@ export class DialogHostComponent {
     }
 
     public titleOf(d: DialogEntry): string {
-        return d.kind === 'custom' ? d.title : d.options.title;
+        if (d.kind !== 'custom') return d.options.title;
+        return typeof d.title === 'function' ? d.title() : d.title;
     }
 
     public onBackdrop(e: MouseEvent, d: DialogEntry): void {

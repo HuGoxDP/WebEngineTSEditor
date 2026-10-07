@@ -186,6 +186,15 @@ input, select, textarea { font: inherit; color: inherit; }
 .menubar-item:hover { background: var(--bg-3); color: var(--fg-0); }
 .menubar-item.open  { background: var(--accent-bg); color: var(--fg-0); }
 .menubar .spacer { flex: 1; }
+.menubar .gear {
+  width: 24px; height: 20px;
+  display: grid; place-items: center;
+  margin-right: 6px;
+  color: var(--fg-2);
+  border-radius: var(--radius);
+  font-size: 14px;
+}
+.menubar .gear:hover { background: var(--bg-3); color: var(--fg-0); }
 .menubar .project-tag {
   display: flex;
   align-items: center;

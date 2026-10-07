@@ -2,13 +2,15 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { ContextMenuComponent, type CtxItem } from '../context-menu/context-menu.component';
 import { MENUBAR, MenuModelService, type MenuId } from '../services/menu-model.service';
 import { ProjectService } from '../services/project.service';
+import { CommandsService } from '../services/commands.service';
+import { IconComponent } from '../icon.component';
 import { TPipe } from '../i18n/t.pipe';
 
 /** The top strip: logo, menus, and which project is open. */
 @Component({
     selector: 'app-topbar',
     standalone: true,
-    imports: [ContextMenuComponent, TPipe],
+    imports: [ContextMenuComponent, IconComponent, TPipe],
     changeDetection: ChangeDetectionStrategy.OnPush,
     host: { style: 'display: contents' },
     template: `
@@ -26,6 +28,9 @@ import { TPipe } from '../i18n/t.pipe';
                 >{{ m.label | t }}</div>
             }
             <div class="spacer"></div>
+            <button class="gear" [title]="'prefs.open' | t" [attr.aria-label]="'prefs.title' | t" (click)="cmd.openPreferences()">
+                <wets-icon name="cog"></wets-icon>
+            </button>
             <div class="project-tag" [title]="project.scenePath() ?? ''">
                 <span class="dot"></span>
                 <span>{{ project.isOpen() ? project.name() : ('project.none' | t) }}</span>
@@ -46,6 +51,7 @@ export class TopbarComponent {
 
     public readonly MENUBAR = MENUBAR;
     public readonly project = inject(ProjectService);
+    public readonly cmd = inject(CommandsService);
     private readonly _menus = inject(MenuModelService);
 
     public readonly openMenu = signal<MenuId | null>(null);
