@@ -4,6 +4,7 @@ import { MENUBAR, MenuModelService, type MenuId } from '../services/menu-model.s
 import { ProjectService } from '../services/project.service';
 import { AppStateService } from '../services/app-state.service';
 import { CommandsService } from '../services/commands.service';
+import { DocumentService } from '../services/document.service';
 import { IconComponent } from '../icon.component';
 import { TPipe } from '../i18n/t.pipe';
 
@@ -36,7 +37,7 @@ import { TPipe } from '../i18n/t.pipe';
             </button>
             @if (inWorkspace()) {
                 <div class="project-tag" [title]="project.scenePath() ?? ''">
-                    <span class="dot"></span>
+                    <span class="dot" [class.unsaved]="doc.dirty()"></span>
                     <span>{{ project.name() }}</span>
                 </div>
             }
@@ -57,6 +58,7 @@ export class TopbarComponent {
     public readonly MENUBAR = MENUBAR;
     public readonly project = inject(ProjectService);
     public readonly cmd = inject(CommandsService);
+    public readonly doc = inject(DocumentService);
     private readonly _menus = inject(MenuModelService);
     private readonly _state = inject(AppStateService);
 

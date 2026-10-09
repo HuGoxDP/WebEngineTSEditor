@@ -112,6 +112,9 @@ export class ProjectService {
 
     public readonly isOpen = computed(() => this.status() === 'open');
 
+    /** Identity of the open project, stable across sessions. Empty while none is open. */
+    public readonly projectId = signal('');
+
     /** Recently opened projects, newest first. */
     public readonly recents = signal<RecentProject[]>([]);
 
@@ -173,10 +176,18 @@ export class ProjectService {
 
     // ── Opening and closing ──────────────────────────────────────────
 
-    /** Makes a folder the open project and remembers it in the recent list. */
-    public async adopt(handle: ProjectFolderHandle): Promise<void> {
+    /**
+     * Makes a folder the open project and remembers it in the recent list.
+     *
+     * @param layout - when given, the scenario layout is written into the folder
+     *   first. The project only counts as open — and the workspace only appears —
+     *   once that is done, so nothing ever shows a project that is half set up.
+     */
+    public async adopt(handle: ProjectFolderHandle, layout?: ProjectMeta): Promise<void> {
         await this._adopt(handle);
-        await this._remember(handle);
+        if (layout) await this.initializeLayout(layout);
+        this.status.set('open');
+        this.projectId.set(await this._remember(handle));
     }
 
     /**
@@ -211,6 +222,7 @@ export class ProjectService {
         this._children.clear();
         this.folders.set([]);
         this.name.set('');
+        this.projectId.set('');
         this.scenePath.set(null);
         this.status.set('closed');
         this.revision.update(n => n + 1);
@@ -248,8 +260,12 @@ export class ProjectService {
         return (await this.readFile(path)).text();
     }
 
-    /** Writes a file, creating its parent folders. Rescans afterwards. */
-    public async write(path: string, data: string | Blob): Promise<void> {
+    /**
+     * Writes a file, creating its parent folders. Rescans afterwards, unless
+     * `rescan` is false — for a file the panel does not list anyway, such as the
+     * autosave, written every minute.
+     */
+    public async write(path: string, data: string | Blob, rescan = true): Promise<void> {
         const handle = await this._fileHandle(path, true);
         const writable = await handle.createWritable();
         try {
@@ -257,7 +273,34 @@ export class ProjectService {
         } finally {
             await writable.close();
         }
-        await this._scan();
+        if (rescan) await this._scan();
+    }
+
+    /**
+     * When a file was last modified, in ms, or null if it is not there.
+     *
+     * Asks the disk rather than the cached listing, so it also sees files the
+     * panel hides (the `.editor` folder) and changes made outside the editor.
+     */
+    public async modifiedAt(path: string): Promise<number | null> {
+        try {
+            return (await this.readFile(path)).lastModified;
+        } catch (err) {
+            const kind = (err as DOMException)?.name;
+            if (kind === 'NotFoundError' || kind === 'TypeMismatchError') return null;
+            throw err;
+        }
+    }
+
+    /** Deletes a file if it exists, without rescanning and without complaint when it does not. */
+    public async removeQuietly(path: string): Promise<void> {
+        const cut = path.lastIndexOf('/');
+        try {
+            const parent = await this._dirHandle(cut === -1 ? '' : path.slice(0, cut), false);
+            await parent.removeEntry(cut === -1 ? path : path.slice(cut + 1));
+        } catch (err) {
+            if ((err as DOMException)?.name !== 'NotFoundError') throw err;
+        }
     }
 
     public async createFolder(path: string): Promise<void> {
@@ -314,11 +357,11 @@ export class ProjectService {
 
     // ── internal ─────────────────────────────────────────────────────
 
+    /** Points the service at a folder and reads it. Does not mark the project open — see {@link adopt}. */
     private async _adopt(handle: DirHandle): Promise<void> {
         this._root = handle;
         this.name.set(handle.name);
         this.scenePath.set(null);
-        this.status.set('open');
         await this._scan();
     }
 
@@ -402,8 +445,11 @@ export class ProjectService {
      * Puts a folder at the top of the recent list. A folder already in it is
      * moved up rather than listed twice — the browser hands out a new handle
      * object every time, so identity is asked of the file system.
+     *
+     * @returns the project's id — the same one every time this folder is opened,
+     *   which is what lets a tab recognise "this project is open elsewhere".
      */
-    private async _remember(handle: DirHandle): Promise<void> {
+    private async _remember(handle: DirHandle): Promise<string> {
         try {
             const known = await idb<RecentProject[]>('readonly', s => s.getAll());
             let id: string = crypto.randomUUID();
@@ -421,8 +467,10 @@ export class ProjectService {
             const sorted = [...known.filter(r => r.id !== id), entry].sort((a, b) => b.openedAt - a.openedAt);
             for (const old of sorted.slice(MAX_RECENTS)) await idb('readwrite', s => s.delete(old.id));
             this.recents.set(sorted.slice(0, MAX_RECENTS));
+            return id;
         } catch {
-            // Not remembered; the project still opens.
+            // Not remembered; the project still opens. The folder name is the best identity left.
+            return handle.name;
         }
     }
 }

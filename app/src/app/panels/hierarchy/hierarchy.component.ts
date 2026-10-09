@@ -13,6 +13,7 @@ import { SelectionService } from '../../services/selection.service';
 import { HistoryService } from '../../services/history.service';
 import { ClipboardService } from '../../services/clipboard.service';
 import { CommandsService } from '../../services/commands.service';
+import { DocumentService } from '../../services/document.service';
 import { IconComponent } from '../../icon.component';
 import { ContextMenuComponent, type CtxItem } from '../../context-menu/context-menu.component';
 import { I18nService } from '../../i18n/i18n.service';
@@ -67,7 +68,7 @@ interface HierarchyNode {
                     <wets-icon name="gameobject"></wets-icon>
                 </span>
                 <span class="label">{{ sceneName() }}</span>
-                @if (history.canUndo()) {
+                @if (doc.dirty()) {
                     <span class="dirty" [title]="'hier.unsaved' | t"></span>
                 }
             </li>
@@ -127,6 +128,7 @@ export class HierarchyComponent {
     public readonly scene = inject(SceneService);
     public readonly selection = inject(SelectionService);
     public readonly history = inject(HistoryService);
+    public readonly doc = inject(DocumentService);
     private readonly _clipboard = inject(ClipboardService);
     private readonly _cmd = inject(CommandsService);
     private readonly _i18n = inject(I18nService);

@@ -202,7 +202,12 @@ export class InspectorComponent {
     private readonly _i18n = inject(I18nService);
     public readonly multiLabel = computed(() => this._i18n.tp('insp.multi', this._selection.count()));
 
+    // pos / rot / scl read the transform through plain getters, so nothing tells
+    // them it changed: `go()` returns the same object on a revision bump, and a
+    // computed whose input has not changed is not recomputed. They depend on the
+    // revision themselves, which is what makes a gizmo drag show up here.
     public readonly pos = computed(() => {
+        this._selection.revision();
         const g = this.go();
         return g
             ? { x: g.transform.localPosition.x, y: g.transform.localPosition.y, z: g.transform.localPosition.z }
@@ -210,12 +215,14 @@ export class InspectorComponent {
     });
 
     public readonly rot = computed<EulerDeg>(() => {
+        this._selection.revision();
         const g = this.go();
         if (!g) return { x: 0, y: 0, z: 0 };
         return InspectorComponent._quatToEulerDeg(g.transform.localRotation);
     });
 
     public readonly scl = computed(() => {
+        this._selection.revision();
         const g = this.go();
         return g
             ? { x: g.transform.localScale.x, y: g.transform.localScale.y, z: g.transform.localScale.z }

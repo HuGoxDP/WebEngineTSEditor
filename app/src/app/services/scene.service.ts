@@ -33,9 +33,16 @@ export class SceneService {
         return go;
     }
 
-    /** Removes a GameObject from the scene. */
+    /**
+     * Removes a GameObject from the scene, now.
+     *
+     * `destroy()` defers to the end of the engine's frame, and the editor never
+     * runs the engine's loop — so a deferred destroy never happened: Delete left
+     * the object in the hierarchy, and every undo left the rebuilt scene next to
+     * the old one. This is what Unity's editor code uses `DestroyImmediate` for.
+     */
     public destroy(go: GameObject): void {
-        go.destroy();
+        go.destroyImmediate();
         this._refresh();
     }
 
@@ -53,7 +60,7 @@ export class SceneService {
     /** Removes every GameObject from the active scene. */
     public clear(): void {
         for (const go of [...SceneManager.activeScene.getRootGameObjects()]) {
-            go.destroy();
+            go.destroyImmediate();
         }
         this._refresh();
     }

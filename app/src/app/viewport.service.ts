@@ -8,7 +8,10 @@ import {
     SceneManager,
     Transform,
     Vector3,
+    type SerializedScene,
 } from 'WebEngineTS';
+import { HistoryService } from './services/history.service';
+import { SceneService } from './services/scene.service';
 import { SelectionService } from './services/selection.service';
 import { SettingsService } from './services/settings.service';
 
@@ -39,6 +42,7 @@ export class ViewportService {
     private _gizmoHelper: THREE.Object3D | null = null;
     private _selectionEffect: EffectRef | null = null;
     private _snapEffect: EffectRef | null = null;
+    private _dragSnapshot: SerializedScene | null = null;
     private _outline: THREE.BoxHelper | null = null;
 
     /** Rolling FPS sample, updated each second. */
@@ -54,6 +58,8 @@ export class ViewportService {
         private readonly _selection: SelectionService,
         private readonly _injector: Injector,
         private readonly _settings: SettingsService,
+        private readonly _sceneService: SceneService,
+        private readonly _history: HistoryService,
     ) {}
 
     /** Initializes the viewport on the given canvas. Idempotent. */
@@ -104,7 +110,20 @@ export class ViewportService {
             // Lock the orbit camera while dragging a gizmo handle.
             controls.enabled = !(e as unknown as { value: boolean }).value;
         });
-        gizmo.addEventListener('change', () => this._syncGizmoToEngine());
+        // A drag mutates the Three.js object directly, outside History.record, so it
+        // has to be given an undo entry — and a "changed" mark — by hand. The
+        // snapshot is taken when the handle is pressed, before anything moves, and
+        // only becomes an entry once the object actually moves: pressing a handle
+        // without dragging changes nothing and must not make the scene "unsaved".
+        gizmo.addEventListener('mouseDown', () => { this._dragSnapshot = this._sceneService.serialize(); });
+        gizmo.addEventListener('mouseUp', () => { this._dragSnapshot = null; });
+        gizmo.addEventListener('change', () => {
+            if (this._dragSnapshot && this._gizmoMovedObject()) {
+                this._history.pushSnapshot('Transform', this._dragSnapshot);
+                this._dragSnapshot = null;
+            }
+            this._syncGizmoToEngine();
+        });
         // Three.js r169+ uses getHelper(); older versions used the gizmo itself.
         const helper: THREE.Object3D = (gizmo as unknown as { getHelper?: () => THREE.Object3D })
             .getHelper?.() ?? (gizmo as unknown as THREE.Object3D);
@@ -207,6 +226,14 @@ export class ViewportService {
         // Flush dirty engine transforms before we render the engine scene.
         Transform._syncAllDirty();
 
+        // The gizmo must not outlive the object it is attached to. Undo, loading and
+        // closing a project rebuild the scene, and the selection effect that detaches
+        // the gizmo runs after this loop has already drawn a frame with the old
+        // object — three logs an error for every one of those frames. Checked after
+        // the flush, because that is where a destroyed object leaves the scene.
+        const attached = this._gizmo?.object;
+        if (attached && attached.parent === null) this._gizmo!.detach();
+
         // Keep the selection outline in sync with the target's current bounds.
         this._outline?.update();
 
@@ -275,6 +302,11 @@ export class ViewportService {
 
     private readonly _onPointerDown = (e: PointerEvent): void => {
         if (e.button !== 0) return;
+        // A press that starts on a gizmo handle belongs to the gizmo. Treated as a
+        // click on the canvas it would pick whatever is behind the handle — nothing,
+        // for an empty object — and deselect the object being moved. The gizmo knows
+        // which handle is under the pointer from the hover before the press.
+        if (this._gizmo?.axis != null) return;
         this._pointerDown = { x: e.clientX, y: e.clientY };
     };
 
@@ -320,6 +352,25 @@ export class ViewportService {
             }
             this._selection.clear();
         });
+    }
+
+    /**
+     * Whether the gizmo has moved the selected object away from what the engine's
+     * Transform still holds. TransformControls reports `change` for more than
+     * movement — pressing a handle is enough — and only movement is an edit.
+     */
+    private _gizmoMovedObject(): boolean {
+        const go = this._selection.selected();
+        if (!go) return false;
+        const o = go.transform._internalObject3D;
+        const p = go.transform.localPosition;
+        const q = go.transform.localRotation;
+        const s = go.transform.localScale;
+        const EPS = 1e-6;
+        return Math.abs(o.position.x - p.x) > EPS || Math.abs(o.position.y - p.y) > EPS || Math.abs(o.position.z - p.z) > EPS
+            || Math.abs(o.quaternion.x - q.x) > EPS || Math.abs(o.quaternion.y - q.y) > EPS
+            || Math.abs(o.quaternion.z - q.z) > EPS || Math.abs(o.quaternion.w - q.w) > EPS
+            || Math.abs(o.scale.x - s.x) > EPS || Math.abs(o.scale.y - s.y) > EPS || Math.abs(o.scale.z - s.z) > EPS;
     }
 
     /**

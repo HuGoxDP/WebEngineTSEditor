@@ -279,6 +279,8 @@ input, select, textarea { font: inherit; color: inherit; }
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--ok);
 }
+/* Unsaved changes: the same dot, in the accent colour. */
+.menubar .project-tag .dot.unsaved { background: var(--accent); }
 
 /* ─── Toolbar ────────────────────────────────────────────── */
 .toolbar {

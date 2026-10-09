@@ -47,17 +47,44 @@ let lastPage = null;
  * unless a scenario says otherwise. The folder the picker returns is
  * `window.__pickFolder`, which a scenario can change between opens.
  */
-async function newPage(folderName = "DemoScenario", { viewport = { width: 1600, height: 900 }, settings = { language: "en" } } = {}) {
+async function newPage(folderName = "DemoScenario", { viewport = { width: 1600, height: 900 }, settings = { language: "en" }, autosaveMs = 0 } = {}) {
     const context = await browser.newContext({ viewport, locale: "en-US" });
     const page = await context.newPage();
+    await instrument(page, folderName, settings, autosaveMs);
+    await page.goto(URL_, { waitUntil: "load" });
+    return page;
+}
+
+/** A second tab in the same browser profile — same storage, same locks. */
+async function siblingPage(page, folderName) {
+    const sibling = await page.context().newPage();
+    await instrument(sibling, folderName, null, 0);
+    await sibling.goto(URL_, { waitUntil: "load" });
+    return sibling;
+}
+
+/** Log capture, the folder-picker stand-in, and the preferences/knobs seeded before the editor starts. */
+async function instrument(page, folderName, settings, autosaveMs) {
     lastPage = page;
     page.logs = [];
     page.nativeDialogs = 0;
+    page.beforeUnloads = 0;
     page.on("console", m => { if (m.type() === "error" || m.type() === "warning") page.logs.push(`[${m.type()}] ${m.text()}`); });
     page.on("pageerror", e => page.logs.push(`[pageerror] ${e.message}`));
-    // The editor has its own dialogs; a native one means something still calls alert/confirm/prompt.
-    page.on("dialog", d => { page.nativeDialogs++; d.dismiss(); });
-    await page.addInitScript(s => { if (!localStorage.getItem("wets:settings:v1")) localStorage.setItem("wets:settings:v1", JSON.stringify(s)); }, settings);
+    page.on("dialog", d => {
+        // The browser's own "leave this page?" prompt is the editor protecting unsaved work, and
+        // is counted separately. Accepted, so a test can reload; any other native dialog means
+        // something still calls alert/confirm/prompt, which the editor replaced with its own.
+        if (d.type() === "beforeunload") { page.beforeUnloads++; d.accept(); return; }
+        page.nativeDialogs++;
+        d.dismiss();
+    });
+    if (settings) {
+        await page.addInitScript(s => { if (!localStorage.getItem("wets:settings:v1")) localStorage.setItem("wets:settings:v1", JSON.stringify(s)); }, settings);
+    }
+    if (autosaveMs) {
+        await page.addInitScript(ms => localStorage.setItem("wets:debug:autosaveMs", String(ms)), autosaveMs);
+    }
     await page.addInitScript(name => {
         window.__pickFolder = name;
         window.showDirectoryPicker = async () => {
@@ -65,8 +92,6 @@ async function newPage(folderName = "DemoScenario", { viewport = { width: 1600, 
             return root.getDirectoryHandle(window.__pickFolder, { create: true });
         };
     }, folderName);
-    await page.goto(URL_, { waitUntil: "load" });
-    return page;
 }
 
 /** Which folder the next "open" picks. */
@@ -270,14 +295,16 @@ scenario("unsaved changes: closing asks, saving never silently replaces a scene"
     await page.locator("canvas").click({ position: { x: 300, y: 300 } });
     await page.keyboard.press("Alt+Shift+N");
     await menu(page, "File", "Close Project");
-    check("closing with unsaved changes asks", (await dialogTitle(page).innerText()) === "Discard unsaved changes?");
+    check("closing with unsaved changes asks", (await dialogTitle(page).innerText()) === "Save changes to main.scene.json?");
+    check("with three ways out", (await page.locator(".dlg-foot .dlg-btn").allInnerTexts()).join() === "Cancel,Don't save,Save");
+    await shot(page, "e2e-save-changes");
     await dialogButton(page, "Cancel").click();
     await page.waitForTimeout(200);
     check("cancelling keeps the project open", (await page.locator(".work").count()) === 1);
 
     // A new scene has no file; the default name is already taken by another scene.
     await menu(page, "File", "New Scene");
-    await dialogButton(page, "Discard").click();
+    await dialogButton(page, "Don't save").click();
     await page.waitForTimeout(300);
     await page.locator("canvas").click({ position: { x: 300, y: 300 } });
     await page.keyboard.press("Alt+Shift+N");
@@ -295,7 +322,215 @@ scenario("unsaved changes: closing asks, saving never silently replaces a scene"
     check("confirming replaces it", replaced.roots[0].name === "GameObject", replaced.roots[0].name);
 
     await menu(page, "File", "Close Project");
-    await dialogButton(page, "Discard").click().catch(() => {});
+    await page.waitForTimeout(300);
+    check("a saved scene closes without asking", (await page.locator(".start-card").count()) === 1 && (await page.locator(".dlg").count()) === 0);
+    check("no native dialogs were used", page.nativeDialogs === 0);
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("honest saving: the mark, Save from the dialog, the gizmo, closing the tab", async () => {
+    const page = await newPage("SaveDemo");
+    await openEmptyProject(page);
+    const status = () => page.locator(".statusbar .accent").first().innerText();
+    const dot = () => page.locator(".project-tag .dot.unsaved").count();
+
+    check("a fresh project is saved", (await status()) === "Saved" && (await dot()) === 0);
+    check("the tab title has no mark", !(await page.title()).startsWith("●"));
+
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(200);
+    check("an edit makes it unsaved", (await status()) === "Unsaved" && (await dot()) === 1);
+    check("the tab title says so", (await page.title()).startsWith("●"));
+    check("and so does the tree's root row", (await page.locator("app-hierarchy .scene-root .dirty").count()) === 1);
+
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(500);
+    check("saving clears it", (await status()) === "Saved" && (await dot()) === 0);
+    check("the tooltip says when", (await page.locator(".statusbar .accent").first().getAttribute("title")).startsWith("Last saved at"));
+
+    // Selection is not an edit.
+    await page.locator("app-hierarchy li", { hasText: "GameObject" }).first().click();
+    check("selecting does not make it unsaved", (await status()) === "Saved");
+
+    // A gizmo drag is an edit — and undoable. Dragging the red (X) arrow of the move tool.
+    const position = () => page.locator(".insp-body .field").first().locator("input").evaluateAll(els => els.map(e => e.value).join(","));
+    const before = await position();
+
+    // Pressing a handle without dragging changes nothing, so it must not make the scene unsaved.
+    await page.mouse.move(800, 388, { steps: 3 });
+    await page.waitForTimeout(200);
+    await page.mouse.down();
+    await page.mouse.up();
+    await page.waitForTimeout(200);
+    check("pressing a handle without dragging is not an edit", (await status()) === "Saved");
+    check("and does not deselect the object", (await position()) === before, await position());
+
+    await page.mouse.move(800, 388, { steps: 3 });
+    await page.waitForTimeout(200);
+    await page.mouse.down();
+    await page.waitForTimeout(100);
+    for (let i = 1; i <= 10; i++) { await page.mouse.move(800 + i * 8, 388 + i * 2, { steps: 2 }); await page.waitForTimeout(40); }
+    await page.mouse.up();
+    await page.waitForTimeout(300);
+    const after = await position();
+    check("dragging the gizmo moved the object", before !== after, `${before} -> ${after}`);
+    check("and made the scene unsaved", (await status()) === "Unsaved");
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(300);
+    // Undo reloads the scene, which drops the selection; select the object again to read it.
+    await page.locator("app-hierarchy li", { hasText: "GameObject" }).first().click();
+    check("Ctrl+Z puts it back", (await position()) === before, `${await position()} vs ${before}`);
+
+    // Closing the tab: the browser asks only when there is something to lose.
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    check("saved again before leaving", (await status()) === "Saved", await status());
+    const askedClean = page.beforeUnloads;
+    await page.reload({ waitUntil: "load" });
+    check("a saved scene lets the tab go quietly", page.beforeUnloads === askedClean);
+    await page.locator(".recent").first().click();
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(400);
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(200);
+    const askedDirty = page.beforeUnloads;
+    await page.reload({ waitUntil: "load" });
+    check("unsaved work makes the browser ask first", page.beforeUnloads === askedDirty + 1);
+
+    // Save from the three-button dialog: saves, then goes on.
+    await page.locator(".recent").first().click();
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(400);
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.keyboard.press("Alt+Shift+N");
+    await menu(page, "File", "Close Project");
+    await dialogButton(page, "Save").click();
+    await page.locator(".start-card").waitFor();
+    const saved = JSON.parse(await readDisk(page, "SaveDemo", "assets/scenes/main.scene.json"));
+    check("Save in the dialog writes the scene before closing", saved.roots.length >= 2, String(saved.roots.length));
+    check("no native dialogs were used", page.nativeDialogs === 0);
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("recovery: unsaved work survives a crash; giving it up is remembered", async () => {
+    const page = await newPage("CrashDemo", { autosaveMs: 300 });
+    await openEmptyProject(page);
+    const autosave = () => readDisk(page, "CrashDemo", ".editor/autosave.scene.json");
+
+    await page.waitForTimeout(800);
+    check("nothing is written while nothing is unsaved", (await autosave()) === null);
+
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(1000);
+    const copy = await autosave();
+    check("a recovery copy appears while there are unsaved changes", copy !== null && JSON.parse(copy).roots.length === 1);
+    check("the Project panel does not show it", !(await page.locator(".proj").innerText()).includes("autosave"));
+
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(600);
+    check("saving removes it", (await autosave()) === null);
+
+    // "Crash": the tab goes away with unsaved work in it.
+    await page.keyboard.press("Alt+Shift+N");
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(1000);
+    await page.reload({ waitUntil: "load" });
+    await page.locator(".recent").first().click();
+    await page.waitForTimeout(800);
+    check("reopening offers the unsaved work back", (await dialogTitle(page).innerText()) === "Restore unsaved work?");
+    await dialogButton(page, "Restore").click();
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(400);
+    const tree = await page.locator("app-hierarchy li").count();
+    check("restoring brings the objects back", tree >= 4, String(tree));
+    check("and the scene is still unsaved, as it is", (await page.locator(".statusbar .accent").first().innerText()) === "Unsaved");
+
+    // Give it up: the next opening must not ask again.
+    await page.reload({ waitUntil: "load" });
+    await page.locator(".recent").first().click();
+    await page.waitForTimeout(800);
+    check("the copy is still offered after another crash", (await dialogTitle(page).innerText()) === "Restore unsaved work?");
+    await dialogButton(page, "Discard it").click();
+    await page.waitForTimeout(500);
+    check("refusing deletes it", (await autosave()) === null);
+    check("and the scene is the saved one", (await page.locator("app-hierarchy li").count()) === 2);
+
+    // "Don't save" in the close dialog gives it up too.
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(1000);
+    check("a copy exists again", (await autosave()) !== null);
+    await menu(page, "File", "Close Project");
+    await dialogButton(page, "Don't save").click();
+    await page.locator(".start-card").waitFor();
+    check("Don't save deletes the copy", (await autosave()) === null);
+    check("no native dialogs were used", page.nativeDialogs === 0);
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("one tab per project; changes made outside the editor", async () => {
+    const page = await newPage("TabsDemo");
+    await openEmptyProject(page);
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(500);
+
+    // A second tab on the same folder is refused.
+    const other = await siblingPage(page, "TabsDemo");
+    await other.getByText("Open folder…").click();
+    await other.waitForTimeout(600);
+    check("a second tab cannot open the same project", (await other.locator(".dlg").innerText()).includes("already open in another tab"));
+    await dialogButton(other, "OK").click();
+    check("it stays on the start screen", (await other.locator(".work").count()) === 0);
+    await menu(page, "File", "Close Project");
+    await other.getByText("Open folder…").click();
+    await other.locator(".work").waitFor();
+    check("once the first tab lets go, the second can open it", (await other.locator(".work").count()) === 1);
+    await other.close();
+
+    // Changed outside while the scene here is clean: reloaded quietly.
+    await page.locator(".recent").first().click();
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(500);
+    const external = name => page.evaluate(async ([n, text]) => {
+        const dir = await (await (await (await navigator.storage.getDirectory()).getDirectoryHandle("TabsDemo")).getDirectoryHandle("assets")).getDirectoryHandle("scenes");
+        const w = await (await dir.getFileHandle("main.scene.json", { create: true })).createWritable();
+        await w.write(text); await w.close();
+    }, [name, sceneWith(name)]);
+    await page.waitForTimeout(50);
+    await external("FromOutside");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(800);
+    check("a clean scene reloads quietly when the file changes", (await page.locator("app-hierarchy").innerText()).includes("FromOutside"));
+    check("and stays clean", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+
+    // Changed in both places: asked, and "keep mine" is respected and not repeated.
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(100);
+    await external("FromOutsideAgain");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(600);
+    check("changed in both places, it asks", (await dialogTitle(page).innerText()).includes("changed on disk"));
+    await dialogButton(page, "Keep mine").click();
+    await page.waitForTimeout(300);
+    check("keeping mine keeps my edit", !(await page.locator("app-hierarchy").innerText()).includes("FromOutsideAgain"));
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(600);
+    check("and it does not ask again about the same change", (await page.locator(".dlg").count()) === 0);
+
+    await page.waitForTimeout(50);
+    await external("ThirdVersion");
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(600);
+    await dialogButton(page, "Reload from disk").click();
+    await page.waitForTimeout(500);
+    check("reloading takes the disk version", (await page.locator("app-hierarchy").innerText()).includes("ThirdVersion"));
     check("no native dialogs were used", page.nativeDialogs === 0);
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });

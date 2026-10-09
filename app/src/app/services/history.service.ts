@@ -50,6 +50,16 @@ export class HistoryService {
     public readonly canRedo = signal(false);
 
     /**
+     * Counts every change to the scene: an edit, an undo, a redo, a reload.
+     *
+     * Only ever goes up. `DocumentService` remembers the value at the last save,
+     * and "unsaved" is the two being different — which `canUndo` cannot say,
+     * because it stays true after a save and false after loading a scene that
+     * was then edited and undone.
+     */
+    public readonly revision = signal(0);
+
+    /**
      * Captures the current scene, runs `action`, clears redo.
      *
      * Consecutive calls with the same `label` within {@link COALESCE_MS}
@@ -80,6 +90,18 @@ export class HistoryService {
             }
             throw err;
         }
+        // Coalesced edits push nothing, but they do change the scene.
+        this.revision.update(n => n + 1);
+    }
+
+    /**
+     * Pushes an undo entry for a change that has already started, from a snapshot
+     * taken before it did — a gizmo drag, which mutates the scene directly rather
+     * than through {@link record}.
+     */
+    public pushSnapshot(label: string, snapshot: SerializedScene): void {
+        this._push(label, snapshot, performance.now());
+        this.revision.update(n => n + 1);
     }
 
     /**
@@ -138,6 +160,7 @@ export class HistoryService {
     }
 
     private _refreshFlags(): void {
+        this.revision.update(n => n + 1);
         this.canUndo.set(this._undoStack.length > 0);
         this.canRedo.set(this._redoStack.length > 0);
     }
