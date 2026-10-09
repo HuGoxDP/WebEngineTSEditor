@@ -1,5 +1,7 @@
 import { ChangeDetectionStrategy, Component, HostListener, inject } from '@angular/core';
+import { AppStateService } from './services/app-state.service';
 import { CommandsService } from './services/commands.service';
+import { StartScreenComponent } from './screens/start/start-screen.component';
 import { DialogHostComponent } from './dialogs/dialog-host.component';
 import { TopbarComponent } from './shell/topbar.component';
 import { WorkspaceComponent } from './shell/workspace.component';
@@ -14,18 +16,26 @@ import { WorkspaceComponent } from './shell/workspace.component';
 @Component({
     selector: 'app-root',
     standalone: true,
-    imports: [TopbarComponent, WorkspaceComponent, DialogHostComponent],
+    imports: [TopbarComponent, WorkspaceComponent, StartScreenComponent, DialogHostComponent],
     changeDetection: ChangeDetectionStrategy.OnPush,
     template: `
-        <div class="app">
-            <app-topbar></app-topbar>
-            <app-workspace></app-workspace>
-        </div>
+        @if (state.screen() === 'workspace') {
+            <div class="app">
+                <app-topbar></app-topbar>
+                <app-workspace></app-workspace>
+            </div>
+        } @else {
+            <div class="app start-layout">
+                <app-topbar></app-topbar>
+                <app-start-screen></app-start-screen>
+            </div>
+        }
         <app-dialog-host></app-dialog-host>
     `,
 })
 export class AppComponent {
 
+    public readonly state = inject(AppStateService);
     private readonly _cmd = inject(CommandsService);
 
     /**

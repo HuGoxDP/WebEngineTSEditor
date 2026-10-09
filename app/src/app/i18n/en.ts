@@ -186,12 +186,6 @@ export const en = {
     // ── project panel ───────────────────────────────────────────────
     'proj.unsupportedTitle': 'Project folders are not available in this browser',
     'proj.unsupportedHint': 'The editor keeps projects on your computer, which needs Chrome or Edge and a page opened over HTTPS or from localhost.',
-    'proj.noneTitle': 'No project open',
-    'proj.noneHint': 'A project is a folder on your computer. Nothing is uploaded until you publish a scenario.',
-    'proj.openFolder': 'Open project folder…',
-    'proj.reconnectHint': 'The browser asks for access to the folder again after a reload.',
-    'proj.reconnect': 'Reconnect',
-    'proj.openAnother': 'Open another folder…',
     'proj.section': 'PROJECT',
     'proj.items.one': '{n} item',
     'proj.items.few': '{n} items',
@@ -201,7 +195,6 @@ export const en = {
     'proj.import': 'Import files into this folder',
     'proj.refresh': 'Refresh from disk',
     'proj.emptyFolder': 'Empty folder — drop files here.',
-    'proj.setupLayout': 'Set up as a scenario project',
     'proj.open': 'Open',
     'proj.delete': 'Delete',
     'proj.closeProject': 'Close Project',
@@ -247,6 +240,28 @@ export const en = {
     'prefs.storedLocally': 'Preferences are stored in this browser, not in the project.',
     'sc.preferences': 'Preferences',
 
+    // ── start screen ────────────────────────────────────────────────
+    'start.heading': 'Scenario editor',
+    'start.tagline': 'Build interactive 3D scenarios for the virtual lab.',
+    'start.create': 'Create project',
+    'start.createHint': 'Start a new scenario in an empty folder.',
+    'start.open': 'Open folder…',
+    'start.openHint': 'Open a project you already have.',
+    'start.recent': 'Recent projects',
+    'start.recentEmpty': 'Projects you open will appear here.',
+    'start.forget': 'Remove from the list',
+    'start.footer': 'A project is stored on your computer. Only what you publish reaches the catalog.',
+    'start.narrow': 'The editor is made for a computer screen. This window is too narrow to work in comfortably.',
+    'start.language': 'Language',
+    'open.emptyTitle': 'Set up a project here?',
+    'open.emptyMessage': 'The folder "{name}" is empty. The editor will create the scenario layout in it.',
+    'open.notProjectTitle': 'This folder is not a project',
+    'open.notProjectMessage': 'There is no scenario.meta.json in "{name}". Make it a scenario project? Your files stay where they are.',
+    'open.setUp': 'Set up',
+    'open.makeProject': 'Make it a project',
+    'open.denied': 'Access to the folder "{name}" was not granted.',
+    'open.missing': 'The folder "{name}" was not found. It may have been moved or deleted.',
+
     // ── saving and opening scenes ───────────────────────────────────
     'scene.discardTitle': 'Discard unsaved changes?',
     'scene.discardMessage': 'The scene has changes that are not saved.',
@@ -259,6 +274,9 @@ export const en = {
     'scene.parseFailed': '{name} is not valid JSON.',
     'scene.invalid': '{name} is not a valid scene file.',
     'scene.mainName': 'main',
+    'scene.overwriteTitle': 'Replace the existing scene?',
+    'scene.overwriteMessage': '{path} already exists in this project. Saving will replace it.',
+    'scene.replace': 'Replace',
 } as const;
 
 export type MessageKey = keyof typeof en;

@@ -20,15 +20,34 @@ export interface ProjectFolder {
     depth: number;
 }
 
-/** Where the open-project state stands — drives the panel's empty states. */
+/** Where the open-project state stands. */
 export type ProjectStatus =
     /** The browser has no File System Access API (not Chromium, or not HTTPS / localhost). */
     | 'unsupported'
     /** Nothing open. */
     | 'closed'
-    /** A folder is remembered from last time, but the browser wants a click before granting it again. */
-    | 'needs-permission'
     | 'open';
+
+/** What a folder the user picked turned out to be. */
+export type FolderKind =
+    /** Has `scenario.meta.json` — a scenario project. */
+    | 'project'
+    /** Nothing in it. */
+    | 'empty'
+    /** Has files, but is not a project. */
+    | 'foreign';
+
+/** A project the user opened before, remembered across sessions. */
+export interface RecentProject {
+    id: string;
+    name: string;
+    /** `Date.now()` of the last time it was opened. */
+    openedAt: number;
+    handle: ProjectFolderHandle;
+}
+
+/** How a recent project's reopening went. */
+export type ReopenResult = 'ok' | 'denied' | 'missing';
 
 // The File System Access API is not in TypeScript's DOM lib beyond the basics,
 // so the handful of members used here are declared rather than pulled in as a
@@ -37,9 +56,10 @@ interface PermissionCapable {
     queryPermission(d: { mode: 'read' | 'readwrite' }): Promise<PermissionState>;
     requestPermission(d: { mode: 'read' | 'readwrite' }): Promise<PermissionState>;
 }
-type DirHandle = FileSystemDirectoryHandle & PermissionCapable & {
+export type ProjectFolderHandle = FileSystemDirectoryHandle & PermissionCapable & {
     values(): AsyncIterable<FileSystemDirectoryHandle | FileSystemFileHandle>;
 };
+type DirHandle = ProjectFolderHandle;
 type PickerWindow = Window & {
     showDirectoryPicker?: (o?: { id?: string; mode?: 'read' | 'readwrite' }) => Promise<DirHandle>;
 };
@@ -51,8 +71,10 @@ const HIDDEN = new Set(['node_modules', 'dist', 'lods']);
 const MAX_ENTRIES = 5000;
 
 const DB_NAME = 'wets-editor';
-const DB_STORE = 'handles';
-const DB_KEY = 'project';
+/** Folder handles of recently opened projects, keyed by id. */
+const RECENTS = 'recents';
+/** How many recent projects are kept. */
+const MAX_RECENTS = 10;
 
 /**
  * The scenario project open in the editor — a folder on the user's own disk.
@@ -61,9 +83,10 @@ const DB_KEY = 'project';
  * Nothing about a project is stored on the server: the platform keeps published
  * scenarios only. The folder is reached through the browser's File System
  * Access API, which is why this needs a Chromium-based browser on HTTPS or
- * localhost. The handle is remembered in IndexedDB, so the project reopens
- * after a reload — once the user clicks to grant access again, which the
- * browser requires on every new page load.
+ * localhost. Opened folders are remembered in IndexedDB as a list of recent
+ * projects. After a reload the browser wants a click before it grants a folder
+ * again, so a project is never opened on its own: the start screen lists them
+ * and {@link openRecent} runs from the click.
  *
  * The folder has the layout ScenarioCreator builds from
  * (`scripts/`, `assets/`, `scenario.meta.json`), so a project authored here is
@@ -88,6 +111,9 @@ export class ProjectService {
 
     public readonly isOpen = computed(() => this.status() === 'open');
 
+    /** Recently opened projects, newest first. */
+    public readonly recents = signal<RecentProject[]>([]);
+
     private _root: DirHandle | null = null;
     private _children = new Map<string, ProjectEntry[]>();
 
@@ -96,42 +122,66 @@ export class ProjectService {
             this.status.set('unsupported');
             return;
         }
-        void this._restore();
+        void this.loadRecents();
+    }
+
+    // ── Choosing a folder ────────────────────────────────────────────
+
+    /** Shows the folder picker. Resolves null if the user cancels. Opens nothing by itself. */
+    public async pickFolder(): Promise<ProjectFolderHandle | null> {
+        const host = window as PickerWindow;
+        if (!host.showDirectoryPicker) return null;
+        try {
+            return await host.showDirectoryPicker({ id: 'wets-project', mode: 'readwrite' });
+        } catch (err) {
+            // AbortError is the user closing the dialog, not a failure.
+            if ((err as DOMException)?.name === 'AbortError') return null;
+            throw err;
+        }
+    }
+
+    /** Whether a folder is already a project, empty, or something else. */
+    public async inspect(handle: ProjectFolderHandle): Promise<FolderKind> {
+        const children = await listDir(handle);
+        if (children.some(c => c.kind === 'file' && c.name === 'scenario.meta.json')) return 'project';
+        return children.length > 0 ? 'foreign' : 'empty';
     }
 
     // ── Opening and closing ──────────────────────────────────────────
 
-    /** Shows the folder picker. Resolves false if the user cancels. */
-    public async open(): Promise<boolean> {
-        const host = window as PickerWindow;
-        if (!host.showDirectoryPicker) return false;
-
-        let handle: DirHandle;
-        try {
-            handle = await host.showDirectoryPicker({ id: 'wets-project', mode: 'readwrite' });
-        } catch (err) {
-            // AbortError is the user closing the dialog, not a failure.
-            if ((err as DOMException)?.name === 'AbortError') return false;
-            throw err;
-        }
+    /** Makes a folder the open project and remembers it in the recent list. */
+    public async adopt(handle: ProjectFolderHandle): Promise<void> {
         await this._adopt(handle);
         await this._remember(handle);
-        return true;
     }
 
     /**
-     * Re-grants access to the folder remembered from the last session.
-     * Must be called from a click: the browser only prompts on a user gesture.
+     * Reopens a project from the recent list.
+     *
+     * Call it straight from the click: the browser only asks for access on a
+     * user gesture, and the permission request is the first thing this does.
      */
-    public async reconnect(): Promise<boolean> {
-        const handle = this._root;
-        if (!handle) return false;
-        if (await handle.requestPermission({ mode: 'readwrite' }) !== 'granted') return false;
-        await this._adopt(handle);
-        return true;
+    public async openRecent(recent: RecentProject): Promise<ReopenResult> {
+        // A folder that was moved or deleted can fail at either step — asking for
+        // access, or listing it — so both are checked for "not found".
+        try {
+            if (await recent.handle.requestPermission({ mode: 'readwrite' }) !== 'granted') return 'denied';
+            await listDir(recent.handle, 1);
+        } catch (err) {
+            if ((err as DOMException)?.name === 'NotFoundError') return 'missing';
+            throw err;
+        }
+        await this.adopt(recent.handle);
+        return 'ok';
     }
 
-    /** Forgets the project. Files on disk are untouched. */
+    /** Removes one project from the recent list. The folder itself is untouched. */
+    public async forgetRecent(id: string): Promise<void> {
+        try { await idb('readwrite', s => s.delete(id)); } catch { /* nothing to forget */ }
+        this.recents.update(list => list.filter(r => r.id !== id));
+    }
+
+    /** Closes the project. It stays in the recent list; files on disk are untouched. */
     public async close(): Promise<void> {
         this._root = null;
         this._children.clear();
@@ -140,7 +190,7 @@ export class ProjectService {
         this.scenePath.set(null);
         this.status.set('closed');
         this.revision.update(n => n + 1);
-        await this._forget();
+        await this.loadRecents();
     }
 
     /** Re-reads the folder from disk — files change underneath the editor. */
@@ -261,7 +311,7 @@ export class ProjectService {
             const entries: ProjectEntry[] = [];
             const subdirs: { handle: DirHandle; entry: ProjectEntry }[] = [];
 
-            for await (const child of dir.values()) {
+            for (const child of await listDir(dir)) {
                 if (child.name.startsWith('.') || HIDDEN.has(child.name)) continue;
                 if (++count > MAX_ENTRIES) break;
 
@@ -312,33 +362,68 @@ export class ProjectService {
         return dir.getFileHandle(cut === -1 ? path : path.slice(cut + 1), { create });
     }
 
-    // ── Remembering the folder between sessions ──────────────────────
+    // ── Remembering projects between sessions ────────────────────────
 
-    private async _restore(): Promise<void> {
-        let handle: DirHandle | undefined;
+    /** Reads the recent list from IndexedDB, newest first. */
+    public async loadRecents(): Promise<void> {
         try {
-            handle = await idb<DirHandle | undefined>('readonly', s => s.get(DB_KEY));
+            const all = await idb<RecentProject[]>('readonly', s => s.getAll());
+            this.recents.set(all.sort((a, b) => b.openedAt - a.openedAt));
         } catch {
-            return;   // No IndexedDB (private mode): the project simply is not remembered.
-        }
-        if (!handle) return;
-
-        this._root = handle;
-        this.name.set(handle.name);
-        if (await handle.queryPermission({ mode: 'readwrite' }) === 'granted') {
-            await this._adopt(handle);
-        } else {
-            this.status.set('needs-permission');
+            // No IndexedDB (private mode): projects are simply not remembered.
         }
     }
 
+    /**
+     * Puts a folder at the top of the recent list. A folder already in it is
+     * moved up rather than listed twice — the browser hands out a new handle
+     * object every time, so identity is asked of the file system.
+     */
     private async _remember(handle: DirHandle): Promise<void> {
-        try { await idb('readwrite', s => s.put(handle, DB_KEY)); } catch { /* not remembered */ }
-    }
+        try {
+            const known = await idb<RecentProject[]>('readonly', s => s.getAll());
+            let id: string = crypto.randomUUID();
+            for (const r of known) {
+                try {
+                    if (await r.handle.isSameEntry(handle)) { id = r.id; break; }
+                } catch {
+                    // A stale handle cannot be compared; it is just not the same one.
+                }
+            }
+            const entry: RecentProject = { id, name: handle.name, openedAt: Date.now(), handle };
+            await idb('readwrite', s => s.put(entry));
 
-    private async _forget(): Promise<void> {
-        try { await idb('readwrite', s => s.delete(DB_KEY)); } catch { /* nothing to forget */ }
+            // Past the limit, the oldest go.
+            const sorted = [...known.filter(r => r.id !== id), entry].sort((a, b) => b.openedAt - a.openedAt);
+            for (const old of sorted.slice(MAX_RECENTS)) await idb('readwrite', s => s.delete(old.id));
+            this.recents.set(sorted.slice(0, MAX_RECENTS));
+        } catch {
+            // Not remembered; the project still opens.
+        }
     }
+}
+
+/**
+ * Lists a folder's entries, at most `limit` of them.
+ *
+ * Steps the iterator by hand instead of using `for await`. The production build
+ * lowers `for await`, and when the first `next()` rejected — a folder deleted
+ * behind the editor's back — the lowered loop rethrew `undefined`, hiding the
+ * browser's `NotFoundError` that the caller needs to see.
+ */
+async function listDir(
+    dir: ProjectFolderHandle,
+    limit: number = Infinity,
+): Promise<Array<FileSystemDirectoryHandle | FileSystemFileHandle>> {
+    const out: Array<FileSystemDirectoryHandle | FileSystemFileHandle> = [];
+    const iterator = dir.values()[Symbol.asyncIterator]();
+    while (out.length < limit) {
+        const step = await iterator.next();
+        if (step.done) return out;
+        out.push(step.value);
+    }
+    await iterator.return?.();
+    return out;
 }
 
 function kindOf(name: string): ProjectEntryKind {
@@ -358,15 +443,24 @@ function kindOf(name: string): ProjectEntryKind {
     }
 }
 
-/** One IndexedDB request against the handle store, as a promise. */
+/**
+ * One IndexedDB request against the recent-projects store, as a promise.
+ *
+ * Version 1 had a single remembered project under a `handles` store; that store
+ * is left alone, and its one project is simply not carried over.
+ */
 function idb<T>(mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBRequest): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-        const open = indexedDB.open(DB_NAME, 1);
-        open.onupgradeneeded = () => open.result.createObjectStore(DB_STORE);
+        const open = indexedDB.open(DB_NAME, 2);
+        open.onupgradeneeded = () => {
+            if (!open.result.objectStoreNames.contains(RECENTS)) {
+                open.result.createObjectStore(RECENTS, { keyPath: 'id' });
+            }
+        };
         open.onerror = () => reject(open.error);
         open.onsuccess = () => {
             const db = open.result;
-            const request = run(db.transaction(DB_STORE, mode).objectStore(DB_STORE));
+            const request = run(db.transaction(RECENTS, mode).objectStore(RECENTS));
             request.onsuccess = () => { resolve(request.result as T); db.close(); };
             request.onerror = () => { reject(request.error); db.close(); };
         };

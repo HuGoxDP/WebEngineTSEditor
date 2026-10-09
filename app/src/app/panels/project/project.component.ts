@@ -36,111 +36,75 @@ const THUMB_MAX_BYTES = 8 * 1024 * 1024;
     imports: [IconComponent, ContextMenuComponent, TPipe],
     changeDetection: ChangeDetectionStrategy.OnPush,
     template: `
-        @switch (project.status()) {
-            @case ('unsupported') {
-                <div class="proj-empty">
-                    <div class="title">{{ 'proj.unsupportedTitle' | t }}</div>
-                    <div class="hint">{{ 'proj.unsupportedHint' | t }}</div>
-                </div>
-            }
-            @case ('closed') {
-                <div class="proj-empty">
-                    <div class="title">{{ 'proj.noneTitle' | t }}</div>
-                    <div class="hint">{{ 'proj.noneHint' | t }}</div>
-                    <button class="proj-btn primary" (click)="onOpenProject()">
-                        <wets-icon name="folder"></wets-icon>
-                        <span>{{ 'proj.openFolder' | t }}</span>
-                    </button>
-                </div>
-            }
-            @case ('needs-permission') {
-                <div class="proj-empty">
-                    <div class="title">{{ project.name() }}</div>
-                    <div class="hint">{{ 'proj.reconnectHint' | t }}</div>
-                    <div class="row">
-                        <button class="proj-btn primary" (click)="onReconnect()">
+        @if (project.isOpen()) {
+            <div class="proj">
+                <div class="folders">
+                    <div class="folder-group">{{ 'proj.section' | t }}</div>
+                    @for (f of project.folders(); track f.path) {
+                        <div class="folder"
+                            [class.active]="active() === f.path"
+                            [style.padding-left.px]="8 + f.depth * 14"
+                            (click)="navigate(f.path)"
+                        >
                             <wets-icon name="folder"></wets-icon>
-                            <span>{{ 'proj.reconnect' | t }}</span>
-                        </button>
-                        <button class="proj-btn" (click)="onOpenProject()">{{ 'proj.openAnother' | t }}</button>
-                    </div>
+                            <span>{{ f.name }}</span>
+                        </div>
+                    }
                 </div>
-            }
-            @case ('open') {
-                <div class="proj">
-                    <div class="folders">
-                        <div class="folder-group">{{ 'proj.section' | t }}</div>
-                        @for (f of project.folders(); track f.path) {
-                            <div class="folder"
-                                [class.active]="active() === f.path"
-                                [style.padding-left.px]="8 + f.depth * 14"
-                                (click)="navigate(f.path)"
+
+                <div class="files"
+                    [class.drop]="dropping()"
+                    (dragover)="onDragOver($event)"
+                    (dragleave)="dropping.set(false)"
+                    (drop)="onDrop($event)"
+                    (contextmenu)="onContextMenu($event, null)"
+                >
+                    <div class="crumbs">
+                        @for (c of crumbs(); track c.path; let last = $last) {
+                            <span class="c" [class.here]="last" (click)="navigate(c.path)">{{ c.label }}</span>
+                            @if (!last) { <span class="sep">›</span> }
+                        }
+                        <span class="counter">{{ itemsLabel() }}</span>
+                        <button class="proj-btn icon" [title]="'proj.newFolder' | t" (click)="onNewFolder()">
+                            <wets-icon name="plus"></wets-icon>
+                        </button>
+                        <button class="proj-btn icon" [title]="'proj.import' | t" (click)="picker.click()">
+                            <wets-icon name="file-new"></wets-icon>
+                        </button>
+                        <button class="proj-btn icon" [title]="'proj.refresh' | t" (click)="project.refresh()">
+                            <wets-icon name="reset"></wets-icon>
+                        </button>
+                        <input #picker type="file" multiple hidden (change)="onPicked(picker)">
+                    </div>
+
+                    <div class="grid">
+                        @for (a of entries(); track a.path) {
+                            <div class="asset"
+                                [class.selected]="selected() === a.path"
+                                [class.current]="project.scenePath() === a.path"
+                                [title]="a.path"
+                                (click)="selected.set(a.path)"
+                                (dblclick)="onOpenEntry(a)"
+                                (contextmenu)="onContextMenu($event, a)"
                             >
-                                <wets-icon name="folder"></wets-icon>
-                                <span>{{ f.name }}</span>
+                                <div class="thumb" [class]="'thumb ' + a.kind">
+                                    @if (thumbs()[a.path]; as url) {
+                                        <img [src]="url" alt="" draggable="false">
+                                    } @else {
+                                        <wets-icon [name]="iconOf(a)"></wets-icon>
+                                    }
+                                </div>
+                                <span class="label">{{ a.name }}</span>
+                            </div>
+                        }
+                        @if (entries().length === 0) {
+                            <div class="empty-grid">
+                                {{ 'proj.emptyFolder' | t }}
                             </div>
                         }
                     </div>
-
-                    <div class="files"
-                        [class.drop]="dropping()"
-                        (dragover)="onDragOver($event)"
-                        (dragleave)="dropping.set(false)"
-                        (drop)="onDrop($event)"
-                        (contextmenu)="onContextMenu($event, null)"
-                    >
-                        <div class="crumbs">
-                            @for (c of crumbs(); track c.path; let last = $last) {
-                                <span class="c" [class.here]="last" (click)="navigate(c.path)">{{ c.label }}</span>
-                                @if (!last) { <span class="sep">›</span> }
-                            }
-                            <span class="counter">{{ itemsLabel() }}</span>
-                            <button class="proj-btn icon" [title]="'proj.newFolder' | t" (click)="onNewFolder()">
-                                <wets-icon name="plus"></wets-icon>
-                            </button>
-                            <button class="proj-btn icon" [title]="'proj.import' | t" (click)="picker.click()">
-                                <wets-icon name="file-new"></wets-icon>
-                            </button>
-                            <button class="proj-btn icon" [title]="'proj.refresh' | t" (click)="project.refresh()">
-                                <wets-icon name="reset"></wets-icon>
-                            </button>
-                            <input #picker type="file" multiple hidden (change)="onPicked(picker)">
-                        </div>
-
-                        <div class="grid">
-                            @for (a of entries(); track a.path) {
-                                <div class="asset"
-                                    [class.selected]="selected() === a.path"
-                                    [class.current]="project.scenePath() === a.path"
-                                    [title]="a.path"
-                                    (click)="selected.set(a.path)"
-                                    (dblclick)="onOpenEntry(a)"
-                                    (contextmenu)="onContextMenu($event, a)"
-                                >
-                                    <div class="thumb" [class]="'thumb ' + a.kind">
-                                        @if (thumbs()[a.path]; as url) {
-                                            <img [src]="url" alt="" draggable="false">
-                                        } @else {
-                                            <wets-icon [name]="iconOf(a)"></wets-icon>
-                                        }
-                                    </div>
-                                    <span class="label">{{ a.name }}</span>
-                                </div>
-                            }
-                            @if (entries().length === 0) {
-                                <div class="empty-grid">
-                                    {{ 'proj.emptyFolder' | t }}
-                                    @if (active() === '' && !isLaidOut()) {
-                                        <div class="row">
-                                            <button class="proj-btn" (click)="onInitialize()">{{ 'proj.setupLayout' | t }}</button>
-                                        </div>
-                                    }
-                                </div>
-                            }
-                        </div>
-                    </div>
                 </div>
-            }
+            </div>
         }
 
         @if (ctxOpen()) {
@@ -194,12 +158,6 @@ export class ProjectComponent implements OnDestroy {
         return out;
     });
 
-    /** Whether the folder already has the layout ScenarioCreator builds from. */
-    public readonly isLaidOut = computed(() => {
-        this.project.revision();
-        return this.project.exists('scripts');
-    });
-
     constructor() {
         // The folder being viewed can disappear underneath us — deleted here,
         // or outside the editor and noticed on refresh.
@@ -248,15 +206,7 @@ export class ProjectComponent implements OnDestroy {
     // ── Project actions ──────────────────────────────────────────────
 
     public onOpenProject(): void {
-        this._cmd.run(async () => { await this.project.open(); this.navigate(''); });
-    }
-
-    public onReconnect(): void {
-        this._cmd.run(() => this.project.reconnect());
-    }
-
-    public onInitialize(): void {
-        this._cmd.run(() => this.project.initializeLayout());
+        this._cmd.openProject();
     }
 
     public async onNewFolder(): Promise<void> {

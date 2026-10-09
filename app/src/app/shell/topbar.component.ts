@@ -1,7 +1,8 @@
-import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { ContextMenuComponent, type CtxItem } from '../context-menu/context-menu.component';
 import { MENUBAR, MenuModelService, type MenuId } from '../services/menu-model.service';
 import { ProjectService } from '../services/project.service';
+import { AppStateService } from '../services/app-state.service';
 import { CommandsService } from '../services/commands.service';
 import { IconComponent } from '../icon.component';
 import { TPipe } from '../i18n/t.pipe';
@@ -19,22 +20,26 @@ import { TPipe } from '../i18n/t.pipe';
                 <span class="brand-mark"></span>
                 <span>WETS</span>
             </div>
-            @for (m of MENUBAR; track m.id) {
-                <div class="menubar-item"
-                    #miEl
-                    [class.open]="openMenu() === m.id"
-                    (click)="onClick($event, m.id, miEl)"
-                    (mouseenter)="onEnter(m.id, miEl)"
-                >{{ m.label | t }}</div>
+            @if (inWorkspace()) {
+                @for (m of MENUBAR; track m.id) {
+                    <div class="menubar-item"
+                        #miEl
+                        [class.open]="openMenu() === m.id"
+                        (click)="onClick($event, m.id, miEl)"
+                        (mouseenter)="onEnter(m.id, miEl)"
+                    >{{ m.label | t }}</div>
+                }
             }
             <div class="spacer"></div>
             <button class="gear" [title]="'prefs.open' | t" [attr.aria-label]="'prefs.title' | t" (click)="cmd.openPreferences()">
                 <wets-icon name="cog"></wets-icon>
             </button>
-            <div class="project-tag" [title]="project.scenePath() ?? ''">
-                <span class="dot"></span>
-                <span>{{ project.isOpen() ? project.name() : ('project.none' | t) }}</span>
-            </div>
+            @if (inWorkspace()) {
+                <div class="project-tag" [title]="project.scenePath() ?? ''">
+                    <span class="dot"></span>
+                    <span>{{ project.name() }}</span>
+                </div>
+            }
         </header>
 
         @if (openMenu()) {
@@ -53,6 +58,10 @@ export class TopbarComponent {
     public readonly project = inject(ProjectService);
     public readonly cmd = inject(CommandsService);
     private readonly _menus = inject(MenuModelService);
+    private readonly _state = inject(AppStateService);
+
+    /** The menus and the project name belong to editing; the start screen has only the logo and the gear. */
+    public readonly inWorkspace = computed(() => this._state.screen() === 'workspace');
 
     public readonly openMenu = signal<MenuId | null>(null);
     public readonly items = signal<CtxItem[]>([]);

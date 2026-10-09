@@ -6,7 +6,7 @@ import { HistoryService } from './history.service';
 import { ClipboardService } from './clipboard.service';
 import { ComponentRegistryService } from './component-registry.service';
 import { FileIoService } from './file-io.service';
-import { ProjectService, type ProjectEntry } from './project.service';
+import { ProjectService, type ProjectEntry, type ProjectFolderHandle, type RecentProject } from './project.service';
 import { ViewportService } from '../viewport.service';
 import { DialogService } from '../dialogs/dialog.service';
 import { SettingsDialogComponent } from '../settings/settings-dialog.component';
@@ -210,22 +210,110 @@ export class CommandsService {
 
     // ── Project ──────────────────────────────────────────────────────
 
-    public openProject(): void {
-        this.run(() => this._project.open());
+    /** Starts a new project. For now that is opening an empty folder; the wizard replaces this. */
+    public createProject(): void {
+        this.openProject();
     }
 
+    /**
+     * Picks a folder and opens it as the project.
+     *
+     * What happens next depends on what the folder is: a project opens as it
+     * is; an empty folder or one that is not yet a project is set up only after
+     * the user agrees, because turning someone's folder into a project is not
+     * something to do silently.
+     */
+    public openProject(): void {
+        this.run(async () => {
+            if (!await this._confirmDiscard()) return;
+            const handle = await this._project.pickFolder();
+            if (!handle) return;
+
+            const kind = await this._project.inspect(handle);
+            if (kind !== 'project') {
+                const set = await this._dialog.confirm(kind === 'empty'
+                    ? {
+                        title: this._i18n.t('open.emptyTitle'),
+                        message: this._i18n.t('open.emptyMessage', { name: handle.name }),
+                        confirmLabel: this._i18n.t('open.setUp'),
+                        cancelLabel: this._i18n.t('dialog.cancel'),
+                    }
+                    : {
+                        title: this._i18n.t('open.notProjectTitle'),
+                        message: this._i18n.t('open.notProjectMessage', { name: handle.name }),
+                        confirmLabel: this._i18n.t('open.makeProject'),
+                        cancelLabel: this._i18n.t('dialog.cancel'),
+                    });
+                if (!set) return;
+            }
+
+            await this._enter(handle);
+            if (kind !== 'project') await this._project.initializeLayout();
+        });
+    }
+
+    /**
+     * Reopens a project from the recent list. Called straight from the click —
+     * the browser's permission prompt needs the user gesture, so nothing may be
+     * awaited before the project service asks for access.
+     */
+    public openRecent(recent: RecentProject): void {
+        this.run(async () => {
+            const result = await this._project.openRecent(recent);
+            if (result === 'ok') {
+                this._resetScene();
+                await this._loadDefaultScene();
+            } else {
+                await this.fail(this._i18n.t(result === 'denied' ? 'open.denied' : 'open.missing', { name: recent.name }));
+            }
+        });
+    }
+
+    /** Closes the project and goes back to the start screen. */
     public closeProject(): void {
-        this.run(() => this._project.close());
+        this.run(async () => {
+            if (!await this._confirmDiscard()) return;
+            this._resetScene();
+            await this._project.close();
+        });
+    }
+
+    /** Makes `handle` the open project, replacing the one that is open. */
+    private async _enter(handle: ProjectFolderHandle): Promise<void> {
+        this._resetScene();
+        await this._project.adopt(handle);
+        await this._loadDefaultScene();
+    }
+
+    /** An empty scene, with nothing selected and nothing to undo. */
+    private _resetScene(): void {
+        this._selection.clear();
+        this._scene.clear();
+        this._history.clear();
+        this._project.scenePath.set(null);
+    }
+
+    /**
+     * Opens the project's main scene if it has one. Without this, saving in a
+     * project that already has `main.scene.json` would write the empty scene
+     * over it.
+     */
+    private async _loadDefaultScene(): Promise<void> {
+        const path = 'assets/scenes/main.scene.json';
+        if (!this._project.exists(path)) return;
+        try {
+            const text = await this._project.readText(path);
+            if (await this._loadSceneText('main.scene.json', text)) this._project.scenePath.set(path);
+        } catch (err) {
+            await this.fail(this._i18n.t('scene.readFailed', { path, error: messageOf(err) }));
+        }
     }
 
     // ── Scenes ───────────────────────────────────────────────────────
 
     public async newScene(): Promise<void> {
         if (!await this._confirmDiscard()) return;
-        this._selection.clear();
-        this._scene.clear();
-        this._history.clear();
-        this._project.scenePath.set(null);
+        this._resetScene();
     }
 
     /**
@@ -239,7 +327,25 @@ export class CommandsService {
             this._fileIo.saveText('main.scene.json', text);
             return;
         }
-        this._writeScene(this._project.scenePath() ?? 'assets/scenes/main.scene.json', text);
+        const known = this._project.scenePath();
+        if (known) {
+            this._writeScene(known, text);
+            return;
+        }
+        // A scene with no file yet. If the default name is taken by another scene,
+        // writing to it would silently replace that scene.
+        const target = 'assets/scenes/main.scene.json';
+        if (!this._project.exists(target)) {
+            this._writeScene(target, text);
+            return;
+        }
+        void this._dialog.confirm({
+            title: this._i18n.t('scene.overwriteTitle'),
+            message: this._i18n.t('scene.overwriteMessage', { path: target }),
+            confirmLabel: this._i18n.t('scene.replace'),
+            cancelLabel: this._i18n.t('dialog.cancel'),
+            danger: true,
+        }).then(replace => { if (replace) this._writeScene(target, text); });
     }
 
     public async saveAs(): Promise<void> {
@@ -339,5 +445,7 @@ export class CommandsService {
 }
 
 function messageOf(err: unknown): string {
-    return (err as Error)?.message ?? String(err);
+    const e = err as { name?: string; message?: string } | null | undefined;
+    if (e?.message) return e.message;
+    return `${Object.prototype.toString.call(err)} ${e?.name ?? ''} ${String(err)}`.trim();
 }

@@ -129,6 +129,75 @@ input, select, textarea { font: inherit; color: inherit; }
   background: var(--bg-0);
 }
 
+/* ─── Start screen ───────────────────────────────────────── */
+.app.start-layout { grid-template-rows: var(--menubar-h) 1fr; }
+.start {
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  padding: 24px;
+  background: var(--bg-0);
+}
+.start-card {
+  width: min(640px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+}
+.start-head { text-align: center; }
+.start-head h1 { margin: 10px 0 4px; font-size: 22px; font-weight: 700; }
+.start-head p  { margin: 0; color: var(--fg-2); font-size: 13px; }
+.brand-mark.big { width: 34px; height: 34px; position: relative; display: inline-block; }
+.brand-mark.big::before,
+.brand-mark.big::after { content: ""; position: absolute; inset: 0; border-radius: 4px; }
+.brand-mark.big::before { background: var(--accent); transform: rotate(45deg) scale(0.78); }
+.brand-mark.big::after  { border: 2px solid var(--fg-0); transform: rotate(45deg) scale(0.96); }
+.start-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.start-action {
+  display: flex; align-items: center; gap: 12px; text-align: left;
+  padding: 16px;
+  background: var(--bg-1);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius-lg);
+  font-size: 22px;
+  color: var(--accent);
+}
+.start-action:hover { background: var(--bg-2); border-color: var(--accent); }
+.start-action.primary { background: var(--accent-bg); border-color: var(--accent); }
+.start-action span { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--fg-0); }
+.start-action small { color: var(--fg-2); font-size: 11px; }
+.start-recent h2 {
+  margin: 0 0 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--fg-3);
+}
+.recent {
+  display: flex; align-items: center; gap: 10px;
+  height: 34px; padding: 0 10px;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+.recent:hover, .recent:focus-visible { background: var(--bg-2); outline: none; }
+.recent wets-icon { color: var(--accent); font-size: 14px; }
+.recent .rname { flex: 1; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent .rwhen { color: var(--fg-2); font-size: 11px; }
+.recent .rforget { width: 22px; height: 22px; color: var(--fg-3); border-radius: var(--radius); visibility: hidden; }
+.recent:hover .rforget, .recent:focus-within .rforget { visibility: visible; }
+.recent .rforget:hover { background: var(--bg-3); color: var(--err); }
+.start-muted { margin: 0; padding: 8px 10px; color: var(--fg-3); font-style: italic; }
+.start-unsupported {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 14px 16px; line-height: 1.5;
+  background: var(--bg-1); border: 1px solid var(--err); border-radius: var(--radius-lg);
+}
+.start-foot { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.start-foot p { margin: 0; color: var(--fg-2); font-size: 11px; }
+.start-lang { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--radius); overflow: hidden; flex: none; }
+.start-lang button { height: 24px; padding: 0 12px; background: var(--bg-2); color: var(--fg-1); font-size: 11px; }
+.start-lang button + button { border-left: 1px solid var(--line-2); }
+.start-lang button.on { background: var(--accent); color: #121318; font-weight: 600; }
+.start-narrow { display: none; margin: 0; padding: 8px 12px; font-size: 11px; color: var(--warn); border: 1px solid var(--warn); border-radius: var(--radius); }
+@media (max-width: 1100px) { .start-narrow { display: block; } }
+
 /* ─── Menu bar ───────────────────────────────────────────── */
 .menubar {
   display: flex;
