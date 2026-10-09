@@ -5,7 +5,8 @@
   "scripts": {
     "start": "ng serve --port 4200",
     "build": "ng build",
-    "e2e": "node e2e/run.mjs"
+    "e2e": "node e2e/run.mjs",
+    "e2e:build": "node e2e/scenariocreator-check.mjs"
   },
   "dependencies": {
     "@angular/common": "^19.1.0",

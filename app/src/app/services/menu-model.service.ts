@@ -61,6 +61,8 @@ export class MenuModelService {
 
     private _file(): CtxItem[] {
         return [
+            { label: this._t('file.newProject'),   disabled: this._project.status() === 'unsupported',
+                action: () => this._cmd.createProject() },
             { label: this._t('file.openProject'),  disabled: this._project.status() === 'unsupported',
                 action: () => this._cmd.openProject() },
             { label: this._t('file.closeProject'), disabled: !this._project.isOpen(),

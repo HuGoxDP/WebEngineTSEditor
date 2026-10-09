@@ -1,4 +1,5 @@
 import { Injectable, computed, signal } from '@angular/core';
+import { defaultMeta, metaJson, SCENARIO_TEMPLATE, type ProjectMeta } from './project-templates';
 
 /** What a file is, as far as the Project panel cares — drives icon and double-click. */
 export type ProjectEntryKind =
@@ -147,6 +148,29 @@ export class ProjectService {
         return children.length > 0 ? 'foreign' : 'empty';
     }
 
+    /**
+     * Whether a project could be created as `name` inside `parent`: `free` if
+     * nothing is there, `taken` if a non-empty folder or a file already is.
+     * An existing empty folder is fine to use.
+     */
+    public async folderState(parent: ProjectFolderHandle, name: string): Promise<'free' | 'taken'> {
+        try {
+            const existing = await parent.getDirectoryHandle(name) as ProjectFolderHandle;
+            return (await listDir(existing, 1)).length === 0 ? 'free' : 'taken';
+        } catch (err) {
+            const kind = (err as DOMException)?.name;
+            if (kind === 'NotFoundError') return 'free';
+            // A *file* with that name: the folder cannot be made.
+            if (kind === 'TypeMismatchError') return 'taken';
+            throw err;
+        }
+    }
+
+    /** Creates `name` inside `parent` (or reuses it if it exists) and returns it. */
+    public async createFolderIn(parent: ProjectFolderHandle, name: string): Promise<ProjectFolderHandle> {
+        return await parent.getDirectoryHandle(name, { create: true }) as ProjectFolderHandle;
+    }
+
     // ── Opening and closing ──────────────────────────────────────────
 
     /** Makes a folder the open project and remembers it in the recent list. */
@@ -272,13 +296,13 @@ export class ProjectService {
      * Lays out an empty folder as a scenario ScenarioCreator can build:
      * an entry point that loads the saved scene, the scenes folder, and
      * `scenario.meta.json`. Existing files are left alone.
+     *
+     * @param meta - the project's identity; derived from the folder name when
+     *   the folder was not set up through the new-project wizard.
      */
-    public async initializeLayout(): Promise<void> {
-        const slug = this.name().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'scenario';
-
+    public async initializeLayout(meta: ProjectMeta = defaultMeta(this.name())): Promise<void> {
         if (!this.exists('scenario.meta.json')) {
-            const meta = { id: slug, name: this.name(), version: '1.0.0' };
-            await this.write('scenario.meta.json', `${JSON.stringify(meta, null, 2)}\n`);
+            await this.write('scenario.meta.json', metaJson(meta));
         }
         if (!this.exists('scripts/Scenario.ts')) {
             await this.write('scripts/Scenario.ts', SCENARIO_TEMPLATE);
@@ -466,21 +490,3 @@ function idb<T>(mode: IDBTransactionMode, run: (store: IDBObjectStore) => IDBReq
         };
     });
 }
-
-/**
- * Entry point written into a new project. It loads the scene the editor saved;
- * anything better built in code goes after that call.
- */
-const SCENARIO_TEMPLATE = `import { ScenarioBehaviour, SceneSerializer } from "WebEngineTS";
-
-/** Scene the editor saves, relative to assets/. */
-const SCENE = "scenes/main.scene.json";
-
-export default class Scenario extends ScenarioBehaviour {
-
-    override async awake(): Promise<void> {
-        const blob = await this.context.assets.getAsset(SCENE);
-        SceneSerializer.deserializeScene(JSON.parse(await blob.text()));
-    }
-}
-`;

@@ -1,5 +1,5 @@
 import { Injectable, inject } from '@angular/core';
-import { SceneSerializer, type GameObject, type SerializedScene } from 'WebEngineTS';
+import { Camera, DirectionalLight, Quaternion, SceneSerializer, Vector3, type GameObject, type SerializedScene } from 'WebEngineTS';
 import { SceneService } from './scene.service';
 import { SelectionService } from './selection.service';
 import { HistoryService } from './history.service';
@@ -10,6 +10,7 @@ import { ProjectService, type ProjectEntry, type ProjectFolderHandle, type Recen
 import { ViewportService } from '../viewport.service';
 import { DialogService } from '../dialogs/dialog.service';
 import { SettingsDialogComponent } from '../settings/settings-dialog.component';
+import { NewProjectDialogComponent, type NewProjectResult } from '../screens/start/new-project-dialog.component';
 import { I18nService, type MessageKey } from '../i18n/i18n.service';
 import type { CtxItem } from '../context-menu/context-menu.component';
 
@@ -210,9 +211,45 @@ export class CommandsService {
 
     // ── Project ──────────────────────────────────────────────────────
 
-    /** Starts a new project. For now that is opening an empty folder; the wizard replaces this. */
+    /**
+     * Runs the new-project wizard, then creates what it described: a folder, the
+     * scenario layout, and a first scene saved to disk so the project has a main
+     * scene from the start. Cancelling the wizard writes nothing.
+     */
     public createProject(): void {
-        this.openProject();
+        this.run(async () => {
+            if (!await this._confirmDiscard()) return;
+            const result = await this._dialog.open<NewProjectResult>(
+                () => this._i18n.t('wiz.title'), NewProjectDialogComponent);
+            if (!result) return;
+
+            const folder = await this._project.createFolderIn(result.parent, result.folderName);
+            await this._enter(folder);
+            await this._project.initializeLayout(result.meta);
+            if (result.template === 'lightCamera') this._buildLightAndCamera();
+
+            const path = 'assets/scenes/main.scene.json';
+            await this._project.write(path, `${JSON.stringify(this._scene.serialize(), null, 2)}\n`);
+            this._project.scenePath.set(path);
+            this._history.clear();
+        });
+    }
+
+    /**
+     * The "Light and camera" starting point, built through the engine and then
+     * serialized like any other scene — a hand-written scene file would go stale
+     * the first time the engine's format moved.
+     */
+    private _buildLightAndCamera(): void {
+        const camera = this._scene.createEmpty(this._i18n.t('go.camera'));
+        camera.tag = 'MainCamera';
+        camera.addComponent(Camera);
+        camera.transform.localPosition = new Vector3(0, 1, -10);
+
+        const sun = this._scene.createEmpty(this._i18n.t('go.directionalLight'));
+        sun.addComponent(DirectionalLight);
+        sun.transform.localPosition = new Vector3(0, 3, 0);
+        sun.transform.localRotation = Quaternion.euler(50, -30, 0);
     }
 
     /**

@@ -16,7 +16,7 @@
 // WebEngineTS/scripts/shoot.mjs does — nothing is downloaded.
 
 import { createRequire } from "node:module";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -110,6 +110,30 @@ const readDisk = (page, folder, path) => page.evaluate(async ([name, file]) => {
         return await (await (await dir.getFileHandle(parts.at(-1))).getFile()).text();
     } catch { return null; }
 }, [folder, path]);
+
+/** Copies a folder from the page's "disk" to a real directory, so other tools can be pointed at it. */
+async function exportFolder(page, folder, sub, targetDir) {
+    const files = await page.evaluate(async ([name, path]) => {
+        const out = {};
+        const walk = async (dir, prefix) => {
+            for await (const h of dir.values()) {
+                const p = prefix ? `${prefix}/${h.name}` : h.name;
+                if (h.kind === "directory") await walk(h, p);
+                else out[p] = Array.from(new Uint8Array(await (await h.getFile()).arrayBuffer()));
+            }
+        };
+        let dir = await (await navigator.storage.getDirectory()).getDirectoryHandle(name);
+        for (const part of path.split("/")) dir = await dir.getDirectoryHandle(part);
+        await walk(dir, "");
+        return out;
+    }, [folder, sub]);
+    rmSync(targetDir, { recursive: true, force: true });
+    for (const [path, bytes] of Object.entries(files)) {
+        const file = resolve(targetDir, path);
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, Buffer.from(bytes));
+    }
+}
 
 const shot = async (page, name) => page.screenshot({ path: `${SHOTS}/${name}.png` });
 
@@ -272,6 +296,72 @@ scenario("unsaved changes: closing asks, saving never silently replaces a scene"
 
     await menu(page, "File", "Close Project");
     await dialogButton(page, "Discard").click().catch(() => {});
+    check("no native dialogs were used", page.nativeDialogs === 0);
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("new project wizard: collects, validates, creates; cancelling writes nothing", async () => {
+    const page = await newPage("WizParent");
+    const exists = name => page.evaluate(async n => {
+        try { await (await navigator.storage.getDirectory()).getDirectoryHandle(n); return true; } catch { return false; }
+    }, name);
+
+    // Cancelling at any step leaves nothing on disk — not even the parent folder, which the picker would create.
+    await page.getByText("Create project").click();
+    check("the wizard opens", (await dialogTitle(page).innerText()) === "New project");
+    check("the title field has focus", await page.evaluate(() => document.activeElement?.id === "wiz-name"));
+    await page.keyboard.press("Escape");
+    check("cancelling creates nothing", !(await exists("WizParent")));
+
+    await page.getByText("Create project").click();
+    await page.locator("#wiz-name").fill("Будова атома");
+    check("the address follows the title, transliterated", (await page.locator("#wiz-id").inputValue()) === "budova-atoma");
+    await page.locator("#wiz-id").fill("Bad_Id");
+    check("an invalid address is flagged", (await page.locator(".wiz-error").innerText()).includes("lowercase"));
+    await page.locator(".dlg-btn.primary").click();
+    check("and blocks going on", (await page.locator(".wiz-steps").innerText()).includes("Step 1 of 3"));
+    await page.locator("#wiz-id").fill("budova-atoma");
+    await page.locator("#wiz-desc").fill("Periodic table and shells");
+    await page.locator("#wiz-cat").selectOption("demo");
+    await shot(page, "e2e-wizard-1");
+    await page.locator(".dlg-btn.primary").click();
+    check("step two offers the starting points", (await page.locator(".wiz-card").count()) === 2);
+    check("light and camera is the default", (await page.locator(".wiz-card.on strong").innerText()) === "Light and camera");
+    await page.locator(".dlg-btn.primary").click();
+    check("step three needs a folder first", (await page.locator(".wiz-parent").innerText()) === "No folder chosen.");
+    check("the folder name follows the title", (await page.locator("#wiz-folder").inputValue()) === "Будова атома");
+
+    // The chosen location already holds a non-empty folder of that name.
+    await seed(page, "WizParent", { "Будова атома/old.txt": "x" });
+    await page.getByText("Choose a folder…").click();
+    await page.waitForTimeout(200);
+    await page.locator(".dlg-btn.primary").click();
+    await page.waitForTimeout(300);
+    await shot(page, "e2e-wizard-3");
+    check("a taken name is refused with a reason", (await page.locator(".wiz-error").innerText()).includes("already exists"));
+    check("and the wizard stays open", (await page.locator(".wiz-steps").innerText()).includes("Step 3 of 3"));
+    await page.locator("#wiz-folder").fill("Atom");
+    await page.keyboard.press("Enter");
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(800);
+
+    check("the project opens", (await page.locator(".project-tag").innerText()).includes("Atom"));
+    const hierarchy = await page.locator("app-hierarchy").innerText();
+    check("the starting scene has a camera and a light", hierarchy.includes("Camera") && hierarchy.includes("Directional Light"), hierarchy.replace(/\s+/g, " "));
+    check("a fresh project is not 'unsaved'", (await page.locator(".statusbar").innerText()).includes("Saved"));
+
+    const files = await diskState(page, "WizParent");
+    check("the layout is in the new folder", ["Atom/scenario.meta.json", "Atom/scripts/Scenario.ts", "Atom/assets/scenes/main.scene.json"].every(f => files.includes(f)), files.join(", "));
+    check("the existing folder was left alone", files.includes("Будова атома/old.txt"));
+    const meta = JSON.parse(await readDisk(page, "WizParent", "Atom/scenario.meta.json"));
+    check("the identity is what was typed", meta.id === "budova-atoma" && meta.name === "Будова атома" && meta.category === "demo"
+        && meta.description === "Periodic table and shells" && meta.version === "1.0.0", JSON.stringify(meta));
+    const scene = JSON.parse(await readDisk(page, "WizParent", "Atom/assets/scenes/main.scene.json"));
+    check("the scene was written with both objects", scene.roots.length === 2 && scene.version === 1, JSON.stringify(scene.roots.map(r => r.name)));
+    const cam = scene.roots.find(r => r.components.some(c => c.type === "Camera"));
+    check("the camera looks at the scene from the back", cam && cam.transform.position.z === -10, JSON.stringify(cam?.transform.position));
+
+    await exportFolder(page, "WizParent", "Atom", resolve(SHOTS, "wizard-project"));
     check("no native dialogs were used", page.nativeDialogs === 0);
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
