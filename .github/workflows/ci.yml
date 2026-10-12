@@ -11,24 +11,48 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Read-only, stated rather than inherited: on a push the token otherwise gets
+# the repository's default permissions, which may include write. Nothing here
+# writes to the repo; the artifact upload uses the Actions runtime token, not
+# this one.
+permissions:
+  contents: read
+
+# Every job below:
+#
+# - Checks out with persist-credentials: false. Nothing uses git after the
+#   checkout, and the token should not stay on disk while `npm ci`, the
+#   Angular build and Playwright's installer run third-party code.
+# - Uses v7 of the actions. The v4s declare the end-of-life Node 20 runtime,
+#   which runners still run, moved onto Node 24, with a deprecation warning
+#   every run.
+# - Has no npm cache: no `cache: npm`, and `package-manager-cache: false`,
+#   since setup-node v6 and later turn the cache on by themselves once a
+#   package.json names npm in `packageManager`. npm's cache is addressed by the
+#   integrity the lockfile records. With a warm cache, `npm ci` installs the
+#   engine from the cache instead of reading app/WebEngineTS-0.1.0.tgz, so a
+#   tarball replaced without a lockfile update would build and pass against the
+#   previous engine. Cold, as here, it fails with EINTEGRITY. Both reproduced
+#   with npm 10.9; a cold install of app/ takes about ten seconds.
 jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: app/package-lock.json
+          package-manager-cache: false
 
       # `npm ci`, so the job fails when the lockfile and the committed engine
-      # tarball disagree (EINTEGRITY) — which is how a clean clone sees it. The
-      # lockfile is generated on Windows but already records the linux-x64
-      # native packages, so ci works here (unlike virtual-lab's frontend).
+      # tarball disagree (EINTEGRITY), as a clean clone sees it. The lockfile is
+      # generated on Windows but already records the linux-x64 native packages,
+      # so ci works here (unlike virtual-lab's frontend).
       - name: Install
         working-directory: app
         run: npm ci
@@ -42,7 +66,9 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Catches Dockerfile drift: the image installs and builds on its own, from
       # the context .dockerignore leaves, with --base-href /editor/.
@@ -58,8 +84,8 @@ jobs:
           docker run -d --name editor -p 8080:80 webengine-editor:ci
           timeout 30 bash -c 'until curl -sf localhost:8080/healthz; do sleep 1; done' \
             || { docker logs editor; exit 1; }
-          # Not `grep -q`: it can exit before curl has written everything, and
-          # the runner's pipefail would then report curl's broken pipe.
+          # A step without `shell:` runs as `bash -e`, without pipefail, so the
+          # pipeline's status is grep's. A failed curl leaves it nothing to match.
           curl -sf localhost:8080/editor/ | grep -F '<base href="/editor/">'
           docker rm -f editor
 
@@ -75,13 +101,14 @@ jobs:
       LANG: C.UTF-8
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: app/package-lock.json
+          package-manager-cache: false
 
       - name: Install
         working-directory: app
@@ -120,9 +147,13 @@ jobs:
           E2E_BROWSER_CHANNEL: chromium
         run: npm run e2e
 
-      - uses: actions/upload-artifact@v4
+      # include-hidden-files: the action skips anything under a folder whose name
+      # starts with a dot, the search path itself included. Without it, `.shots/`
+      # uploads nothing at all.
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: e2e-shots
           path: .shots/
+          include-hidden-files: true
           retention-days: 7
