@@ -54,6 +54,37 @@ docker compose -f docker-compose.yml -f docker-compose.editor.yml up --build -d
 If you change the engine, rebuild it (`npm run build` in `WebEngineTS`) and reinstall here
 (`npm install`) so the editor picks up the new `dist/`.
 
+## CI
+
+`.github/workflows/ci.yml` runs on every push and pull request, and by hand:
+
+- **Build** — `npm ci` and `npm run build` in `app/`.
+- **Docker build** — `docker build .`, the image as the platform builds it, then a start-up
+  check that nginx serves `/editor/` with the right base href.
+- **e2e (Chromium)** — `app/e2e/run.mjs`, the editor's only test suite, against a production
+  build served at `http://localhost:8044/editor/`, in Playwright's Chromium. `.shots/` is
+  uploaded as an artifact when it fails.
+
+`npm ci` checks the engine tarball against the hash in `package-lock.json`, so commit
+`app/WebEngineTS-0.1.0.tgz` and the lockfile together; one without the other fails every job
+with `EINTEGRITY`.
+
+To run the e2e as CI does, without `testv/virtual-lab` or Edge:
+
+```bash
+cd app
+npm run build -- --base-href /editor/
+# serve app/dist/browser at http://localhost:8044/editor/ (ci.yml does it with python3), then:
+E2E_PLAYWRIGHT_DIR="$(npm root -g)" E2E_BROWSER_CHANNEL=chromium npm run e2e
+```
+
+`E2E_PLAYWRIGHT_DIR` is any directory `require("playwright")` resolves from, and
+`E2E_BROWSER_CHANNEL=chromium` uses Playwright's Chromium (`npx playwright install chromium`)
+instead of Edge. Unset, both keep the defaults: virtual-lab's Playwright and Edge. On Linux,
+run it in a UTF-8 locale (`LANG=C.UTF-8`): under `C`/`POSIX`, Chromium turns a non-ASCII name
+in the origin-private file system the scenarios use into an empty one, and the wizard scenario
+fails for that reason alone.
+
 ## Relationship to the other projects
 
 - **WebEngineTS** — the engine library this editor is built on.
