@@ -17,7 +17,10 @@
 // neither that checkout nor Edge (CI, a Linux box) points both elsewhere:
 //
 //   E2E_PLAYWRIGHT_DIR=<dir>       where require("playwright") resolves from, e.g.
-//                                  `npm root -g`; default ../testv/virtual-lab/e2e
+//                                  `npm root -g`. A relative path is taken from the
+//                                  current directory (app/ under `npm run e2e`).
+//                                  Default: testv/virtual-lab/e2e beside this
+//                                  repository, ../testv/virtual-lab/e2e from its root.
 //   E2E_BROWSER_CHANNEL=chromium   Playwright's own Chromium instead of Edge; an
 //                                  empty value uses its headless shell. Default msedge.
 //
@@ -148,6 +151,28 @@ const readDisk = (page, folder, path) => page.evaluate(async ([name, file]) => {
         return await (await (await dir.getFileHandle(parts.at(-1))).getFile()).text();
     } catch { return null; }
 }, [folder, path]);
+
+/**
+ * Keeps each write of the recovery copy open `ms` longer before it closes, so
+ * an autosave is nearly always in flight when the next step runs. A race with
+ * it then shows every run instead of one run in eight. 0 turns it off; a
+ * reload does too.
+ */
+const slowAutosave = (page, ms) => page.evaluate(delay => {
+    if (window.__slowAutosave === undefined) {
+        const create = FileSystemFileHandle.prototype.createWritable;
+        FileSystemFileHandle.prototype.createWritable = async function (...args) {
+            const writable = await create.apply(this, args);
+            const hold = this.name === "autosave.scene.json" ? window.__slowAutosave : 0;
+            if (hold > 0) {
+                const close = writable.close.bind(writable);
+                writable.close = async () => { await new Promise(r => setTimeout(r, hold)); return close(); };
+            }
+            return writable;
+        };
+    }
+    window.__slowAutosave = delay;
+}, ms);
 
 /** Copies a folder from the page's "disk" to a real directory, so other tools can be pointed at it. */
 async function exportFolder(page, folder, sub, targetDir) {
@@ -443,9 +468,14 @@ scenario("recovery: unsaved work survives a crash; giving it up is remembered", 
     check("a recovery copy appears while there are unsaved changes", copy !== null && JSON.parse(copy).roots.length === 1);
     check("the Project panel does not show it", !(await page.locator(".proj").innerText()).includes("autosave"));
 
+    // With an autosave mid-write. Its open file used to make the removal fail,
+    // and the copy outlived the save.
+    await slowAutosave(page, 500);
+    await page.waitForTimeout(700);
     await page.keyboard.press("Control+s");
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(1500);
     check("saving removes it", (await autosave()) === null);
+    await slowAutosave(page, 0);
 
     // "Crash": the tab goes away with unsaved work in it.
     await page.keyboard.press("Alt+Shift+N");
@@ -472,11 +502,14 @@ scenario("recovery: unsaved work survives a crash; giving it up is remembered", 
     check("refusing deletes it", (await autosave()) === null);
     check("and the scene is the saved one", (await page.locator("app-hierarchy li").count()) === 2);
 
-    // "Don't save" in the close dialog gives it up too.
+    // "Don't save" in the close dialog gives it up too, with an autosave mid-write
+    // as above: this is where the race first showed, about one full run in eight.
     await page.locator("canvas").click({ position: { x: 300, y: 300 } });
     await page.keyboard.press("Alt+Shift+N");
     await page.waitForTimeout(1000);
     check("a copy exists again", (await autosave()) !== null);
+    await slowAutosave(page, 500);
+    await page.waitForTimeout(700);
     await menu(page, "File", "Close Project");
     await dialogButton(page, "Don't save").click();
     await page.locator(".start-card").waitFor();

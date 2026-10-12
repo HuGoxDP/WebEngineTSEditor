@@ -103,6 +103,9 @@ export class DocumentService {
     /** No autosave before this time (ms since the epoch). Set when the user gives their changes up. */
     private _quietUntil = 0;
 
+    /** The recovery copy being written, while it is; null between writes. */
+    private _autosaving: Promise<void> | null = null;
+
     /**
      * The user chose not to keep the unsaved changes. Deletes the recovery copy
      * and keeps the timer from writing it again in the moments before the caller
@@ -119,6 +122,19 @@ export class DocumentService {
         // is on screen during play is not work.
         if (!this._settings.autosave() || !this.dirty() || this._play.isPlaying()) return;
         if (Date.now() < this._quietUntil) return;
+        // One write at a time: a tick that finds the last one still going skips,
+        // and the next writes the newer state. It also leaves a single write for
+        // discardAutosave to wait for.
+        if (this._autosaving) return;
+        this._autosaving = this._writeAutosave();
+        try {
+            await this._autosaving;
+        } finally {
+            this._autosaving = null;
+        }
+    }
+
+    private async _writeAutosave(): Promise<void> {
         try {
             await this._project.write(AUTOSAVE_FILE, JSON.stringify(this._scene.serialize()), false);
         } catch (err) {
@@ -148,6 +164,12 @@ export class DocumentService {
 
     /** Deletes the recovery copy. Called once its contents are saved, or deliberately given up. */
     public async discardAutosave(): Promise<void> {
+        // Not while a write is in flight. Its open writable makes the removal fail
+        // (NoModificationAllowedError), the write then completes, and the copy
+        // outlives the save or the "Don't save" meant to end it: the next open
+        // offers it back. One wait is enough. After a save or abandonChanges, a
+        // new write starts only for new unsaved changes, which a copy should protect.
+        await this._autosaving;
         try {
             await this._project.removeQuietly(AUTOSAVE_FILE);
         } catch {
