@@ -1,0 +1,128 @@
+name: CI
+
+on:
+  push:
+    # Branches only: a tag points at a commit some branch push already checked.
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # `npm ci`, so the job fails when the lockfile and the committed engine
+      # tarball disagree (EINTEGRITY) — which is how a clean clone sees it. The
+      # lockfile is generated on Windows but already records the linux-x64
+      # native packages, so ci works here (unlike virtual-lab's frontend).
+      - name: Install
+        working-directory: app
+        run: npm ci
+
+      - name: Build
+        working-directory: app
+        run: npm run build
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Catches Dockerfile drift: the image installs and builds on its own, from
+      # the context .dockerignore leaves, with --base-href /editor/.
+      - name: Build image
+        run: docker build -t webengine-editor:ci .
+
+      # Building the image copies docker/nginx.conf but never parses it; starting
+      # nginx does.
+      # Then the two things the platform's proxy relies on: the editor under
+      # /editor/, with the matching base href, and the health check.
+      - name: Smoke-test the image
+        run: |
+          docker run -d --name editor -p 8080:80 webengine-editor:ci
+          timeout 30 bash -c 'until curl -sf localhost:8080/healthz; do sleep 1; done' \
+            || { docker logs editor; exit 1; }
+          # Not `grep -q`: it can exit before curl has written everything, and
+          # the runner's pipefail would then report curl's broken pipe.
+          curl -sf localhost:8080/editor/ | grep -F '<base href="/editor/">'
+          docker rm -f editor
+
+  e2e:
+    name: e2e (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Chromium on Linux converts file names through the C library's locale. In
+      # a non-UTF-8 one, a non-ASCII name becomes empty — the wizard scenario's
+      # "Будова атома" folder then resolves to its parent. Runners default to
+      # C.UTF-8; this keeps the result from depending on that.
+      LANG: C.UTF-8
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install
+        working-directory: app
+        run: npm ci
+
+      # The base href the Docker image builds with, served under the same path, so
+      # run.mjs's default URL (http://localhost:8044/editor/) and its reloads mean
+      # here what they mean against the container. No scenario needs nginx itself.
+      - name: Build for /editor/
+        working-directory: app
+        run: npm run build -- --base-href /editor/
+
+      - name: Serve it at /editor/
+        run: |
+          mkdir -p "$RUNNER_TEMP/site"
+          ln -s "$GITHUB_WORKSPACE/app/dist/browser" "$RUNNER_TEMP/site/editor"
+          nohup python3 -m http.server 8044 --bind 127.0.0.1 --directory "$RUNNER_TEMP/site" \
+            > "$RUNNER_TEMP/http.log" 2>&1 &
+          timeout 30 bash -c 'until curl -sf localhost:8044/editor/ >/dev/null; do sleep 1; done' \
+            || { cat "$RUNNER_TEMP/http.log"; exit 1; }
+
+      # Locally, run.mjs borrows Playwright from testv/virtual-lab/e2e and drives
+      # the installed Edge; a runner has neither. Playwright goes outside app/ so
+      # the editor's package.json and lockfile stay as they are. 1.56.1 is the
+      # version this suite was verified with on Linux; virtual-lab's e2e is on a
+      # newer one, and following it is a one-line change once a run proves it.
+      - name: Install Playwright and Chromium
+        run: |
+          npm install --prefix "$RUNNER_TEMP/playwright" --no-audit --no-fund playwright@1.56.1
+          "$RUNNER_TEMP/playwright/node_modules/.bin/playwright" install --with-deps chromium
+
+      - name: e2e
+        working-directory: app
+        env:
+          E2E_PLAYWRIGHT_DIR: ${{ runner.temp }}/playwright
+          E2E_BROWSER_CHANNEL: chromium
+        run: npm run e2e
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-shots
+          path: .shots/
+          retention-days: 7
