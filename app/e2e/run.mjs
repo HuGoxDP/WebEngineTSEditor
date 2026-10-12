@@ -13,7 +13,17 @@
 // runs the real code. The dialog itself is a manual check.
 //
 // Playwright and Edge are borrowed from testv/virtual-lab/e2e, like
-// WebEngineTS/scripts/shoot.mjs does — nothing is downloaded.
+// WebEngineTS/scripts/shoot.mjs does — nothing is downloaded. A machine that has
+// neither that checkout nor Edge (CI, a Linux box) points both elsewhere:
+//
+//   E2E_PLAYWRIGHT_DIR=<dir>       where require("playwright") resolves from, e.g.
+//                                  `npm root -g`; default ../testv/virtual-lab/e2e
+//   E2E_BROWSER_CHANNEL=chromium   Playwright's own Chromium instead of Edge; an
+//                                  empty value uses its headless shell. Default msedge.
+//
+// On Linux, run it under a UTF-8 locale (LANG=C.UTF-8): under C/POSIX, Chromium
+// empties non-ASCII names in the origin-private file system, and the wizard
+// scenario fails for that alone. CI (.github/workflows/ci.yml) runs it this way.
 
 import { createRequire } from "node:module";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -21,10 +31,13 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const E2E = resolve(HERE, "../../../testv/virtual-lab/e2e");
+const E2E = resolve(process.env.E2E_PLAYWRIGHT_DIR || resolve(HERE, "../../../testv/virtual-lab/e2e"));
+// `??`, not `||`: set-but-empty is a choice (the headless shell), not "unset".
+const CHANNEL = process.env.E2E_BROWSER_CHANNEL ?? "msedge";
 const SHOTS = resolve(HERE, "../../.shots");
 const URL_ = process.argv[2] ?? "http://localhost:8044/editor/";
 
+// createRequire wants a file to resolve from; it does not have to exist.
 const { chromium } = createRequire(resolve(E2E, "package.json"))("playwright");
 mkdirSync(SHOTS, { recursive: true });
 
@@ -35,7 +48,7 @@ const check = (name, ok, detail = "") => {
 };
 
 const browser = await chromium.launch({
-    channel: "msedge",
+    channel: CHANNEL || undefined,
     args: ["--use-gl=angle", "--use-angle=swiftshader", "--enable-unsafe-swiftshader", "--ignore-gpu-blocklist"],
 });
 
