@@ -544,7 +544,11 @@ scenario("new project wizard: collects, validates, creates; cancelling writes no
     // Cancelling at any step leaves nothing on disk — not even the parent folder, which the picker would create.
     await page.getByText("Create project").click();
     check("the wizard opens", (await dialogTitle(page).innerText()) === "New project");
-    check("the title field has focus", await page.evaluate(() => document.activeElement?.id === "wiz-name"));
+    // dlgFocus moves focus in a setTimeout, once the dialog is laid out. Late in a full run,
+    // with every earlier scenario's page still open, that can land after the title is
+    // readable — so wait for it, briefly, instead of racing it. Focus elsewhere still fails.
+    check("the title field has focus", await page.waitForFunction(() => document.activeElement?.id === "wiz-name", null, { timeout: 1000 })
+        .then(() => true, () => false));
     await page.keyboard.press("Escape");
     check("cancelling creates nothing", !(await exists("WizParent")));
 
