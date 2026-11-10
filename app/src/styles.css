@@ -1224,6 +1224,12 @@ body.resizing { cursor: inherit !important; user-select: none; }
   color: var(--fg-1);
 }
 .add-menu .add-list li:hover { background: var(--accent-bg); color: var(--fg-0); }
+/* A one-per-object type this object already holds: offered, but not addable. */
+.add-menu .add-list li.held {
+  color: var(--fg-3);
+  cursor: not-allowed;
+}
+.add-menu .add-list li.held:hover { background: none; color: var(--fg-3); }
 .add-menu .empty-hint {
   color: var(--fg-3); font-style: italic;
 }

@@ -165,6 +165,7 @@ export const en = {
     'insp.addComponent': 'Add Component',
     'insp.searchComponents': 'Search components...',
     'insp.noMatch': 'No components match.',
+    'insp.held': 'This object already has one — an object holds only one.',
 
     'comp.reset': 'Reset',
     'comp.menu': 'Component menu',

@@ -160,6 +160,7 @@ export const uk: Record<MessageKey, string> = {
     'insp.addComponent': 'Додати компонент',
     'insp.searchComponents': 'Пошук компонентів...',
     'insp.noMatch': 'Нічого не знайдено.',
+    'insp.held': 'Об’єкт уже має один — об’єкт тримає лише один.',
 
     'comp.reset': 'Скинути',
     'comp.menu': 'Меню компонента',
