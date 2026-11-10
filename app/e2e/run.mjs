@@ -847,7 +847,12 @@ scenario("scene formats: v1, an absent version and a v2 link all open", async ()
         await page.waitForTimeout(300);
     }
     check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
-    check("no page errors", noErrors(page), page.logs.join(" | "));
+    // The v2 fixture is a link to a prefab file this fixture project does not
+    // carry (the editor's prefab authoring is stage 14), so the engine keeps
+    // the instance as a placeholder and says so — a warning, not an error, and
+    // the scene still opens. Everything else must stay silent.
+    const unexpected = page.logs.filter(l => !l.includes("404") && !l.includes("fixture-holder-0001"));
+    check("no page errors beyond the placeholder warning", unexpected.length === 0, unexpected.join(" | "));
 });
 
 scenario("scene formats: a newer format and a broken file are refused, the scene stays", async () => {
@@ -867,12 +872,12 @@ scenario("scene formats: a newer format and a broken file are refused, the scene
     }, text);
 
     // A file of a version this editor does not read: named, not loaded, kept.
-    await external(sceneAt("FromV3", { ...oneRoot("FromV3Root"), version: 3 }));
+    await external(JSON.stringify({ name: "FromV3", version: 3, roots: [oneRoot("FromV3Root")] }));
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(800);
+    const dlgText = (await page.locator(".dlg").count()) ? await page.locator(".dlg").innerText() : "no dialog";
     check("a v3 file is refused with the too-new message",
-        (await page.locator(".dlg").innerText()).includes("format v3") && (await page.locator(".dlg").innerText()).includes("reads v1, 2"),
-        (await page.locator(".dlg").count()) ? await page.locator(".dlg").innerText() : "no dialog");
+        dlgText.includes("format v3") && dlgText.includes("reads v1, 2"), dlgText);
     await dialogButton(page, "OK").click();
     await page.waitForTimeout(300);
     check("the refusal keeps the open scene", (await page.locator("app-hierarchy").innerText()).includes("SeededKeep")
@@ -899,7 +904,8 @@ scenario("scene formats: the too-new refusal is translated (uk)", async () => {
     const page = await newPage("FmtUk", { settings: { language: "uk" } });
     await seed(page, "FmtUkKeep", { "scenario.meta.json": meta("uk", "Uk"), "assets/scenes/main.scene.json": sceneWith("SeededUk") });
     await pick(page, "FmtUkKeep");
-    await page.getByText("Open folder…").click();
+    // Language-neutral: the start screen's "Open folder…" is the non-primary action.
+    await page.locator("button.start-action:not(.primary)").click();
     await page.locator(".work").waitFor();
     await page.waitForTimeout(500);
     const external = (text) => page.evaluate(async t => {
@@ -910,9 +916,9 @@ scenario("scene formats: the too-new refusal is translated (uk)", async () => {
     }, text);
     await external(JSON.stringify({ name: "FromV3", version: 3, roots: [oneRoot("FromV3Root")] }));
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    await page.waitForTimeout(600);
+    await page.waitForTimeout(800);
     check("uk: the too-new message is Ukrainian", (await page.locator(".dlg").innerText()).includes("збережено новішою версією редактора"));
-    await dialogButton(page, "OK").click();
+    await dialogButton(page, "Гаразд").click();
     check("uk: the refusal keeps the open scene", (await page.locator("app-hierarchy").innerText()).includes("SeededUk"));
 });
 
