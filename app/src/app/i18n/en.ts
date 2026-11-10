@@ -320,6 +320,7 @@ export const en = {
     'scene.readFailed': 'Could not read {path}: {error}',
     'scene.parseFailed': '{name} is not valid JSON.',
     'scene.invalid': '{name} is not a valid scene file.',
+    'scene.tooNew': '{name} was saved by a newer editor (format v{version}). This editor reads v{readable} — update the editor to open it.',
     'scene.mainName': 'main',
     'scene.overwriteTitle': 'Replace the existing scene?',
     'scene.overwriteMessage': '{path} already exists in this project. Saving will replace it.',

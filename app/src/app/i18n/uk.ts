@@ -315,6 +315,7 @@ export const uk: Record<MessageKey, string> = {
     'scene.readFailed': 'Не вдалося прочитати {path}: {error}',
     'scene.parseFailed': '{name} — некоректний JSON.',
     'scene.invalid': '{name} не є файлом сцени.',
+    'scene.tooNew': '{name} збережено новішою версією редактора (формат v{version}). Цей редактор читає v{readable} — оновіть редактор, щоб відкрити файл.',
     'scene.mainName': 'main',
     'scene.overwriteTitle': 'Замінити наявну сцену?',
     'scene.overwriteMessage': '{path} уже є в цьому проєкті. Збереження замінить її.',
