@@ -1,0 +1,55 @@
+{
+ "name": "V2Linked",
+ "version": 2,
+ "roots": [
+  {
+   "name": "FromV2",
+   "active": true,
+   "transform": {
+    "position": {
+     "x": 0,
+     "y": 0,
+     "z": 0
+    },
+    "rotation": {
+     "x": 0,
+     "y": 0,
+     "z": 0,
+     "w": 1
+    },
+    "scale": {
+     "x": 1,
+     "y": 1,
+     "z": 1
+    }
+   },
+   "components": [],
+   "children": [],
+   "prefab": {
+    "guid": "fixture-holder-0001",
+    "changes": {
+     "overrides": []
+    }
+   }
+  }
+ ],
+ "renderSettings": {
+  "fog": false,
+  "fogColor": {
+   "r": 0.5,
+   "g": 0.5,
+   "b": 0.5,
+   "a": 1
+  },
+  "fogMode": 2,
+  "fogStartDistance": 0,
+  "fogEndDistance": 300,
+  "fogDensity": 0.01,
+  "ambientColor": {
+   "r": 0.2,
+   "g": 0.2,
+   "b": 0.2,
+   "a": 1
+  }
+ }
+}
