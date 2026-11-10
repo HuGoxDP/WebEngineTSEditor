@@ -7,6 +7,7 @@ import {
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import {
+    type Component as EngineComponent,
     GameObject,
     Quaternion,
     TypeRegistry,
@@ -169,7 +170,9 @@ interface EulerDeg { x: number; y: number; z: number; }
                             >
                             <ul class="add-list">
                                 @for (c of filteredComponents(); track c.name) {
-                                    <li (click)="onAddComponent(c)">{{ c.name }}</li>
+                                    <li [class.held]="isHeld(c)"
+                                        [title]="isHeld(c) ? ('insp.held' | t) : ''"
+                                        (click)="onAddComponent(c)">{{ c.name }}</li>
                                 }
                                 @if (filteredComponents().length === 0) {
                                     <li class="empty-hint">{{ 'insp.noMatch' | t }}</li>
@@ -304,9 +307,31 @@ export class InspectorComponent {
         return all.filter(c => c.name.toLowerCase().includes(q));
     });
 
+    /**
+     * Whether the picker must show `entry` as a one-per-object type this object
+     * already holds — Unity greys those out, and here the add has been a silent
+     * no-op with a console warning since M0.2b.
+     *
+     * `Component.allowsMultiple` is the type's side of the rule (public since
+     * M0.2g) and `GameObject.hasComponent` the object's, which also knows the
+     * Transform — the one component that is never in the component list.
+     */
+    public isHeld(entry: { name: string; ctor: new (...args: any[]) => unknown }): boolean {
+        const g = this.go();
+        if (!g) return false;
+        // `EngineComponent` aliased: `Component` here is Angular's decorator.
+        const ctor = entry.ctor as unknown as typeof EngineComponent;
+        if (ctor.allowsMultiple !== false) return false;
+        return g.hasComponent(entry.ctor as any);
+    }
+
     public onAddComponent(entry: { name: string; ctor: new (...args: any[]) => unknown }): void {
         const g = this.go();
         if (!g) return;
+        // Offered greyed out and refused once more here: a one-per-object type
+        // the object holds is not added, so the click must not record a history
+        // step either.
+        if (this.isHeld(entry)) return;
         this._history.record(`Add ${entry.name}`, () => {
             g.addComponent(entry.ctor as any);
             this._selection.notifyChanged();
