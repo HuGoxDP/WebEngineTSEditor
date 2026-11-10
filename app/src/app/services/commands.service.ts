@@ -602,7 +602,14 @@ export class CommandsService {
         }
     }
 
-    /** Replaces the scene with the one in `text`. Returns false if it is not a scene. */
+    /**
+     * Replaces the scene with the one in `text`. Returns false if it is not a
+     * scene, or states a format version this editor does not read — in both
+     * cases the current scene, selection and history are left untouched. The
+     * version question is the engine's (A4: `SceneSerializer.versionOf` /
+     * `canRead` / `readableVersions`), not a literal: a file of a newer format
+     * gets `scene.tooNew`, a malformed one `scene.invalid`.
+     */
     private async _loadSceneText(name: string, text: string): Promise<boolean> {
         let data: SerializedScene;
         try {
@@ -611,8 +618,17 @@ export class CommandsService {
             await this.fail(this._i18n.t('scene.parseFailed', { name }));
             return false;
         }
-        if (!data || typeof data !== 'object' || data.version !== 1 || !Array.isArray(data.roots)) {
+        const version = SceneSerializer.versionOf(data);
+        if (!data || typeof data !== 'object' || version === null || !Array.isArray(data.roots)) {
             await this.fail(this._i18n.t('scene.invalid', { name }));
+            return false;
+        }
+        if (!SceneSerializer.canRead(data)) {
+            await this.fail(this._i18n.t('scene.tooNew', {
+                name,
+                version,
+                readable: SceneSerializer.readableVersions.join(', '),
+            }));
             return false;
         }
         this._selection.clear();

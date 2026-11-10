@@ -29,7 +29,7 @@
 // scenario fails for that alone. CI (.github/workflows/ci.yml) runs it this way.
 
 import { createRequire } from "node:module";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -813,6 +813,113 @@ scenario("dialogs: Esc cancels, Enter confirms, shortcuts stand down", async () 
     check("an empty name cannot be confirmed", await page.locator(".dlg-btn.primary").isDisabled());
     await page.keyboard.press("Escape");
     check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+});
+
+/**
+ * A8: a scene file the editor can open, in the format the editor's own engine
+ * writes it — a link-mode prefab instance, version 2 — plus the refusals: a
+ * newer format gets `scene.tooNew`, a malformed file `scene.invalid`, and in
+ * every refusal the scene already on screen is kept.
+ */
+const v2Linked = readFileSync(resolve(HERE, "fixtures/v2-linked.json"), "utf8");
+const sceneAt = (name, root) => JSON.stringify({ name, roots: [root] });
+const oneRoot = name => ({
+    name, active: true,
+    transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+    components: [], children: [],
+});
+const meta = (id, name) => JSON.stringify({ id, name, version: "1.0.0" });
+
+scenario("scene formats: v1, an absent version and a v2 link all open", async () => {
+    const page = await newPage("FmtOpen");
+    await seed(page, "FmtV1", { "scenario.meta.json": meta("v1", "V1"), "assets/scenes/main.scene.json": sceneWith("SeededV1") });
+    await seed(page, "FmtNoVer", { "scenario.meta.json": meta("nover", "NoVer"), "assets/scenes/main.scene.json": sceneAt("NoVersion", oneRoot("NoVersionRoot")) });
+    await seed(page, "FmtV2", { "scenario.meta.json": meta("v2", "V2"), "assets/scenes/main.scene.json": v2Linked });
+
+    for (const [folder, object] of [["FmtV1", "SeededV1"], ["FmtNoVer", "NoVersionRoot"], ["FmtV2", "FromV2"]]) {
+        await pick(page, folder);
+        await page.getByText("Open folder…").click();
+        await page.locator(".work").waitFor();
+        await page.waitForTimeout(500);
+        check(`${folder}: the scene opens without questions`,
+            (await page.locator(".dlg").count()) === 0 && (await page.locator("app-hierarchy").innerText()).includes(object));
+        await menu(page, "File", "Close Project");
+        await page.waitForTimeout(300);
+    }
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    // The v2 fixture is a link to a prefab file this fixture project does not
+    // carry (the editor's prefab authoring is stage 14), so the engine keeps
+    // the instance as a placeholder and says so — a warning, not an error, and
+    // the scene still opens. Everything else must stay silent.
+    const unexpected = page.logs.filter(l => !l.includes("404") && !l.includes("fixture-holder-0001"));
+    check("no page errors beyond the placeholder warning", unexpected.length === 0, unexpected.join(" | "));
+});
+
+scenario("scene formats: a newer format and a broken file are refused, the scene stays", async () => {
+    const page = await newPage("FmtRefuse");
+    await seed(page, "FmtKeep", { "scenario.meta.json": meta("keep", "Keep"), "assets/scenes/main.scene.json": sceneWith("SeededKeep") });
+    await pick(page, "FmtKeep");
+    await page.getByText("Open folder…").click();
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(500);
+    check("the scene is open first", (await page.locator("app-hierarchy").innerText()).includes("SeededKeep"));
+
+    const external = (text) => page.evaluate(async t => {
+        const dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle("FmtKeep")).getDirectoryHandle("assets");
+        const scenes = await dir.getDirectoryHandle("scenes", { create: true });
+        const w = await (await scenes.getFileHandle("main.scene.json", { create: true })).createWritable();
+        await w.write(t); await w.close();
+    }, text);
+
+    // A file of a version this editor does not read: named, not loaded, kept.
+    await external(JSON.stringify({ name: "FromV3", version: 3, roots: [oneRoot("FromV3Root")] }));
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(800);
+    const dlgText = (await page.locator(".dlg").count()) ? await page.locator(".dlg").innerText() : "no dialog";
+    check("a v3 file is refused with the too-new message",
+        dlgText.includes("format v3") && dlgText.includes("reads v1, 2"), dlgText);
+    await dialogButton(page, "OK").click();
+    await page.waitForTimeout(300);
+    check("the refusal keeps the open scene", (await page.locator("app-hierarchy").innerText()).includes("SeededKeep")
+        && !(await page.locator("app-hierarchy").innerText()).includes("FromV3Root"));
+    check("the refusal keeps the scene clean", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+
+    // Not JSON at all, and JSON that is not a scene: both keep scene.invalid.
+    for (const [what, text] of [["not JSON", "this is not json"], ["not a scene", "{}"]]) {
+        await external(text);
+        await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+        await page.waitForTimeout(600);
+        check(`${what} keeps the scene.invalid message`, (await page.locator(".dlg").innerText()).includes("not a valid scene file")
+            || (await page.locator(".dlg").innerText()).includes("not valid JSON"));
+        await dialogButton(page, "OK").click();
+        await page.waitForTimeout(300);
+        check(`${what} keeps the open scene`, (await page.locator("app-hierarchy").innerText()).includes("SeededKeep"));
+    }
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+    await shot(page, "e2e-scene-formats-refused");
+});
+
+scenario("scene formats: the too-new refusal is translated (uk)", async () => {
+    const page = await newPage("FmtUk", { settings: { language: "uk" } });
+    await seed(page, "FmtUkKeep", { "scenario.meta.json": meta("uk", "Uk"), "assets/scenes/main.scene.json": sceneWith("SeededUk") });
+    await pick(page, "FmtUkKeep");
+    // Language-neutral: the start screen's "Open folder…" is the non-primary action.
+    await page.locator("button.start-action:not(.primary)").click();
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(500);
+    const external = (text) => page.evaluate(async t => {
+        const dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle("FmtUkKeep")).getDirectoryHandle("assets");
+        const scenes = await dir.getDirectoryHandle("scenes", { create: true });
+        const w = await (await scenes.getFileHandle("main.scene.json", { create: true })).createWritable();
+        await w.write(t); await w.close();
+    }, text);
+    await external(JSON.stringify({ name: "FromV3", version: 3, roots: [oneRoot("FromV3Root")] }));
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(800);
+    check("uk: the too-new message is Ukrainian", (await page.locator(".dlg").innerText()).includes("збережено новішою версією редактора"));
+    await dialogButton(page, "Гаразд").click();
+    check("uk: the refusal keeps the open scene", (await page.locator("app-hierarchy").innerText()).includes("SeededUk"));
 });
 
 // ═══ Run ═══
