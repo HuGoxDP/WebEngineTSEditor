@@ -1,5 +1,6 @@
 import { Injectable, computed, signal } from '@angular/core';
 import { defaultMeta, metaJson, SCENARIO_TEMPLATE, type ProjectMeta } from './project-templates';
+import { FileSystemAccessStore, OpfsStore, type ProjectStore } from './project-store';
 
 /** What a file is, as far as the Project panel cares — drives icon and double-click. */
 export type ProjectEntryKind =
@@ -38,13 +39,16 @@ export type FolderKind =
     /** Has files, but is not a project. */
     | 'foreign';
 
-/** A project the user opened before, remembered across sessions. */
+    /** A project the user opened before, remembered across sessions. */
 export interface RecentProject {
     id: string;
     name: string;
     /** `Date.now()` of the last time it was opened. */
     openedAt: number;
-    handle: ProjectFolderHandle;
+    /** Which store it lives in — a disk folder asks for permission, the browser store has none. */
+    kind: 'disk' | 'browser';
+    /** The folder handle, for a disk project. A browser-store project is found by its id. */
+    handle: ProjectFolderHandle | null;
 }
 
 /** How a recent project's reopening went. */
@@ -118,11 +122,13 @@ export class ProjectService {
     /** Recently opened projects, newest first. */
     public readonly recents = signal<RecentProject[]>([]);
 
-    private _root: DirHandle | null = null;
+    private _store: ProjectStore | null = null;
     private _children = new Map<string, ProjectEntry[]>();
 
     constructor() {
-        if (!(window as PickerWindow).showDirectoryPicker) {
+        // Unsupported means *no store at all*: no folder picker (not Chromium)
+        // and no origin-private file system.
+        if (!(window as PickerWindow).showDirectoryPicker && !OpfsStore.available()) {
             this.status.set('unsupported');
             return;
         }
@@ -184,29 +190,64 @@ export class ProjectService {
      *   once that is done, so nothing ever shows a project that is half set up.
      */
     public async adopt(handle: ProjectFolderHandle, layout?: ProjectMeta): Promise<void> {
-        await this._adopt(handle);
+        await this._adopt(new FileSystemAccessStore(handle));
         if (layout) await this.initializeLayout(layout);
         this.status.set('open');
-        this.projectId.set(await this._remember(handle));
+        this.projectId.set(await this._remember(handle, 'disk'));
     }
+
+    /**
+     * Makes a project in the browser's own store — the origin-private file
+     * system — and opens it. There is no folder to pick and no permission to
+     * ask for, which is what makes the editor work outside Chromium.
+     *
+     * @param layout - the project's identity, written as `scenario.meta.json`
+     *   and the scenario layout before the project opens.
+     */
+    public async createInBrowser(layout: ProjectMeta): Promise<void> {
+        const store = await OpfsStore.create();
+        await store.keepAcrossRestarts();
+        await this._adopt(store, layout.name);
+        await this.initializeLayout(layout);
+        this.status.set('open');
+        this.projectId.set(await this._rememberOpfs(store));
+    }
+
+    /** Whether this browser can hold a project in its own store (all modern browsers). */
+    public get browserStoreAvailable(): boolean { return OpfsStore.available(); }
+
+    /** Whether this browser can pick a folder on the user's disk (Chromium only). */
+    public get folderPickerAvailable(): boolean { return !!(window as PickerWindow).showDirectoryPicker; }
 
     /**
      * Reopens a project from the recent list.
      *
-     * Call it straight from the click: the browser only asks for access on a
-     * user gesture, and the permission request is the first thing this does.
+     * Call it straight from the click for a disk project: the browser only asks
+     * for access on a user gesture, and the permission request is the first
+     * thing this does. A browser-store project has no permission to request,
+     * so its gesture need not come first.
      */
     public async openRecent(recent: RecentProject): Promise<ReopenResult> {
         // A folder that was moved or deleted can fail at either step — asking for
-        // access, or listing it — so both are checked for "not found".
+        // access, or listing it — so both are checked for "not found". A
+        // browser-store project asks for nothing; its folder is simply there or
+        // it is not (cleared site data, private window).
+        if (recent.kind === 'browser') {
+            if (!(await OpfsStore.exists(recent.id))) return 'missing';
+            const store = await OpfsStore.create(recent.id);
+            await this._adopt(store, recent.name);
+            this.status.set('open');
+            this.projectId.set(recent.id);
+            return 'ok';
+        }
         try {
-            if (await recent.handle.requestPermission({ mode: 'readwrite' }) !== 'granted') return 'denied';
-            await listDir(recent.handle, 1);
+            if (await recent.handle!.requestPermission({ mode: 'readwrite' }) !== 'granted') return 'denied';
+            await listDir(recent.handle!, 1);
         } catch (err) {
             if ((err as DOMException)?.name === 'NotFoundError') return 'missing';
             throw err;
         }
-        await this.adopt(recent.handle);
+        await this.adopt(recent.handle!);
         return 'ok';
     }
 
@@ -218,7 +259,7 @@ export class ProjectService {
 
     /** Closes the project. It stays in the recent list; files on disk are untouched. */
     public async close(): Promise<void> {
-        this._root = null;
+        this._store = null;
         this._children.clear();
         this.folders.set([]);
         this.name.set('');
@@ -231,7 +272,7 @@ export class ProjectService {
 
     /** Re-reads the folder from disk — files change underneath the editor. */
     public async refresh(): Promise<void> {
-        if (!this._root || this.status() !== 'open') return;
+        if (!this._store || this.status() !== 'open') return;
         await this._scan();
     }
 
@@ -243,7 +284,7 @@ export class ProjectService {
     }
 
     public exists(path: string): boolean {
-        if (path === '') return this._root !== null;
+        if (path === '') return this._store !== null;
         const cut = path.lastIndexOf('/');
         const parent = cut === -1 ? '' : path.slice(0, cut);
         return this.list(parent).some(e => e.path === path);
@@ -252,8 +293,7 @@ export class ProjectService {
     // ── Files ────────────────────────────────────────────────────────
 
     public async readFile(path: string): Promise<File> {
-        const handle = await this._fileHandle(path, false);
-        return handle.getFile();
+        return (await this._store!.file(path, false)).getFile();
     }
 
     public async readText(path: string): Promise<string> {
@@ -266,7 +306,7 @@ export class ProjectService {
      * autosave, written every minute.
      */
     public async write(path: string, data: string | Blob, rescan = true): Promise<void> {
-        const handle = await this._fileHandle(path, true);
+        const handle = await this._store!.file(path, true);
         const writable = await handle.createWritable();
         try {
             await writable.write(data);
@@ -294,17 +334,15 @@ export class ProjectService {
 
     /** Deletes a file if it exists, without rescanning and without complaint when it does not. */
     public async removeQuietly(path: string): Promise<void> {
-        const cut = path.lastIndexOf('/');
         try {
-            const parent = await this._dirHandle(cut === -1 ? '' : path.slice(0, cut), false);
-            await parent.removeEntry(cut === -1 ? path : path.slice(cut + 1));
+            await this._store!.remove(path, false);
         } catch (err) {
             if ((err as DOMException)?.name !== 'NotFoundError') throw err;
         }
     }
 
     public async createFolder(path: string): Promise<void> {
-        await this._dirHandle(path, true);
+        await this._store!.mkdir(path);
         await this._scan();
     }
 
@@ -313,9 +351,8 @@ export class ProjectService {
      * A file with the same name is overwritten, as a copy on disk would be.
      */
     public async importFiles(folder: string, files: readonly File[]): Promise<void> {
-        const dir = await this._dirHandle(folder, true);
         for (const file of files) {
-            const handle = await dir.getFileHandle(file.name, { create: true });
+            const handle = await this._store!.file(`${folder}/${file.name}`, true);
             const writable = await handle.createWritable();
             try {
                 await writable.write(file);
@@ -328,9 +365,7 @@ export class ProjectService {
 
     /** Deletes a file, or a folder with everything in it. */
     public async remove(path: string): Promise<void> {
-        const cut = path.lastIndexOf('/');
-        const parent = await this._dirHandle(cut === -1 ? '' : path.slice(0, cut), false);
-        await parent.removeEntry(cut === -1 ? path : path.slice(cut + 1), { recursive: true });
+        await this._store!.remove(path, true);
         if (this.scenePath() === path) this.scenePath.set(null);
         await this._scan();
     }
@@ -350,43 +385,42 @@ export class ProjectService {
         if (!this.exists('scripts/Scenario.ts')) {
             await this.write('scripts/Scenario.ts', SCENARIO_TEMPLATE);
         }
-        await this._dirHandle('assets/scenes', true);
-        await this._dirHandle('scripts/components', true);
+        await this._store!.mkdir('assets/scenes');
+        await this._store!.mkdir('scripts/components');
         await this._scan();
     }
 
     // ── internal ─────────────────────────────────────────────────────
 
-    /** Points the service at a folder and reads it. Does not mark the project open — see {@link adopt}. */
-    private async _adopt(handle: DirHandle): Promise<void> {
-        this._root = handle;
-        this.name.set(handle.name);
+    /** Points the service at a store and reads it. Does not mark the project open — see {@link adopt}. */
+    private async _adopt(store: ProjectStore, displayName?: string): Promise<void> {
+        this._store = store;
+        this.name.set(displayName ?? store.name);
         this.scenePath.set(null);
         await this._scan();
     }
 
     /** Walks the whole folder once; a scenario project is small enough for that. */
     private async _scan(): Promise<void> {
-        const root = this._root;
-        if (!root) return;
+        const store = this._store;
+        if (!store) return;
 
         const children = new Map<string, ProjectEntry[]>();
-        const folders: ProjectFolder[] = [{ name: root.name, path: '', depth: 0 }];
+        const folders: ProjectFolder[] = [{ name: store.name, path: '', depth: 0 }];
         let count = 0;
 
-        const walk = async (dir: DirHandle, path: string, depth: number): Promise<void> => {
+        const walk = async (path: string, depth: number): Promise<void> => {
             const entries: ProjectEntry[] = [];
-            const subdirs: { handle: DirHandle; entry: ProjectEntry }[] = [];
+            const subdirs: string[] = [];
 
-            for (const child of await listDir(dir)) {
+            for (const child of await store.entries(path)) {
                 if (child.name.startsWith('.') || HIDDEN.has(child.name)) continue;
                 if (++count > MAX_ENTRIES) break;
 
                 const childPath = path ? `${path}/${child.name}` : child.name;
                 if (child.kind === 'directory') {
-                    const entry: ProjectEntry = { name: child.name, path: childPath, kind: 'folder' };
-                    entries.push(entry);
-                    subdirs.push({ handle: child as DirHandle, entry });
+                    entries.push({ name: child.name, path: childPath, kind: 'folder' });
+                    subdirs.push(childPath);
                 } else {
                     entries.push({ name: child.name, path: childPath, kind: kindOf(child.name) });
                 }
@@ -397,36 +431,21 @@ export class ProjectService {
                 || a.name.localeCompare(b.name));
             children.set(path, entries);
 
-            subdirs.sort((a, b) => a.entry.name.localeCompare(b.entry.name));
+            subdirs.sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
             for (const sub of subdirs) {
-                folders.push({ name: sub.entry.name, path: sub.entry.path, depth: depth + 1 });
-                await walk(sub.handle, sub.entry.path, depth + 1);
+                folders.push({ name: nameOf(sub), path: sub, depth: depth + 1 });
+                await walk(sub, depth + 1);
             }
         };
 
-        await walk(root, '', 0);
+        await walk('', 0);
         if (count > MAX_ENTRIES) {
-            console.warn(`[Project] "${root.name}" has more than ${MAX_ENTRIES} entries — the listing is cut short.`);
+            console.warn(`[Project] "${store.name}" has more than ${MAX_ENTRIES} entries — the listing is cut short.`);
         }
 
         this._children = children;
         this.folders.set(folders);
         this.revision.update(n => n + 1);
-    }
-
-    private async _dirHandle(path: string, create: boolean): Promise<DirHandle> {
-        if (!this._root) throw new Error('[Project] No project is open.');
-        let dir: FileSystemDirectoryHandle = this._root;
-        for (const part of path.split('/').filter(Boolean)) {
-            dir = await dir.getDirectoryHandle(part, { create });
-        }
-        return dir as DirHandle;
-    }
-
-    private async _fileHandle(path: string, create: boolean): Promise<FileSystemFileHandle> {
-        const cut = path.lastIndexOf('/');
-        const dir = await this._dirHandle(cut === -1 ? '' : path.slice(0, cut), create);
-        return dir.getFileHandle(cut === -1 ? path : path.slice(cut + 1), { create });
     }
 
     // ── Remembering projects between sessions ────────────────────────
@@ -449,18 +468,18 @@ export class ProjectService {
      * @returns the project's id — the same one every time this folder is opened,
      *   which is what lets a tab recognise "this project is open elsewhere".
      */
-    private async _remember(handle: DirHandle): Promise<string> {
+    private async _remember(handle: DirHandle, kind: 'disk' | 'browser' = 'disk'): Promise<string> {
         try {
             const known = await idb<RecentProject[]>('readonly', s => s.getAll());
             let id: string = crypto.randomUUID();
             for (const r of known) {
                 try {
-                    if (await r.handle.isSameEntry(handle)) { id = r.id; break; }
+                    if (r.handle !== null && await r.handle.isSameEntry(handle)) { id = r.id; break; }
                 } catch {
                     // A stale handle cannot be compared; it is just not the same one.
                 }
             }
-            const entry: RecentProject = { id, name: handle.name, openedAt: Date.now(), handle };
+            const entry: RecentProject = { id, name: handle.name, openedAt: Date.now(), handle, kind };
             await idb('readwrite', s => s.put(entry));
 
             // Past the limit, the oldest go.
@@ -471,6 +490,30 @@ export class ProjectService {
         } catch {
             // Not remembered; the project still opens. The folder name is the best identity left.
             return handle.name;
+        }
+    }
+
+    /**
+     * Remembers a browser-store project: its id *is* its identity, so a second
+     * open of the same project is the same row, and the store is found by id
+     * rather than by a stored handle.
+     */
+    private async _rememberOpfs(store: OpfsStore): Promise<string> {
+        try {
+            const known = await idb<RecentProject[]>('readonly', s => s.getAll());
+            const entry: RecentProject = {
+                id: store.id, name: this.name() || store.id, openedAt: Date.now(),
+                handle: null, kind: 'browser',
+            };
+            await idb('readwrite', s => s.put(entry));
+            const sorted = [entry, ...known.filter(r => r.id !== entry.id)]
+                .sort((a, b) => b.openedAt - a.openedAt);
+            for (const old of sorted.slice(MAX_RECENTS)) await idb('readwrite', s => s.delete(old.id));
+            this.recents.set(sorted.slice(0, MAX_RECENTS));
+            return entry.id;
+        } catch {
+            // Not remembered; the project still opens.
+            return store.id;
         }
     }
 }
@@ -496,6 +539,11 @@ async function listDir(
     }
     await iterator.return?.();
     return out;
+}
+
+/** The last segment of a slash-separated path — a folder's name from its path. */
+function nameOf(path: string): string {
+    return path.slice(path.lastIndexOf('/') + 1);
 }
 
 function kindOf(name: string): ProjectEntryKind {

@@ -19,8 +19,8 @@ import { ProjectService, type ProjectFolderHandle } from '../../services/project
 export interface NewProjectResult {
     meta: ProjectMeta;
     template: TemplateId;
-    /** The folder the user chose; the project goes in a new folder inside it. */
-    parent: ProjectFolderHandle;
+    /** The folder the user chose; the project goes in a new folder inside it. Null for the browser store. */
+    parent: ProjectFolderHandle | null;
     folderName: string;
 }
 
@@ -113,26 +113,44 @@ const CATEGORY_LABEL: Record<ProjectCategory, MessageKey> = {
                 }
 
                 @case (3) {
-                    <div class="wiz-field">
-                        <span class="lbl">{{ 'wiz.location' | t }}</span>
-                        <div class="wiz-pick">
-                            <button class="wiz-btn" (click)="choose()">{{ 'wiz.choose' | t }}</button>
-                            <span class="wiz-parent" [class.none]="!parent()">{{ parent()?.name ?? ('wiz.locationNone' | t) }}</span>
+                    @if (browserStore()) {
+                        <div class="wiz-field">
+                            <span class="lbl">{{ 'wiz.where' | t }}</span>
+                            <button class="wiz-card" [attr.aria-checked]="location() === 'folder'"
+                                [disabled]="!folderPicker()" (click)="location.set('folder')">
+                                <strong>{{ 'wiz.whereFolder' | t }}</strong>
+                                <span>{{ 'wiz.whereFolderHint' | t }}</span>
+                            </button>
+                            <button class="wiz-card" [attr.aria-checked]="location() === 'browser'"
+                                (click)="location.set('browser')">
+                                <strong>{{ 'wiz.whereBrowser' | t }}</strong>
+                                <span>{{ 'wiz.whereBrowserHint' | t }}</span>
+                            </button>
                         </div>
-                        <span class="wiz-hint">{{ 'wiz.locationHint' | t }}</span>
-                    </div>
+                    }
 
-                    <div class="wiz-field">
-                        <label for="wiz-folder">{{ 'wiz.folderName' | t }}</label>
-                        <input id="wiz-folder" type="text" spellcheck="false"
-                            [value]="folderShown()"
-                            (input)="setFolder($any($event.target).value)"
-                            (keydown.enter)="$event.preventDefault(); next()">
-                        @if (folderError(); as e) { <span class="wiz-error">{{ e }}</span> }
-                    </div>
+                    @if (location() === 'folder') {
+                        <div class="wiz-field">
+                            <span class="lbl">{{ 'wiz.location' | t }}</span>
+                            <div class="wiz-pick">
+                                <button class="wiz-btn" (click)="choose()">{{ 'wiz.choose' | t }}</button>
+                                <span class="wiz-parent" [class.none]="!parent()">{{ parent()?.name ?? ('wiz.locationNone' | t) }}</span>
+                            </div>
+                            <span class="wiz-hint">{{ 'wiz.locationHint' | t }}</span>
+                        </div>
 
-                    @if (parent() && !folderError()) {
-                        <p class="wiz-summary">{{ 'wiz.willCreate' | t: { path: parent()!.name + ' / ' + folderShown() } }}</p>
+                        <div class="wiz-field">
+                            <label for="wiz-folder">{{ 'wiz.folderName' | t }}</label>
+                            <input id="wiz-folder" type="text" spellcheck="false"
+                                [value]="folderShown()"
+                                (input)="setFolder($any($event.target).value)"
+                                (keydown.enter)="$event.preventDefault(); next()">
+                            @if (folderError(); as e) { <span class="wiz-error">{{ e }}</span> }
+                        </div>
+
+                        @if (parent() && !folderError()) {
+                            <p class="wiz-summary">{{ 'wiz.willCreate' | t: { path: parent()!.name + ' / ' + folderShown() } }}</p>
+                        }
                     }
                 }
             }
@@ -209,6 +227,13 @@ export class NewProjectDialogComponent {
     public readonly template = signal<TemplateId>('lightCamera');
     public readonly parent = signal<ProjectFolderHandle | null>(null);
 
+    /** Where the project will live: a folder on disk, or the browser's own store. */
+    public readonly location = signal<'folder' | 'browser'>(
+        this._project.folderPickerAvailable ? 'folder' : 'browser');
+    /** The browser store exists on every modern browser; the picker only on Chromium. */
+    public readonly browserStore = computed(() => this._project.browserStoreAvailable);
+    public readonly folderPicker = computed(() => this._project.folderPickerAvailable);
+
     /** An address typed by hand. `null` while it still follows the title. */
     private readonly _id = signal<string | null>(null);
     private readonly _folder = signal<string | null>(null);
@@ -267,8 +292,25 @@ export class NewProjectDialogComponent {
     }
 
     private async _create(): Promise<void> {
+        const inBrowser = this.location() === 'browser';
         const parent = this.parent();
         const folderName = this.folderShown().trim();
+        if (inBrowser) {
+            // No folder to check: the browser store mints the project's own name.
+            this.ref.close({
+                meta: {
+                    id: this.idShown(),
+                    name: this.name().trim(),
+                    description: this.description().trim() || undefined,
+                    category: this.category(),
+                    version: '1.0.0',
+                },
+                template: this.template(),
+                parent: null,
+                folderName: '',
+            });
+            return;
+        }
         if (!parent || folderNameProblem(folderName)) return;
 
         this.busy.set(true);
