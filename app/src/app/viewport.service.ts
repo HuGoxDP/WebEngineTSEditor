@@ -1,6 +1,5 @@
-import { EffectRef, Injectable, Injector, NgZone, effect, signal } from '@angular/core';
+import { EffectRef, Injectable, Injector, NgZone, effect, inject, signal } from '@angular/core';
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import {
     GameObject,
@@ -14,44 +13,44 @@ import { HistoryService } from './services/history.service';
 import { SceneService } from './services/scene.service';
 import { SelectionService } from './services/selection.service';
 import { SettingsService } from './services/settings.service';
+import { SceneViewRenderer } from './scene-view/scene-view-renderer';
+import { installProbe, probeEnabled } from './scene-view/debug-probe';
 
 /** Current mode of the transform gizmo. */
 export type GizmoMode = 'translate' | 'rotate' | 'scale';
 
 /**
- * Owns the Three.js renderer, the editor camera, and the animation loop.
+ * The Scene view, as the rest of the editor sees it (B1 phase 1).
  *
- * Renders the engine's active Scene (`SceneManager.activeScene._internalThreeScene`)
- * plus an editor-only overlay scene with the grid and axes helpers.
- * Dirty transforms are flushed before each draw via `Transform._syncAllDirty`.
+ * A thin facade over {@link SceneViewRenderer} (the frame, the D-2 layers, the
+ * probe) that owns what is editor *behaviour* rather than drawing: the
+ * transform gizmo and its engine write-back, the selection outline, click
+ * picking, and the orbits. The renderer owns the WebGLRenderer, the camera, the
+ * OrbitControls and the overlay scenes; the plan's B1 phases build on that
+ * split (navigation controller, tools, selection, gizmos, lighting).
  */
 @Injectable({ providedIn: 'root' })
 export class ViewportService {
 
-    private _renderer: THREE.WebGLRenderer | null = null;
-    private _camera: THREE.PerspectiveCamera | null = null;
-    private _controls: OrbitControls | null = null;
-    private _overlay: THREE.Scene | null = null;
-    private _rafId: number = 0;
-    private _resizeObs: ResizeObserver | null = null;
-    private _canvas: HTMLCanvasElement | null = null;
-    private _raycaster: THREE.Raycaster = new THREE.Raycaster();
-    private _ndc: THREE.Vector2 = new THREE.Vector2();
-    private _pointerDown: { x: number; y: number } | null = null;
+    private readonly _renderer = inject(SceneViewRenderer);
     private _gizmo: TransformControls | null = null;
     private _gizmoHelper: THREE.Object3D | null = null;
     private _selectionEffect: EffectRef | null = null;
     private _snapEffect: EffectRef | null = null;
     private _dragSnapshot: SerializedScene | null = null;
     private _outline: THREE.BoxHelper | null = null;
+    private _raycaster: THREE.Raycaster = new THREE.Raycaster();
+    private _ndc: THREE.Vector2 = new THREE.Vector2();
+    private _pointerDown: { x: number; y: number } | null = null;
+    private _canvas: HTMLCanvasElement | null = null;
+    private _frames: number = 0;
+    private _fpsLastT: number = 0;
+    private _lastT: number = 0;
 
     /** Rolling FPS sample, updated each second. */
     public readonly fps = signal(0);
     /** Last frame time in milliseconds. */
     public readonly frameMs = signal(0);
-    private _frames: number = 0;
-    private _fpsLastT: number = 0;
-    private _lastT: number = 0;
 
     constructor(
         private readonly _zone: NgZone,
@@ -64,46 +63,24 @@ export class ViewportService {
 
     /** Initializes the viewport on the given canvas. Idempotent. */
     public attach(canvas: HTMLCanvasElement): void {
-        if (this._renderer) return;
+        if (this._canvas) return;
         this._canvas = canvas;
 
-        this._renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-        this._renderer.setPixelRatio(window.devicePixelRatio);
-        this._renderer.autoClear = false;
-
-        // ── Pointer selection (click vs. drag detection) ──
         canvas.addEventListener('pointerdown', this._onPointerDown);
         canvas.addEventListener('pointerup',   this._onPointerUp);
 
-        // ── Editor overlay (grid + axes) ──
-        const overlay = new THREE.Scene();
+        this._renderer.attach(canvas, () => this._tick());
+
+        const overlay = this._renderer.aboveScene;
+        const controls = this._renderer.controls;
+        if (!overlay || !controls) return;
+
+        // ── Grid: depth-tested against the engine scene (D-2 step 3) ──
         const grid = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
-        overlay.add(grid);
-        const axes = new THREE.AxesHelper(2);
-        overlay.add(axes);
-        this._overlay = overlay;
-
-        // ── Editor camera ──
-        const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
-        camera.position.set(6, 6, 10);
-        camera.lookAt(0, 0, 0);
-        this._camera = camera;
-
-        // ── Orbit controls ──
-        const controls = new OrbitControls(camera, canvas);
-        controls.enableDamping = true;
-        controls.target.set(0, 0, 0);
-        this._controls = controls;
-
-        // ── Lights live in the editor scene, not the engine scene ──
-        // Users can add their own lights via GameObjects.
-        const hemi = new THREE.HemisphereLight(0xffffff, 0x303030, 1.0);
-        overlay.add(hemi);
-        const dir = new THREE.DirectionalLight(0xffffff, 0.8);
-        dir.position.set(5, 10, 5);
-        overlay.add(dir);
+        this._renderer.addOverlayLayer('grid', grid);
 
         // ── Transform gizmo ──
+        const camera = this._renderer.camera!;
         const gizmo = new TransformControls(camera, canvas);
         gizmo.setSize(0.8);
         gizmo.addEventListener('dragging-changed', e => {
@@ -127,7 +104,7 @@ export class ViewportService {
         // Three.js r169+ uses getHelper(); older versions used the gizmo itself.
         const helper: THREE.Object3D = (gizmo as unknown as { getHelper?: () => THREE.Object3D })
             .getHelper?.() ?? (gizmo as unknown as THREE.Object3D);
-        overlay.add(helper);
+        this._renderer.addOverlayLayer('above-scene', helper);
         this._gizmo = gizmo;
         this._gizmoHelper = helper;
 
@@ -138,7 +115,7 @@ export class ViewportService {
         }, { injector: this._injector });
 
         // Selection outline — a BoxHelper we re-attach on each selection change.
-        // Lives in the overlay so it always renders on top of the engine scene.
+        // Lives in the on-top layer so it always renders over the engine scene.
         this._selectionEffect = effect(() => {
             const go = this._selection.selected();
             this._selection.revision();
@@ -151,31 +128,29 @@ export class ViewportService {
 
             // Outline
             if (this._outline) {
-                overlay.remove(this._outline);
+                this._renderer.removeOverlayLayer(this._outline);
                 this._outline.dispose();
                 this._outline = null;
             }
             if (go) {
                 const helper = new THREE.BoxHelper(go.transform._internalObject3D, 0x4ade80);
-                // Recompute the box every frame in _loop so it tracks transform changes.
+                // Recompute the box every frame in _tick so it tracks transform changes.
                 this._outline = helper;
-                overlay.add(helper);
+                this._renderer.addOverlayLayer('above-scene', helper);
             }
         }, { injector: this._injector });
 
-        this._resize(canvas);
-        this._resizeObs = new ResizeObserver(() => this._resize(canvas));
-        this._resizeObs.observe(canvas);
-
-        this._zone.runOutsideAngular(() => this._loop());
+        // The debug probe (D-13) exists only when the flag is set.
+        if (probeEnabled()) {
+            installProbe(this._renderer, {
+                selection: this._selection,
+                canvas: () => this._canvas,
+            });
+        }
     }
 
     /** Releases GPU resources and stops the loop. */
     public detach(): void {
-        if (this._rafId) cancelAnimationFrame(this._rafId);
-        this._rafId = 0;
-        this._resizeObs?.disconnect();
-        this._resizeObs = null;
         if (this._canvas) {
             this._canvas.removeEventListener('pointerdown', this._onPointerDown);
             this._canvas.removeEventListener('pointerup',   this._onPointerUp);
@@ -193,12 +168,7 @@ export class ViewportService {
         this._snapEffect = null;
         this._outline?.dispose();
         this._outline = null;
-        this._controls?.dispose();
-        this._controls = null;
-        this._renderer?.dispose();
-        this._renderer = null;
-        this._overlay = null;
-        this._camera = null;
+        this._renderer.detach();
     }
 
     /** Active gizmo tool — drives the toolbar toggle and the viewport overlay. */
@@ -216,13 +186,16 @@ export class ViewportService {
     }
 
     /** The editor camera. Used by selection raycasting in later milestones. */
-    public get camera(): THREE.PerspectiveCamera | null { return this._camera; }
+    public get camera(): THREE.PerspectiveCamera | null { return this._renderer.camera; }
 
-    private _loop = (): void => {
-        if (!this._renderer || !this._camera || !this._overlay) return;
-        this._rafId = requestAnimationFrame(this._loop);
-        this._controls?.update();
+    /** The Scene-view pivot in engine space — where root creates land (D-3). */
+    public get pivot(): { x: number; y: number; z: number } {
+        const target = this._renderer.controls?.target ?? new THREE.Vector3();
+        return { x: target.x, y: target.y, z: -target.z };
+    }
 
+    /** One frame's bookkeeping, run by the renderer's loop before it draws. */
+    private _tick(): void {
         // Flush dirty engine transforms before we render the engine scene.
         Transform._syncAllDirty();
 
@@ -237,12 +210,6 @@ export class ViewportService {
         // Keep the selection outline in sync with the target's current bounds.
         this._outline?.update();
 
-        const engineScene = SceneManager.activeScene._internalThreeScene;
-
-        this._renderer.clear();
-        this._renderer.render(this._overlay, this._camera);
-        this._renderer.render(engineScene, this._camera);
-
         // ── FPS / frame time bookkeeping (zone-free signal updates) ──
         const now = performance.now();
         if (this._lastT) this.frameMs.set(+(now - this._lastT).toFixed(1));
@@ -254,7 +221,7 @@ export class ViewportService {
             this._frames = 0;
             this._fpsLastT = now;
         }
-    };
+    }
 
     /**
      * Frames the orbit camera on the given GameObject — moves the orbit
@@ -262,15 +229,17 @@ export class ViewportService {
      * back to a sensible distance so the whole object is visible.
      */
     public frameOnObject(obj3d: THREE.Object3D): void {
-        if (!this._camera || !this._controls) return;
+        const camera = this._renderer.camera;
+        const controls = this._renderer.controls;
+        if (!camera || !controls) return;
         const box = new THREE.Box3().setFromObject(obj3d);
         if (box.isEmpty()) {
             // Fallback to the object's local origin.
             obj3d.updateMatrixWorld(true);
             const p = new THREE.Vector3();
             p.setFromMatrixPosition(obj3d.matrixWorld);
-            this._controls.target.copy(p);
-            this._controls.update();
+            controls.target.copy(p);
+            controls.update();
             return;
         }
         const center = new THREE.Vector3();
@@ -279,23 +248,14 @@ export class ViewportService {
         box.getSize(size);
         const radius = Math.max(size.x, size.y, size.z) * 0.6 || 1;
         // Distance fitted to vertical FOV with a small padding.
-        const fov = (this._camera.fov * Math.PI) / 180;
+        const fov = (camera.fov * Math.PI) / 180;
         const dist = (radius / Math.tan(fov / 2)) * 1.2;
 
-        const dir = this._camera.position.clone().sub(this._controls.target).normalize();
+        const dir = camera.position.clone().sub(controls.target).normalize();
         if (dir.lengthSq() < 1e-6) dir.set(0.5, 0.5, 1).normalize();
-        this._camera.position.copy(center).addScaledVector(dir, dist);
-        this._controls.target.copy(center);
-        this._controls.update();
-    }
-
-    private _resize(canvas: HTMLCanvasElement): void {
-        const w = canvas.clientWidth;
-        const h = canvas.clientHeight;
-        if (w === 0 || h === 0 || !this._renderer || !this._camera) return;
-        this._renderer.setSize(w, h, false);
-        this._camera.aspect = w / h;
-        this._camera.updateProjectionMatrix();
+        camera.position.copy(center).addScaledVector(dir, dist);
+        controls.target.copy(center);
+        controls.update();
     }
 
     // ── Click-to-select ──────────────────────────────────────────────
@@ -322,14 +282,15 @@ export class ViewportService {
     };
 
     private _pickAt(e: PointerEvent): void {
-        if (!this._camera || !this._canvas) return;
+        const camera = this._renderer.camera;
+        if (!camera || !this._canvas) return;
 
         const rect = this._canvas.getBoundingClientRect();
         this._ndc.set(
             ((e.clientX - rect.left) / rect.width)  * 2 - 1,
             -((e.clientY - rect.top)  / rect.height) * 2 + 1,
         );
-        this._raycaster.setFromCamera(this._ndc, this._camera);
+        this._raycaster.setFromCamera(this._ndc, camera);
 
         Transform._syncAllDirty();
         const scene = SceneManager.activeScene._internalThreeScene;

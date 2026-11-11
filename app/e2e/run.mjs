@@ -63,10 +63,15 @@ let lastPage = null;
  * unless a scenario says otherwise. The folder the picker returns is
  * `window.__pickFolder`, which a scenario can change between opens.
  */
-async function newPage(folderName = "DemoScenario", { viewport = { width: 1600, height: 900 }, settings = { language: "en" }, autosaveMs = 0 } = {}) {
+async function newPage(folderName = "DemoScenario", { viewport = { width: 1600, height: 900 }, settings = { language: "en" }, autosaveMs = 0, probe = false } = {}) {
     const context = await browser.newContext({ viewport, locale: "en-US" });
     const page = await context.newPage();
     await instrument(page, folderName, settings, autosaveMs);
+    if (probe) {
+        // The debug probe (D-13) is only installed with this flag; production
+        // editors never set it, and no other scenario does.
+        await page.addInitScript(() => localStorage.setItem("wets:debug:probe", "1"));
+    }
     await page.goto(URL_, { waitUntil: "load" });
     return page;
 }
@@ -450,6 +455,83 @@ scenario("honest saving: the mark, Save from the dialog, the gizmo, closing the 
     const saved = JSON.parse(await readDisk(page, "SaveDemo", "assets/scenes/main.scene.json"));
     check("Save in the dialog writes the scene before closing", saved.roots.length >= 2, String(saved.roots.length));
     check("no native dialogs were used", page.nativeDialogs === 0);
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1 phase 1 — the 3D Object menu (D-3) and the D-2 render order. The debug
+// probe (D-13) is installed only when the flag is set, so the scenario sets it
+// in its own context; production editors never carry it.
+scenario("3d objects: the six primitives, undo, persistence, and the gizmo on top (B1.1)", async () => {
+    const page = await newPage("PrimitivesDemo", { probe: true });
+    await openEmptyProject(page);
+
+    const KINDS = ["Cube", "Sphere", "Capsule", "Cylinder", "Plane", "Quad"];
+    const pivot = () => page.evaluate(() => window.__wetsProbe.pivot());
+    const treeNames = () => page.locator("app-hierarchy li .label").allInnerTexts();
+
+    // DW-1.1: each of the six, from the GameObject menu, lands at the pivot and
+    // is selected; one Ctrl+Z removes it in one step, Ctrl+Y brings it back.
+    const origin = await pivot();
+    check("the pivot starts at the origin", origin.x === 0 && origin.y === 0 && origin.z === 0, JSON.stringify(origin));
+
+    for (const kind of KINDS) {
+        // The 3D Object entry is a submenu parent: it opens on hover.
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+        await page.locator(".ctx-item", { hasText: kind }).last().click();
+        await page.waitForTimeout(250);
+        check(`${kind}: created and selected`, (await page.locator("app-hierarchy li.selected .label").innerText()) === kind);
+
+        const p = () => page.locator(".insp-body .field").nth(0).locator("input").evaluateAll(els => els.map(e => e.value).join(","));
+        const placed = await p();
+        check(`${kind}: sits at the pivot`, placed === "0,0,0", placed);
+
+        await page.keyboard.press("Control+z");
+        await page.waitForTimeout(300);
+        check(`${kind}: one undo step removes it`, !(await treeNames()).includes(kind), (await treeNames()).join(", "));
+
+        await page.keyboard.press("Control+y");
+        await page.waitForTimeout(300);
+        check(`${kind}: redo brings it back`, (await treeNames()).includes(kind), (await treeNames()).join(", "));
+    }
+
+    // DW-1.3: save, close, reopen — all six present, version 1, the mesh, the
+    // material and the collider per kind (Plane/Quad carry none, D-3).
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(600);
+    // Saved already, so the close goes without the three-button dialog.
+    await menu(page, "File", "Close Project");
+    await page.locator(".start-card").waitFor();
+    await page.locator(".recent").first().click();
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(500);
+
+    const saved = JSON.parse(await readDisk(page, "PrimitivesDemo", "assets/scenes/main.scene.json"));
+    check("reopen: all six are in the scene", KINDS.every(k => saved.roots.some(r => r.name === k)), saved.roots.map(r => r.name).join(", "));
+    check("the file stays format version 1", saved.version === 1, String(saved.version));
+    for (const kind of KINDS.slice(0, 4)) {
+        const root = saved.roots.find(r => r.name === kind);
+        const mesh = root.components.find(c => c.type === "MeshFilter");
+        const mat = root.components.find(c => c.type === "MeshRenderer");
+        check(`${kind}: a PrimitiveMesh with its kind`, mesh?.fields.sharedMesh?.$type === "PrimitiveMesh" && typeof mesh.fields.sharedMesh.kind === "string", JSON.stringify(mesh?.fields.sharedMesh));
+        check(`${kind}: an inlined material`, typeof mat?.fields.sharedMaterial === "object", JSON.stringify(mat?.fields.sharedMaterial));
+        check(`${kind}: Unity's collider`, root.components.some(c => /Collider/.test(c.type)), root.components.map(c => c.type).join(", "));
+    }
+    for (const kind of KINDS.slice(4)) {
+        const root = saved.roots.find(r => r.name === kind);
+        check(`${kind}: no collider (Unity's MeshCollider is a recorded deviation)`, !root.components.some(c => /Collider/.test(c.type)), root.components.map(c => c.type).join(", "));
+    }
+
+    // DW-1.4: the gizmo's red X arrow lands over the cube (D-2's on-top layer).
+    await page.locator("app-hierarchy li", { hasText: "Cube" }).first().click();
+    await page.waitForTimeout(300);
+    const point = await page.evaluate(() => {
+        const probe = window.__wetsProbe;
+        const p = probe.handlePoint("x", 1.2);
+        return p ? probe.pixel(p.x, p.y) : null;
+    });
+    check("the gizmo's X arrow is drawn over the cube", Array.isArray(point) && point[0] > 120 && point[0] > point[1] + 60 && point[0] > point[2] + 60, JSON.stringify(point));
+
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 

@@ -45,6 +45,13 @@ export const en = {
     'edit.preferences': 'Preferences…',
 
     'go.createEmpty': 'Create Empty',
+    'go.3dObject': '3D Object',
+    'go.cube': 'Cube',
+    'go.sphere': 'Sphere',
+    'go.capsule': 'Capsule',
+    'go.cylinder': 'Cylinder',
+    'go.plane': 'Plane',
+    'go.quad': 'Quad',
     'go.camera': 'Camera',
     'go.light': 'Light',
     'go.directionalLight': 'Directional Light',

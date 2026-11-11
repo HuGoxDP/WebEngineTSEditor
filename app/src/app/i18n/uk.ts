@@ -40,6 +40,13 @@ export const uk: Record<MessageKey, string> = {
     'edit.preferences': 'Налаштування…',
 
     'go.createEmpty': 'Створити порожній',
+    'go.3dObject': '3D-об’єкт',
+    'go.cube': 'Куб',
+    'go.sphere': 'Сфера',
+    'go.capsule': 'Капсула',
+    'go.cylinder': 'Циліндр',
+    'go.plane': 'Площина',
+    'go.quad': 'Квад',
     'go.camera': 'Камера',
     'go.light': 'Світло',
     'go.directionalLight': 'Спрямоване світло',
