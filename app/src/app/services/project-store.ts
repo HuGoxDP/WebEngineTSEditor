@@ -81,6 +81,104 @@ async function dirAt(
     return dir;
 }
 
+/** Under the OPFS root: one folder per project, so two projects never share a namespace. */
+const PROJECTS_DIR = 'projects';
+
+/** A project in the browser's origin-private file system (OPFS). */
+export class OpfsStore implements ProjectStore {
+
+    private _id: string;
+
+    private constructor(private readonly _root: Promise<FileSystemDirectoryHandle>, id: string) {
+        this._id = id;
+    }
+
+    /** The project's id — its folder name under `projects/`, and its stable identity. */
+    public get id(): string { return this._id; }
+
+    /**
+     * Whether this browser can run projects from OPFS: the API itself, and a
+     * way to write (Safari below 26 has the directory but no `createWritable`,
+     * so a project there would open read-only — not a store).
+     */
+    public static available(): boolean {
+        const storage: Partial<StorageManager> | undefined = globalThis.navigator?.storage;
+        return typeof storage?.getDirectory === 'function'
+            && typeof FileSystemFileHandle !== 'undefined'
+            && typeof FileSystemFileHandle.prototype.createWritable === 'function';
+    }
+
+    /** Opens (making it if it is new) the project folder `id`. */
+    public static async create(id: string = crypto.randomUUID()): Promise<OpfsStore> {
+        const opfs = await navigator.storage.getDirectory();
+        const projects = await opfs.getDirectoryHandle(PROJECTS_DIR, { create: true });
+        const root = await projects.getDirectoryHandle(id, { create: true });
+        return new OpfsStore(Promise.resolve(root), id);
+    }
+
+    /**
+     * Whether the project folder `id` is there — without making it. A remembered
+     * project whose folder was cleared is *missing*, and must not silently come
+     * back empty.
+     */
+    public static async exists(id: string): Promise<boolean> {
+        try {
+            const opfs = await navigator.storage.getDirectory();
+            const projects = await opfs.getDirectoryHandle(PROJECTS_DIR);
+            await projects.getDirectoryHandle(id);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    public get name(): string { return this._id; }
+
+    public async entries(path: string): Promise<StoreEntry[]> {
+        const dir = (await dirAt(await this._root, path, false)) as FileSystemDirectoryHandle & ValuesCapable;
+        const out: StoreEntry[] = [];
+        for (const child of await stepValues(dir)) {
+            out.push({ name: child.name, kind: child.kind === 'directory' ? 'directory' : 'file' });
+        }
+        return out;
+    }
+
+    public async file(path: string, create: boolean): Promise<FileSystemFileHandle> {
+        const cut = path.lastIndexOf('/');
+        const dir = await dirAt(await this._root, cut === -1 ? '' : path.slice(0, cut), create);
+        return dir.getFileHandle(cut === -1 ? path : path.slice(cut + 1), { create });
+    }
+
+    public async mkdir(path: string): Promise<void> {
+        await dirAt(await this._root, path, true);
+    }
+
+    public async remove(path: string, recursive: boolean): Promise<void> {
+        const cut = path.lastIndexOf('/');
+        const dir = await dirAt(await this._root, cut === -1 ? '' : path.slice(0, cut), false);
+        await dir.removeEntry(cut === -1 ? path : path.slice(cut + 1), { recursive });
+    }
+
+    public async isSameEntry(other: ProjectStore): Promise<boolean> {
+        if (!(other instanceof OpfsStore)) return false;
+        try {
+            return await (await this._root).isSameEntry(await other._root);
+        } catch {
+            return false;
+        }
+    }
+
+    /**
+     * Asks the browser to keep this origin's storage out of eviction. Best
+     * effort: a browser may still ask the user, and OPFS in private mode is
+     * gone when the window closes whatever the answer — a failure here never
+     * fails the project.
+     */
+    public async keepAcrossRestarts(): Promise<void> {
+        try { await navigator.storage.persist(); } catch { /* best effort */ }
+    }
+}
+
 /** A project folder on the user's own disk, opened through the folder picker. */
 export class FileSystemAccessStore implements ProjectStore {
 

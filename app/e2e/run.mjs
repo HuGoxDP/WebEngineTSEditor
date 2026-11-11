@@ -581,6 +581,87 @@ scenario("one tab per project; changes made outside the editor", async () => {
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
+/** Entries directly inside a path of the origin-private file system ('' = its root). */
+const opfsEntries = (page, path = "") => page.evaluate(async p => {
+    const root = await navigator.storage.getDirectory();
+    let dir = root;
+    for (const part of p.split("/").filter(Boolean)) dir = await dir.getDirectoryHandle(part);
+    const out = [];
+    for await (const h of dir.values()) out.push(h.kind === "directory" ? `${h.name}/` : h.name);
+    return out.sort();
+}, path);
+
+/** The text of one file in the origin-private file system, or null. */
+const opfsRead = (page, path) => page.evaluate(async f => {
+    try {
+        let dir = await navigator.storage.getDirectory();
+        const parts = f.split("/");
+        for (const part of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(part);
+        return await (await (await dir.getFileHandle(parts.at(-1))).getFile()).text();
+    } catch { return null; }
+}, path);
+
+// A project in the browser's own store (R1): the folder picker is a Chromium-only
+// API, so the wizard's second option is what a non-Chromium browser gets. The
+// picker is faked to OPFS by `instrument`, so both options exist here.
+scenario("a project in the browser's own store: create, reopen after a reload, missing when cleared", async () => {
+    const page = await newPage("BrowserStoreParent");
+
+    await page.getByText("Create project").click();
+    await page.locator("#wiz-name").fill("Кристали решітки");
+    await page.locator("#wiz-id").fill("crystal-lattices");
+    await page.locator(".dlg-btn.primary").click();               // step 1 → 2
+    await page.locator(".dlg-btn.primary").click();               // step 2 → 3
+    check("step three offers both stores", (await page.locator(".wiz-card").count()) === 2);
+    check("the folder is the default", await page.locator('.wiz-card[aria-checked="true"]').innerText().then(t => t.includes("folder on this computer")));
+    await page.getByText("The browser’s own storage").click();
+    await shot(page, "e2e-browser-store-choice");
+    await page.locator(".dlg-btn.primary").click();                 // create
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(900);
+
+    check("the project opens", (await page.locator(".project-tag").innerText()).includes("Кристали"));
+
+    // Where it lives: one project folder in the origin-private file system.
+    const projects = await opfsEntries(page, "projects");
+    const id = projects.find(n => n.endsWith("/"))?.slice(0, -1);
+    check("one project folder in the browser store", !!id, projects.join(", "));
+    const layout = await opfsEntries(page, `projects/${id}`);
+    check("the layout is in the browser store",
+        ["scenario.meta.json", "scripts/", "assets/"].every(f => layout.includes(f)), layout.join(", "));
+    const meta = JSON.parse(await opfsRead(page, `projects/${id}/scenario.meta.json`));
+    check("the identity is what was typed",
+        meta.id === "crystal-lattices" && meta.name === "Кристали решітки", JSON.stringify(meta));
+    check("the starting scene was written",
+        (await opfsEntries(page, `projects/${id}/assets/scenes`)).includes("main.scene.json"));
+
+    // It survives a reload, and reopens from the recent list.
+    await page.reload({ waitUntil: "load" });
+    await page.waitForTimeout(500);
+    check("after a reload nothing opens by itself", (await page.locator(".work").count()) === 0);
+    check("the browser project is remembered", (await page.locator(".recent .rname").allInnerTexts()).join() === "Кристали решітки");
+    await page.locator(".recent").first().click();
+    await page.locator(".work").waitFor();
+    check("a browser project reopens", (await page.locator(".project-tag").innerText()).includes("Кристали"));
+
+    // Cleared site data makes it *missing*, not an empty project that pretends to be new.
+    await page.evaluate(async projectId => {
+        const projects = await (await navigator.storage.getDirectory()).getDirectoryHandle("projects");
+        await projects.removeEntry(projectId, { recursive: true });
+    }, id);
+    await page.reload({ waitUntil: "load" });
+    await page.waitForTimeout(500);
+    await page.locator(".recent").first().click();
+    await page.waitForTimeout(300);
+    check("a cleared project is reported missing, not reopened empty",
+        (await page.locator(".dlg").innerText()).includes("was not found"),
+        (await page.locator(".dlg").innerText().catch(() => "no dialog")));
+    check("and the workspace did not open", (await page.locator(".work").count()) === 0);
+    await dialogButton(page, "OK").click();
+    await page.waitForTimeout(200);
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
 scenario("new project wizard: collects, validates, creates; cancelling writes nothing", async () => {
     const page = await newPage("WizParent");
     const exists = name => page.evaluate(async n => {
