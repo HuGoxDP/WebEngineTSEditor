@@ -1,5 +1,20 @@
 import { Injectable, inject } from '@angular/core';
-import { Camera, DirectionalLight, Quaternion, SceneSerializer, Vector3, type GameObject, type SerializedScene } from 'WebEngineTS';
+import {
+    BoxCollider,
+    Camera,
+    CapsuleCollider,
+    DirectionalLight,
+    Mesh,
+    MeshFilter,
+    MeshRenderer,
+    Quaternion,
+    SceneSerializer,
+    SphereCollider,
+    StandardMaterial,
+    Vector3,
+    type GameObject,
+    type SerializedScene,
+} from 'WebEngineTS';
 import { SceneService } from './scene.service';
 import { SelectionService } from './selection.service';
 import { HistoryService } from './history.service';
@@ -23,6 +38,27 @@ const DEFAULT_SCENE = 'assets/scenes/main.scene.json';
 
 /** A creatable object: the menu label, and the component it comes with. */
 interface CreateEntry { label: MessageKey; component: string; }
+
+/**
+ * A 3D Object primitive (B1 phase 1; D-3). Unity's default sizes and Unity's
+ * collider choice; `Plane`/`Quad` take none — Unity gives them a MeshCollider
+ * the engine does not have (a recorded deviation in the B1 research).
+ */
+interface PrimitiveEntry {
+    label: MessageKey;
+    mesh: () => Mesh;
+    /** Unity's collider for the kind, as a component constructor (null: none). */
+    collider: CtorOf | null;
+}
+
+const PRIMITIVES: PrimitiveEntry[] = [
+    { label: 'go.cube',     mesh: () => Mesh.createCube(),            collider: BoxCollider as unknown as CtorOf },
+    { label: 'go.sphere',   mesh: () => Mesh.createSphere(),          collider: SphereCollider as unknown as CtorOf },
+    { label: 'go.capsule',  mesh: () => Mesh.createCapsule(),         collider: CapsuleCollider as unknown as CtorOf },
+    { label: 'go.cylinder', mesh: () => Mesh.createCylinder(0.5, 2),  collider: CapsuleCollider as unknown as CtorOf },
+    { label: 'go.plane',    mesh: () => Mesh.createPlane(10, 10),     collider: null },
+    { label: 'go.quad',     mesh: () => Mesh.createQuad(),            collider: null },
+];
 
 const LIGHTS: CreateEntry[] = [
     { label: 'go.directionalLight', component: 'DirectionalLight' },
@@ -86,12 +122,39 @@ export class CommandsService {
         return [
             { label: t('go.createEmpty'), shortcut: 'Alt+Shift+N', action: () => this.createEmpty(parent) },
             { separator: true, label: null },
+            { label: t('go.3dObject'), children: PRIMITIVES.map(p => ({ label: t(p.label), action: () => this.createPrimitive(p, parent) })) },
             { label: t('go.camera'), action: () => this.createWith({ label: 'go.camera', component: 'Camera' }, parent) },
             group('go.light', LIGHTS),
             group('go.audio', AUDIO),
             group('go.effects', EFFECTS),
             group('go.ui', UI),
         ];
+    }
+
+    /**
+     * Creates a 3D Object primitive (B1 phase 1; D-3): the mesh, a white
+     * `StandardMaterial` (Unity's Default-Material) and Unity's collider for the
+     * kind. A root lands at the Scene-view **pivot** (Unity's behaviour; still the
+     * orbit centre until B1.2's controller), a child at local zero — and the same
+     * pivot placement applies to every other root create, Unity parity. One
+     * `history.record` per create = one undo step.
+     */
+    public createPrimitive(entry: PrimitiveEntry, parent: GameObject | null = null): void {
+        const pivot = this._viewport.pivot;
+        // coalesce: false — two primitives of a kind in quick succession are two
+        // creates and two undo steps, not one coalesced edit (B1 phase 1).
+        this._history.record(`Create ${entry.label}`, () => {
+            const go = this._scene.createEmpty(this._i18n.t(entry.label));
+            if (parent) {
+                go.transform.parent = parent.transform;
+            } else {
+                go.transform.localPosition = new Vector3(pivot.x, pivot.y, pivot.z);
+            }
+            go.addComponent(MeshFilter).sharedMesh = entry.mesh();
+            go.addComponent(MeshRenderer).sharedMaterial = new StandardMaterial();
+            if (entry.collider) go.addComponent(entry.collider as never);
+            this._selection.select(go);
+        }, { coalesce: false });
     }
 
     public createEmpty(parent: GameObject | null = null): void {

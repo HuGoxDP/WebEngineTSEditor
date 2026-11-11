@@ -64,13 +64,19 @@ export class HistoryService {
      *
      * Consecutive calls with the same `label` within {@link COALESCE_MS}
      * don't push a new snapshot — they extend the previous edit session.
+     *
+     * `coalesce: false` closes that window for this edit: a create is its own
+     * undo step even when the same kind is created twice inside the window
+     * (B1 phase 1's 3D Object menu).
      */
-    public record(label: string, action: () => void): void {
+    public record(label: string, action: () => void, options?: { coalesce?: boolean }): void {
         const now = performance.now();
         const last = this._undoStack[this._undoStack.length - 1];
-        const coalesce = !!last
-            && last.label === label
-            && (now - last.time) < HistoryService.COALESCE_MS;
+        const coalesce = options?.coalesce === false
+            ? false
+            : !!last
+                && last.label === label
+                && (now - last.time) < HistoryService.COALESCE_MS;
 
         let snapshotPushed = false;
         if (!coalesce) {
