@@ -793,9 +793,14 @@ scenario("new project wizard: collects, validates, creates; cancelling writes no
     // The chosen location already holds a non-empty folder of that name.
     await seed(page, "WizParent", { "Будова атома/old.txt": "x" });
     await page.getByText("Choose a folder…").click();
-    await page.waitForTimeout(200);
     await page.locator(".dlg-btn.primary").click();
-    await page.waitForTimeout(300);
+    // The refusal is asynchronous (it stats the picked folder), and late in a
+    // full run — every earlier scenario's page is still open — that lands well
+    // after the fixed 300 ms this used to wait. Wait for the error instead.
+    for (let i = 0; i < 50; i++) {
+        if ((await page.locator(".wiz-error").count()) > 0) break;
+        await page.waitForTimeout(100);
+    }
     await shot(page, "e2e-wizard-3");
     check("a taken name is refused with a reason", (await page.locator(".wiz-error").innerText()).includes("already exists"));
     check("and the wizard stays open", (await page.locator(".wiz-steps").innerText()).includes("Step 3 of 3"));
