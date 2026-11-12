@@ -213,6 +213,14 @@ const menu = async (page, bar, item) => {
 };
 const noErrors = page => page.logs.filter(l => !l.includes("404")).length === 0;
 
+/** Writes a full project layout (files by project-relative path) the picker will hand back. */
+async function seedScriptProject(page, files) {
+  await seed(page, "ScriptParent", {
+    "scenario.meta.json": JSON.stringify({ id: "script-parent", name: "ScriptParent", version: 1, createdAt: "2026-11-12T00:00:00Z" }),
+    ...files,
+  });
+}
+
 /** From the start screen: open the (empty) folder the picker returns and accept the set-up. */
 async function openEmptyProject(page) {
     await page.getByText("Open folder…").click();
@@ -233,6 +241,130 @@ const sceneWith = name => JSON.stringify({
 // ═══ Scenarios ═══
 const scenarios = [];
 const scenario = (name, fn) => scenarios.push([name, fn]);
+
+// C4 phase 2: the script runtime. A project whose saved scene names a component
+// script opens with that component attached: the scripts are compiled and linked
+// before the scene is read, exactly as a reload on the platform runs them. The
+// engine is resolved through the app's import map, so the script and the editor
+// share one TypeRegistry — a class a script exports reaches the scene the editor
+// deserializes.
+const ROTATOR = `import { ScriptableBehaviour, Serializable, SerializedField, Time } from "WebEngineTS";
+
+@Serializable({ typeName: "Rotator" })
+export default class Rotator extends ScriptableBehaviour {
+    @SerializedField() public speed = 1;
+
+    protected override update(): void {
+        this.transform.position.x += this.speed * Time.deltaTime;
+    }
+}
+`;
+const SCENARIO_ENTRY = `import { ScenarioBehaviour, SceneSerializer } from "WebEngineTS";
+
+const SCENE = "scenes/main.scene.json";
+
+export default class Scenario extends ScenarioBehaviour {
+    override async awake(): Promise<void> {
+        const blob = await this.context.assets.getAsset(SCENE);
+        SceneSerializer.deserializeScene(JSON.parse(await blob.text()));
+    }
+}
+`;
+
+scenario("a component script loads, attaches to its object, and swaps on save", async () => {
+  const page = await newPage("ScriptParent");
+  const scene = {
+    name: "Main", version: 1,
+    roots: [{
+      name: "Spinner", active: true,
+      transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+      components: [{ type: "Rotator", fields: { speed: 3 } }],
+      children: [],
+    }],
+  };
+  await seed(page, "ScriptParent", {
+    "scenario.meta.json": JSON.stringify({ id: "script-parent", name: "ScriptParent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Rotator.ts": ROTATOR,
+    "assets/scenes/main.scene.json": JSON.stringify(scene),
+  });
+
+  // Open through the picker, like any existing project: the picker is faked to
+  // OPFS by `instrument`, so this reads the files just seeded.
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  // The scripts load before the scene, so the object's component is a real
+  // component by the time the hierarchy shows it.
+  await page.waitForFunction(
+    () => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false,
+    null, { timeout: 30000 },
+  );
+
+  check("the scene opened with the object the script drives",
+    (await page.locator("app-hierarchy").innerText()).includes("Spinner"));
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(400);
+  const body = () => page.locator(".insp-body").innerText();
+  check("the component is attached, not a placeholder",
+    (await body()).includes("Rotator"), (await body()).slice(0, 160));
+  const fieldValues = () => page.locator(".insp-body .field input")
+    .evaluateAll(els => els.map(e => e.value));
+  check("and its saved field is shown",
+    (await fieldValues()).includes("3"), JSON.stringify(await fieldValues()));
+
+  // Open the script, change the default, save — the class is swapped.
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: "Rotator.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  check("the Code tab opened on the script", (await page.locator(".code-name").innerText()).includes("Rotator.ts"));
+
+  // Pasted, not typed: Monaco's auto-closing brackets rewrite a typed source,
+  // and the file on disk would no longer be the text the author meant.
+  const context = page.context();
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const edited = ROTATOR.replace("public speed = 1;", "public speed = 5;");
+  await page.evaluate(text => navigator.clipboard.writeText(text), edited);
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(700);
+  await page.locator(".pane-btn.primary").click();
+  await page.waitForTimeout(2500);
+  const onDisk = await readDisk(page, "ScriptParent", "scripts/components/Rotator.ts");
+  check("the file on disk holds the new default", onDisk.includes("public speed = 5"));
+  check("the typed file is what was typed", JSON.stringify(onDisk).indexOf("public speed = 5;") > 0 && !onDisk.includes("speed = 1;"), JSON.stringify(onDisk).slice(0, 400));
+  check("the workspace is still open after the swap", (await page.locator(".work").count()) === 1);
+  check("the object is still there", (await page.locator("app-hierarchy").innerText()).includes("Spinner"));
+
+  // DW-2.2: a fresh object of the same script sees the new default. The class
+  // was replaced, not re-registered.
+  // The engine canvas, not Monaco's own (the Code tab is open by now).
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().click();
+  await page.waitForTimeout(300);
+  await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+  await page.waitForTimeout(500);
+  await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+  await page.waitForTimeout(600);
+  const added = () => page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  check("a new object gets the script's new default",
+    (await added()).includes("5"), JSON.stringify(await added()));
+
+  // The engine's own advisory about the refused duplicate registration is what
+  // a reload swap looks like from its side: `register` refuses the second
+  // class, and the editor answers with `TypeRegistry.replace` — which is what
+  // the message asks for. Everything else in the console must be quiet.
+  const swapError = "[TypeRegistry] Type name \"Rotator\" is already registered to a different class";
+  check("nothing but the swap advisory in the console",
+    page.logs.filter(l => !l.includes("404") && !l.includes(swapError)).length === 0,
+    page.logs.join(" | "));
+  await shot(page, "e2e-script-runtime");
+});
 
 // C4 phase 1: the Code tab. A script file is a file like any other — it opens
 // in the Code tab, types, saves back through the project store, and an edit of

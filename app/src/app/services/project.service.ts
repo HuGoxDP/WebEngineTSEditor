@@ -1,6 +1,6 @@
 import { Injectable, computed, signal } from '@angular/core';
 import { defaultMeta, metaJson, SCENARIO_TEMPLATE, type ProjectMeta } from './project-templates';
-import { FileSystemAccessStore, OpfsStore, type ProjectStore } from './project-store';
+import { FileSystemAccessStore, OpfsStore, type ProjectStore, type StoreEntry } from './project-store';
 
 /** What a file is, as far as the Project panel cares — drives icon and double-click. */
 export type ProjectEntryKind =
@@ -291,6 +291,17 @@ export class ProjectService {
     }
 
     // ── Files ────────────────────────────────────────────────────────
+
+    /**
+     * The entries directly under `path`, for a caller that walks the project
+     * itself — the script runtime enumerating `scripts/`. Empty when no project
+     * is open, or the folder is not there, so a caller never has to try/catch.
+     */
+    public async entries(path: string): Promise<StoreEntry[]> {
+        if (!this._store) return [];
+        try { return await this._store.entries(path); }
+        catch { return []; }
+    }
 
     public async readFile(path: string): Promise<File> {
         return (await this._store!.file(path, false)).getFile();

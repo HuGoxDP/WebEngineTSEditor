@@ -1,5 +1,6 @@
 import { Injectable, computed, signal } from '@angular/core';
 import { ProjectService } from './project.service';
+import { ScriptRuntimeService } from './script-runtime.service';
 
 /**
  * One file open in the Code tab, and whether its buffer differs from the disk.
@@ -39,7 +40,10 @@ export class CodeEditorService {
     /** What the Code tab shows when no file is open. */
     public readonly empty = computed(() => this.file() === null);
 
-    public constructor(private readonly _project: ProjectService) {}
+    public constructor(
+        private readonly _project: ProjectService,
+        private readonly _runtime: ScriptRuntimeService,
+    ) {}
 
     /** Reads `path` into the Code tab. A read failure is reported, not swallowed. */
     public async open(path: string): Promise<boolean> {
@@ -58,7 +62,11 @@ export class CodeEditorService {
         return true;
     }
 
-    /** Writes the buffer back through the project store and clears the mark. */
+    /**
+     * Writes the buffer back through the project store, clears the mark, and
+     * hands the saved file to the script runtime — a save is the moment the
+     * project's classes change, which is what Unity's "reload on save" means.
+     */
     public async save(text: string): Promise<boolean> {
         const file = this.file();
         if (!file) return false;
@@ -70,7 +78,22 @@ export class CodeEditorService {
         }
         this._dirty.set(false);
         this._revision.update(n => n + 1);
+        await this._reload();
         return true;
+    }
+
+    /** Compiles, links and loads the project's scripts (the runtime's entry). */
+    public async reloadScripts(): Promise<string[]> {
+        return await this._reload();
+    }
+
+    private async _reload(): Promise<string[]> {
+        try {
+            return await this._runtime.reload();
+        } catch (err) {
+            console.error(`[Script] Could not reload scripts: ${String(err)}`);
+            return [String(err)];
+        }
     }
 
     /**

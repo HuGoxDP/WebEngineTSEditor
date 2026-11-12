@@ -118,6 +118,9 @@ export class CodeComponent implements AfterViewInit, OnDestroy {
         await Promise.all([
             import('monaco-editor/esm/vs/basic-languages/typescript/typescript.js'),
             import('monaco-editor/esm/vs/basic-languages/javascript/javascript.js'),
+            // The TypeScript language service: its worker is what compiles a
+            // script for the runtime and what later reports diagnostics.
+            import('monaco-editor/esm/vs/language/typescript/monaco.contribution.js'),
         ]);
         return api as unknown as Monaco;
     }

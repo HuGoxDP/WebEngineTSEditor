@@ -6,3 +6,6 @@
  */
 declare module 'monaco-editor/esm/vs/basic-languages/typescript/typescript.js';
 declare module 'monaco-editor/esm/vs/basic-languages/javascript/javascript.js';
+declare module 'monaco-editor/esm/vs/language/typescript/monaco.contribution.js';
+declare module 'monaco-editor/esm/vs/language/typescript/tsMode.js';
+declare module 'monaco-editor/esm/vs/language/typescript/tsMode.js';

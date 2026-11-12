@@ -1,4 +1,5 @@
 import { Injectable, inject } from '@angular/core';
+import { CodeEditorService } from './code-editor.service';
 import {
     BoxCollider,
     Camera,
@@ -101,6 +102,7 @@ export class CommandsService {
     private readonly _registry = inject(ComponentRegistryService);
     private readonly _fileIo = inject(FileIoService);
     private readonly _project = inject(ProjectService);
+    private readonly _code = inject(CodeEditorService);
     private readonly _viewport = inject(ViewportService);
     private readonly _dialog = inject(DialogService);
     private readonly _i18n = inject(I18nService);
@@ -426,6 +428,12 @@ export class CommandsService {
             await this.fail(this._i18n.t('open.elsewhere', { name }));
             return;
         }
+        // The classes before the scene: a saved scene names its components by
+        // type name, and only the project's own scripts know those names, so
+        // the scripts are compiled and loaded first — the scene then
+        // deserializes into the real component instead of the placeholder the
+        // engine keeps for an unknown type.
+        await this._code.reloadScripts();
         this._resetScene();
         await this._loadDefaultScene();
         await this._offerRecovery();

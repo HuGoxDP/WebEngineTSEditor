@@ -8,6 +8,20 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- One engine instance, one three. The app's own bundle, the engine's
+       bundle and a scenario script's module all resolve "WebEngineTS" — and
+       "three" — here, so TypeRegistry is shared (a script's classes reach the
+       scene the editor deserializes) and there is no second copy of three. -->
+  <script type="importmap">
+    {
+      "imports": {
+        "WebEngineTS": "/editor/engine/WebEngineTS.esm.js",
+        "three": "/editor/engine/three.module.js",
+        "three/addons/": "/editor/engine/three-addons/",
+        "three/examples/jsm/": "/editor/engine/three-addons/"
+      }
+    }
+  </script>
 </head>
 <body>
   <app-root></app-root>
