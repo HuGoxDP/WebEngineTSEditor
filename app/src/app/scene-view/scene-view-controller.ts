@@ -151,6 +151,17 @@ export class SceneViewController {
     /** A gesture or an animation marks the camera "touched" — ends follow. */
     public onCameraGesture: (() => void) | null = null;
 
+    /**
+     * Whether the View tool (Q) is active: the left button then pans instead of
+     * selecting, as Unity's hand tool does.
+     */
+    public set viewTool(active: boolean) {
+        if (active === this._viewTool) return;
+        this._viewTool = active;
+        if (active && this._mode === 'look') this._mode = 'none';
+    }
+    private _viewTool = false;
+
     constructor(initial?: Partial<NavState>) {
         // The frozen pose the plan requires: engine (6, 6, −10) from the origin,
         // which is where the renderer left the camera before the controller
@@ -393,15 +404,17 @@ export class SceneViewController {
         this._downY = e.clientY;
         this._shift = e.shiftKey;
         // The gesture the button + modifiers mean (D-4). Alt+LMB orbits;
-        // plain LMB is the selection's (Phase 5), never ours. A movement key
-        // already held wins over Shift+RMB's orbit: Shift is the fly's sprint,
-        // so RMB+Shift+W flies fast instead of orbiting.
+        // plain LMB is the selection's, except under the View tool (Q), where it
+        // pans like Unity's hand. A movement key already held wins over
+        // Shift+RMB's orbit: Shift is the fly's sprint, so RMB+Shift+W flies
+        // fast instead of orbiting.
         if (e.button === 2 && e.altKey)      this._mode = 'dolly';
         else if (e.button === 2 && this._keys.size > 0) this._mode = 'fly';
         else if (e.button === 2 && e.shiftKey) this._mode = 'orbit';
         else if (e.button === 2)             this._mode = 'look';
         else if (e.button === 1)             this._mode = 'pan';
         else if (e.button === 0 && e.altKey) this._mode = 'orbit';
+        else if (e.button === 0 && this._viewTool) this._mode = 'pan';
         else { this._pointerId = null; return; }
 
         // A movement key pressed after the right button turns the look into a fly.

@@ -109,6 +109,9 @@ export const en = {
     // ── viewport ────────────────────────────────────────────────────
     'vp.pivot': 'Pivot',
     'vp.local': 'Local',
+    'vp.center': 'Center',
+    'vp.world': 'Global',
+    'vp.snapTo': 'Snap',
     'vp.localSpace': 'Local space',
     'vp.snap': 'Snap value',
     'vp.shaded': 'Shaded',
@@ -129,9 +132,11 @@ export const en = {
     'vp.projection': 'Projection',
     'vp.persp': 'Persp',
     'vp.iso': 'Iso',
+    'tool.view': 'View',
     'tool.translate': 'Move',
     'tool.rotate': 'Rotate',
     'tool.scale': 'Scale',
+    'tool.combined': 'Transform',
 
     // ── status bar ──────────────────────────────────────────────────
     'status.playing': 'Playing',
@@ -238,6 +243,11 @@ export const en = {
     'prefs.densityComfy': 'Comfortable',
     'prefs.gridSnap': 'Snap step',
     'prefs.gridSnapHint': 'How far the move gizmo steps, in scene units. 0 turns snapping off.',
+    'prefs.rotateStep': 'Rotate step (degrees)',
+    'prefs.rotateStepHint': 'How far the turn gizmo steps, in degrees. 0 turns snapping off.',
+    'prefs.scaleStep': 'Scale step',
+    'prefs.scaleStepHint': "The scale gizmo's step, as a fraction of the current size. 0 turns snapping off.",
+    'prefs.snapHint': 'Held snapping applies while Ctrl is held; the magnet in the Scene view turns it on.',
     'prefs.flySpeed': 'Fly speed',
     'prefs.flySpeedHint': 'Units per second while flying the Scene view with the right mouse button and WASD/QE.',
     'prefs.autosave': 'Autosave',

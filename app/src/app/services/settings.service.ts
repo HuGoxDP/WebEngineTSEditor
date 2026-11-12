@@ -13,6 +13,10 @@ export interface Settings {
     density: Density;
     /** Gizmo snap step in world units. `0` turns snapping off. */
     gridSnap: number;
+    /** Rotation snap step in degrees (D-6). `0` turns it off. */
+    rotateSnap: number;
+    /** Scale snap step as a fraction (D-6). `0` turns it off. */
+    scaleSnap: number;
     /** Scene-view fly speed in world units per second (D-4). */
     flySpeed: number;
     /** Writes `.editor/autosave.scene.json` while a scene has unsaved changes. */
@@ -31,6 +35,8 @@ function defaults(): Settings {
         theme: 'dark',
         density: 'compact',
         gridSnap: 1,
+        rotateSnap: 15,
+        scaleSnap: 0.1,
         flySpeed: 5,
         autosave: true,
         confirmDelete: true,
@@ -53,6 +59,8 @@ export class SettingsService {
     public readonly theme         = signal<Theme>('dark');
     public readonly density       = signal<Density>('compact');
     public readonly gridSnap      = signal(1);
+    public readonly rotateSnap    = signal(15);
+    public readonly scaleSnap     = signal(0.1);
     public readonly flySpeed      = signal(5);
     public readonly autosave      = signal(true);
     public readonly confirmDelete = signal(true);
@@ -78,6 +86,8 @@ export class SettingsService {
             theme: this.theme(),
             density: this.density(),
             gridSnap: this.gridSnap(),
+            rotateSnap: this.rotateSnap(),
+            scaleSnap: this.scaleSnap(),
             flySpeed: this.flySpeed(),
             autosave: this.autosave(),
             confirmDelete: this.confirmDelete(),
@@ -108,6 +118,8 @@ export class SettingsService {
             if (p.theme === 'dark' || p.theme === 'light') out.theme = p.theme;
             if (p.density === 'compact' || p.density === 'comfy') out.density = p.density;
             if (typeof p.gridSnap === 'number' && p.gridSnap >= 0 && Number.isFinite(p.gridSnap)) out.gridSnap = p.gridSnap;
+            if (typeof p.rotateSnap === 'number' && p.rotateSnap >= 0 && Number.isFinite(p.rotateSnap)) out.rotateSnap = p.rotateSnap;
+            if (typeof p.scaleSnap === 'number' && p.scaleSnap > 0 && Number.isFinite(p.scaleSnap)) out.scaleSnap = p.scaleSnap;
             if (typeof p.flySpeed === 'number' && p.flySpeed > 0 && Number.isFinite(p.flySpeed)) out.flySpeed = p.flySpeed;
             if (typeof p.autosave === 'boolean') out.autosave = p.autosave;
             if (typeof p.confirmDelete === 'boolean') out.confirmDelete = p.confirmDelete;
