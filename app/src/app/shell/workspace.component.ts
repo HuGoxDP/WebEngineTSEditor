@@ -9,7 +9,7 @@ import {
     inject,
     signal,
 } from '@angular/core';
-import { ViewportService, type GizmoMode } from '../viewport.service';
+import { ViewportService, type Tool } from '../viewport.service';
 import type { MessageKey } from '../i18n/i18n.service';
 import { CommandsService } from '../services/commands.service';
 import { ConsoleService } from '../services/console.service';
@@ -85,17 +85,25 @@ import { StatusbarComponent } from './statusbar.component';
 
                         <!-- Sub-toolbar above the canvas -->
                         <div class="vp-subtoolbar">
-                            <button class="chip" [title]="'vp.pivot' | t">
+                            <button class="chip"
+                                [class.active]="viewport.pivotMode() === 'center'"
+                                (click)="viewport.setPivotMode(viewport.pivotMode() === 'center' ? 'pivot' : 'center')"
+                                [title]="'vp.pivot' | t">
                                 <wets-icon name="pivot"></wets-icon>
-                                <span>{{ 'vp.pivot' | t }}</span>
-                                <span class="caret">▾</span>
+                                <span>{{ (viewport.pivotMode() === 'center' ? 'vp.center' : 'vp.pivot') | t }}</span>
                             </button>
-                            <button class="chip" [title]="'vp.localSpace' | t">
+                            <button class="chip"
+                                [class.active]="viewport.handleSpace() === 'local'"
+                                (click)="viewport.setHandleSpace(viewport.handleSpace() === 'local' ? 'world' : 'local')"
+                                [title]="'vp.localSpace' | t">
                                 <wets-icon name="globe"></wets-icon>
-                                <span>{{ 'vp.local' | t }}</span>
-                                <span class="caret">▾</span>
+                                <span>{{ (viewport.handleSpace() === 'local' ? 'vp.local' : 'vp.world') | t }}</span>
                             </button>
-                            <button class="chip" [title]="'vp.snap' | t">
+                            <!-- The magnet: snapping on without holding Ctrl -->
+                            <button class="chip"
+                                [class.active]="viewport.snapOn()"
+                                (click)="viewport.toggleSnap()"
+                                [title]="'vp.snapTo' | t">
                                 <wets-icon name="magnet"></wets-icon>
                                 <span>{{ settings.gridSnap() > 0 ? settings.gridSnap() : '–' }}</span>
                             </button>
@@ -114,9 +122,12 @@ import { StatusbarComponent } from './statusbar.component';
                         <div class="vp-canvas">
                             <canvas #viewportCanvas></canvas>
 
-                            <!-- Floating vertical tool palette (Unity-style) -->
+                            <!-- Floating vertical tool palette (Unity-style). Q view, W/E/R the
+                                 three handle sets, Y all of them; Rect is stage 18. -->
                             <aside class="tool-palette">
-                                <button class="tool-btn" [title]="'vp.hand' | t" disabled>
+                                <button class="tool-btn"
+                                    [class.active]="viewport.tool() === 'view'"
+                                    (click)="viewport.setTool('view')" [title]="'vp.hand' | t">
                                     <wets-icon name="hand"></wets-icon>
                                 </button>
                                 <button class="tool-btn"
@@ -137,7 +148,9 @@ import { StatusbarComponent } from './statusbar.component';
                                 <button class="tool-btn" [title]="'vp.rect' | t" disabled>
                                     <wets-icon name="rect"></wets-icon>
                                 </button>
-                                <button class="tool-btn" [title]="'vp.combined' | t" disabled>
+                                <button class="tool-btn"
+                                    [class.active]="viewport.tool() === 'combined'"
+                                    (click)="viewport.setTool('combined')" [title]="'vp.combined' | t">
                                     <wets-icon name="transform-combo"></wets-icon>
                                 </button>
                             </aside>
@@ -149,7 +162,7 @@ import { StatusbarComponent } from './statusbar.component';
                                 </div>
                                 <div class="chip">
                                     <span class="k">{{ 'vp.shortcuts' | t }}</span>
-                                    <span class="v">W · E · R · Del · Alt+Shift+N</span>
+                                    <span class="v">Q · W · E · R · Y · Del · Alt+Shift+N</span>
                                 </div>
                             </div>
 
@@ -239,11 +252,16 @@ export class WorkspaceComponent implements AfterViewInit, OnDestroy {
     private readonly _canvasRef!: ElementRef<HTMLCanvasElement>;
 
     /** Message key for each tool's name, so a typo in one does not compile. */
-    public readonly TOOL_LABEL: Record<GizmoMode, MessageKey> = {
+    public readonly TOOL_LABEL: Record<Tool, MessageKey> = {
+        view: 'tool.view',
         translate: 'tool.translate',
         rotate: 'tool.rotate',
         scale: 'tool.scale',
+        combined: 'tool.combined',
     };
+
+    /** The tools the palette shows in order (Rect is stage 18). */
+    public readonly PALETTE: Tool[] = ['view', 'translate', 'rotate', 'scale', 'combined'];
 
     public readonly viewport = inject(ViewportService);
     public readonly layout = inject(LayoutService);

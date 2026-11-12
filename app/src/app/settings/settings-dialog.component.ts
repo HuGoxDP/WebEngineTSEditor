@@ -111,6 +111,23 @@ const SHORTCUTS: ReadonlyArray<{ label: MessageKey; keys: string }> = [
                         <p class="prefs-hint">{{ 'prefs.gridSnapHint' | t }}</p>
 
                         <div class="prefs-row">
+                            <label for="prefs-rsnap">{{ 'prefs.rotateStep' | t }}</label>
+                            <input id="prefs-rsnap" class="num" type="number" min="0" step="1"
+                                [value]="settings.rotateSnap()"
+                                (change)="onRotateSnap($any($event.target).value)">
+                        </div>
+                        <p class="prefs-hint">{{ 'prefs.rotateStepHint' | t }}</p>
+
+                        <div class="prefs-row">
+                            <label for="prefs-ssnap">{{ 'prefs.scaleStep' | t }}</label>
+                            <input id="prefs-ssnap" class="num" type="number" min="0" step="0.05"
+                                [value]="settings.scaleSnap()"
+                                (change)="onScaleSnap($any($event.target).value)">
+                        </div>
+                        <p class="prefs-hint">{{ 'prefs.scaleStepHint' | t }}</p>
+                        <p class="prefs-hint">{{ 'prefs.snapHint' | t }}</p>
+
+                        <div class="prefs-row">
                             <label for="prefs-fly">{{ 'prefs.flySpeed' | t }}</label>
                             <input id="prefs-fly" class="num" type="number" min="0.1" step="0.5"
                                 [value]="settings.flySpeed()"
@@ -228,6 +245,17 @@ export class SettingsDialogComponent {
     public onSnap(raw: string): void {
         const value = Number(raw);
         if (Number.isFinite(value) && value >= 0) this.settings.gridSnap.set(value);
+    }
+
+    /** The turn step is in whole degrees; the scale step a positive fraction. */
+    public onRotateSnap(raw: string): void {
+        const value = Number(raw);
+        if (Number.isFinite(value) && value >= 0) this.settings.rotateSnap.set(value);
+    }
+
+    public onScaleSnap(raw: string): void {
+        const value = Number(raw);
+        if (Number.isFinite(value) && value > 0) this.settings.scaleSnap.set(value);
     }
 
     /** The fly speed is a strictly positive rate; anything else keeps the old one. */

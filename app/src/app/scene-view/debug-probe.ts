@@ -29,8 +29,22 @@ export interface WetsProbe {
     pivot(): { x: number; y: number; z: number };
     /** The selected object names. */
     selection(): string[];
-    /** Client pixels of a point `t` along the given axis from the pivot. */
-    handlePoint(axis: 'x' | 'y' | 'z', t: number): { x: number; y: number } | null;
+    /**
+     * Client pixels of a point `t` along the given axis from the pivot: lowercase
+     * for the world axes, uppercase for the **handle's** axes (D-6), which the
+     * Pivot/Centre and Local/Global switches move.
+     */
+    handlePoint(axis: 'x' | 'y' | 'z' | 'X' | 'Y' | 'Z', t: number): { x: number; y: number } | null;
+    /** The handle axes under the pointer right now, or null (D-6's tool checks). */
+    hoverAxis(): string | null;
+    /** A selected object's engine-space transform, by name (D-6's assertions). */
+    transformOf(name: string): {
+        position: { x: number; y: number; z: number };
+        rotation: { x: number; y: number; z: number; w: number };
+        /** The rotation as Unity's Inspector shows it, in degrees. */
+        euler: { x: number; y: number; z: number };
+        scale: { x: number; y: number; z: number };
+    } | null;
     /** RGBA of the composed frame at a client pixel (null if off-canvas). */
     pixel(x: number, y: number): [number, number, number, number] | null;
     /** Client size of the drawing surface. */
@@ -41,6 +55,17 @@ export interface WetsProbe {
     orientationMode(): { orthographic: boolean; label: string };
     /** Clicks the orientation cube at a client pixel (DW-3.1). */
     orientationClick(x: number, y: number): boolean;
+    /** Every handle set's axis under the pointer, as `set: axis` (D-6). */
+    hoverAll(): Record<string, string | null>;
+    /** An object's screen-space bounds, or null when it is behind the camera. */
+    objectScreenRect(name: string): { left: number; top: number; right: number; bottom: number } | null;
+    /**
+     * Counts pixels by hue inside a client-pixel rectangle: the selection
+     * outline's proof (D-9) is a count of orange pixels, not one sample.
+     */
+    pixelStats(rect: { left: number; top: number; right: number; bottom: number }): {
+        total: number; orange: number; green: number; white: number;
+    };
 }
 
 declare global {
@@ -82,7 +107,7 @@ function enginePose(camera: THREE.Camera & { position: THREE.Vector3; quaternion
 export function installProbe(
     renderer: SceneViewRenderer,
     deps: {
-        selection: { selectedSet(): ReadonlySet<{ name: string }> },
+        selection: { selectedSet(): ReadonlySet<{ name: string; transform: { position: { x: number; y: number; z: number }; rotation: { x: number; y: number; z: number; w: number }; eulerAngles: { x: number; y: number; z: number }; localScale: { x: number; y: number; z: number } } }> },
         canvas: () => HTMLCanvasElement | null;
         /** The navigation controller's state, engine space, while one exists. */
         nav?: { pivot: { x: number; y: number; z: number }; distance: number; yaw: number; pitch: number; orthographic: boolean; flySpeed: number };
@@ -90,6 +115,14 @@ export function installProbe(
         orientation?: () => { targets: Record<string, { x: number; y: number }>; label: string };
         /** Routes a client-pixel click to the orientation cube. */
         orientationClick?: (x: number, y: number) => boolean;
+        /** The handle axes under the pointer, when the handles own one. */
+        hoverAxis?: () => string | null;
+        /** Every handle set's axis under the pointer (the sets can overlap). */
+        hoverAll?: () => Record<string, string | null>;
+        /** An object's projected renderer bounds (D-10's rectangle target). */
+        objectScreenRect?: (name: string) => { left: number; top: number; right: number; bottom: number } | null;
+        /** The handle's position and axis directions in engine space (D-6). */
+        handlePoint?: (axis: 'X' | 'Y' | 'Z', t: number) => { x: number; y: number; z: number } | null;
     },
 ): void {
     const probe: WetsProbe = {
@@ -107,6 +140,18 @@ export function installProbe(
             const cam = renderer.camera;
             const canvas = deps.canvas();
             if (!cam || !canvas) return null;
+            // The handle's own axes: read the proxy through the viewport's engine-space
+            // accessor, so a Local-space or Centre-mode handle reports where it is.
+            if (axis === 'X' || axis === 'Y' || axis === 'Z') {
+                const p = deps.handlePoint?.(axis, t);
+                if (!p) return null;
+                const v = new THREE.Vector3(p.x, p.y, -p.z).project(cam);
+                const rect = canvas.getBoundingClientRect();
+                return {
+                    x: rect.left + ((v.x + 1) / 2) * rect.width,
+                    y: rect.top + ((1 - v.y) / 2) * rect.height,
+                };
+            }
             const nv = deps.nav ? { ...deps.nav.pivot } : { x: 0, y: 0, z: 0 };
             const pivot = new THREE.Vector3(nv.x, nv.y, nv.z);
             const dir = new THREE.Vector3(axis === 'x' ? 1 : 0, axis === 'y' ? 1 : 0, axis === 'z' ? -1 : 0);
@@ -116,6 +161,26 @@ export function installProbe(
                 x: rect.left + ((p.x + 1) / 2) * rect.width,
                 y: rect.top + ((1 - p.y) / 2) * rect.height,
             };
+        },
+        hoverAxis: () => deps.hoverAxis?.() ?? null,
+        hoverAll: () => deps.hoverAll?.() ?? {},
+        objectScreenRect: (name) => deps.objectScreenRect?.(name) ?? null,
+        pixelStats: (rect) => renderer.pixelStats(rect),
+        transformOf: (name) => {
+            for (const go of deps.selection.selectedSet()) {
+                if (go.name !== name) continue;
+                const t = go.transform;
+                const p = t.position;
+                const q = t.rotation;
+                const s = t.localScale;
+                return {
+                    position: { x: p.x, y: p.y, z: p.z },
+                    rotation: { x: q.x, y: q.y, z: q.z, w: q.w },
+                    euler: (() => { const e = t.eulerAngles; return { x: e.x, y: e.y, z: e.z }; })(),
+                    scale: { x: s.x, y: s.y, z: s.z },
+                };
+            }
+            return null;
         },
         size: () => {
             const canvas = deps.canvas();
