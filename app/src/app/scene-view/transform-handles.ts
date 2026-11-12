@@ -201,6 +201,9 @@ export class TransformHandles {
         }
         this._placeHandle();
         for (const mode of MODES) this._controls[mode].attach(this._proxy);
+        // three's attach() shows the root again, so the tool's choice of visible
+        // sets is re-applied after it.
+        this._applyMode();
     }
 
     /** Sets the snap steps; null (or 0) turns a step off. */
