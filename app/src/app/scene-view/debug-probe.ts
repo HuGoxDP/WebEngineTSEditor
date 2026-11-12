@@ -73,7 +73,9 @@ export function installProbe(
     renderer: SceneViewRenderer,
     deps: {
         selection: { selectedSet(): ReadonlySet<{ name: string }> },
-        canvas: () => HTMLCanvasElement | null,
+        canvas: () => HTMLCanvasElement | null;
+        /** The navigation controller's state, engine space, while one exists. */
+        nav?: { pivot: { x: number; y: number; z: number }; distance: number; yaw: number; pitch: number; orthographic: boolean; flySpeed: number };
     },
 ): void {
     const probe: WetsProbe = {
@@ -83,15 +85,16 @@ export function installProbe(
             return enginePose(cam);
         },
         pivot: () => {
-            const target = renderer.controls?.target ?? new THREE.Vector3();
-            return { x: target.x, y: target.y, z: -target.z };
+            if (deps.nav) return { ...deps.nav.pivot };
+            return { x: 0, y: 0, z: 0 };
         },
         selection: () => [...deps.selection.selectedSet()].map(o => o.name),
         handlePoint: (axis, t) => {
             const cam = renderer.camera;
             const canvas = deps.canvas();
             if (!cam || !canvas) return null;
-            const pivot = renderer.controls?.target ?? new THREE.Vector3();
+            const nv = deps.nav ? { ...deps.nav.pivot } : { x: 0, y: 0, z: 0 };
+            const pivot = new THREE.Vector3(nv.x, nv.y, nv.z);
             const dir = new THREE.Vector3(axis === 'x' ? 1 : 0, axis === 'y' ? 1 : 0, axis === 'z' ? -1 : 0);
             const p = pivot.clone().addScaledVector(dir, t).project(cam);
             const rect = canvas.getBoundingClientRect();

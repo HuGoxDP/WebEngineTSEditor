@@ -1,6 +1,5 @@
 import { Injectable } from '@angular/core';
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SceneManager } from 'WebEngineTS';
 
 /**
@@ -32,7 +31,7 @@ export class SceneViewRenderer {
 
     private _renderer: THREE.WebGLRenderer | null = null;
     private _camera: THREE.PerspectiveCamera | null = null;
-    private _controls: OrbitControls | null = null;
+
     private _gridScene: THREE.Scene | null = null;
     private _aboveScene: THREE.Scene | null = null;
     private _rafId = 0;
@@ -48,8 +47,7 @@ export class SceneViewRenderer {
     /** The editor camera. */
     public get camera(): THREE.PerspectiveCamera | null { return this._camera; }
 
-    /** The orbit controls (the pivot for creates until B1.2's controller). */
-    public get controls(): OrbitControls | null { return this._controls; }
+
 
     /** Attaches to a canvas. Idempotent. */
     public attach(canvas: HTMLCanvasElement, onTick?: () => void): void {
@@ -68,10 +66,10 @@ export class SceneViewRenderer {
         camera.lookAt(0, 0, 0);
         this._camera = camera;
 
-        const controls = new OrbitControls(camera, canvas);
-        controls.enableDamping = true;
-        controls.target.set(0, 0, 0);
-        this._controls = controls;
+        // The navigation controller (B1 phase 2) owns the pose. The controls
+        // The navigation controller (B1 phase 2) owns the pose; a second set of
+        // mouse handlers on the same canvas would fight it. The controls are
+        // not created at all — the pivot lives in the controller's state.
 
         this._resize(canvas);
         this._resizeObs = new ResizeObserver(() => this._resize(canvas));
@@ -103,7 +101,8 @@ export class SceneViewRenderer {
         const cam = this._camera;
         if (!r || !cam || !this._gridScene || !this._aboveScene) return;
 
-        this._controls?.update();
+        // The navigation controller owns the camera pose; the OrbitControls
+        // target is kept only as the initial target and is not updated here.
 
         // 1–2: clear, then the engine scene.
         r.clear();
@@ -141,8 +140,6 @@ export class SceneViewRenderer {
         this._rafId = 0;
         this._resizeObs?.disconnect();
         this._resizeObs = null;
-        this._controls?.dispose();
-        this._controls = null;
         this._renderer?.dispose();
         this._renderer = null;
         this._gridScene = null;

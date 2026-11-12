@@ -70,11 +70,15 @@ export class ShortcutsService {
                 return;
         }
 
+        // While flying (RMB held, WASD/QE), the movement keys belong to the
+        // camera, not to the toolbar.
+        if (this._viewport.flying) return;
+
         switch (key) {
             case 'f':
                 if (this._selection.selected()) {
                     e.preventDefault();
-                    this._cmd.frameSelection();
+                    e.shiftKey ? this._cmd.frameAndFollowSelection() : this._cmd.frameSelection();
                 }
                 break;
             case 'w': this._viewport.setTool('translate'); break;

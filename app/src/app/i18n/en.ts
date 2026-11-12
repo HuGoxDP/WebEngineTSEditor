@@ -234,6 +234,8 @@ export const en = {
     'prefs.densityComfy': 'Comfortable',
     'prefs.gridSnap': 'Snap step',
     'prefs.gridSnapHint': 'How far the move gizmo steps, in scene units. 0 turns snapping off.',
+    'prefs.flySpeed': 'Fly speed',
+    'prefs.flySpeedHint': 'Units per second while flying the Scene view with the right mouse button and WASD/QE.',
     'prefs.autosave': 'Autosave',
     'prefs.autosaveHint': 'Keep a recovery copy of the scene while it has unsaved changes.',
     'prefs.confirmDelete': 'Confirm before deleting files',

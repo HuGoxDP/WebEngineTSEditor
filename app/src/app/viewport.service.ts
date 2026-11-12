@@ -1,6 +1,7 @@
 import { EffectRef, Injectable, Injector, NgZone, effect, inject, signal } from '@angular/core';
 import * as THREE from 'three';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { SceneViewController } from './scene-view/scene-view-controller';
 import {
     GameObject,
     Quaternion,
@@ -33,6 +34,7 @@ export type GizmoMode = 'translate' | 'rotate' | 'scale';
 export class ViewportService {
 
     private readonly _renderer = inject(SceneViewRenderer);
+    private _nav: SceneViewController | null = null;
     private _gizmo: TransformControls | null = null;
     private _gizmoHelper: THREE.Object3D | null = null;
     private _selectionEffect: EffectRef | null = null;
@@ -72,20 +74,28 @@ export class ViewportService {
         this._renderer.attach(canvas, () => this._tick());
 
         const overlay = this._renderer.aboveScene;
-        const controls = this._renderer.controls;
-        if (!overlay || !controls) return;
+        const camera = this._renderer.camera;
+        if (!overlay || !camera) return;
+
+        // ── Navigation (B1 phase 2): the controller owns the camera pose ──
+        const nav = new SceneViewController();
+        nav.attach(canvas, camera as unknown as import('./scene-view/scene-view-controller').CameraTarget);
+        this._nav = nav;
 
         // ── Grid: depth-tested against the engine scene (D-2 step 3) ──
         const grid = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
         this._renderer.addOverlayLayer('grid', grid);
 
         // ── Transform gizmo ──
-        const camera = this._renderer.camera!;
         const gizmo = new TransformControls(camera, canvas);
         gizmo.setSize(0.8);
         gizmo.addEventListener('dragging-changed', e => {
-            // Lock the orbit camera while dragging a gizmo handle.
-            controls.enabled = !(e as unknown as { value: boolean }).value;
+            // A gizmo drag owns the camera: cancel any navigation gesture and
+            // stop following so the handle stays under the cursor.
+            if ((e as unknown as { value: boolean }).value) {
+                this._nav?.cancelGestures();
+                this._nav?.stopFollow();
+            }
         });
         // A drag mutates the Three.js object directly, outside History.record, so it
         // has to be given an undo entry — and a "changed" mark — by hand. The
@@ -145,6 +155,7 @@ export class ViewportService {
             installProbe(this._renderer, {
                 selection: this._selection,
                 canvas: () => this._canvas,
+                nav: nav.state,
             });
         }
     }
@@ -156,6 +167,8 @@ export class ViewportService {
             this._canvas.removeEventListener('pointerup',   this._onPointerUp);
         }
         this._canvas = null;
+        this._nav?.detach();
+        this._nav = null;
         if (this._gizmo) {
             this._gizmo.detach();
             this._gizmo.dispose();
@@ -188,10 +201,12 @@ export class ViewportService {
     /** The editor camera. Used by selection raycasting in later milestones. */
     public get camera(): THREE.PerspectiveCamera | null { return this._renderer.camera; }
 
+    /** Whether the Scene view is flying (RMB + WASD/QE) — the toolbar keys stand down. */
+    public get flying(): boolean { return this._nav?.flying ?? false; }
+
     /** The Scene-view pivot in engine space — where root creates land (D-3). */
     public get pivot(): { x: number; y: number; z: number } {
-        const target = this._renderer.controls?.target ?? new THREE.Vector3();
-        return { x: target.x, y: target.y, z: -target.z };
+        return this._nav ? { ...this._nav.state.pivot } : { x: 0, y: 0, z: 0 };
     }
 
     /** One frame's bookkeeping, run by the renderer's loop before it draws. */
@@ -223,39 +238,38 @@ export class ViewportService {
         }
     }
 
+    /** Frames and then follows the primary selection (Shift+F, D-4). */
+    public frameAndFollowSelection(): void {
+        this._nav?.frameAndFollow(() => {
+            const go = this._selection.selected();
+            return go ? { ...go.transform.position } : null;
+        });
+    }
+
     /**
      * Frames the orbit camera on the given GameObject — moves the orbit
      * target to the object's bounding-box center and steps the camera
      * back to a sensible distance so the whole object is visible.
      */
     public frameOnObject(obj3d: THREE.Object3D): void {
-        const camera = this._renderer.camera;
-        const controls = this._renderer.controls;
-        if (!camera || !controls) return;
+        const nav = this._nav;
+        if (!nav) return;
         const box = new THREE.Box3().setFromObject(obj3d);
         if (box.isEmpty()) {
             // Fallback to the object's local origin.
             obj3d.updateMatrixWorld(true);
             const p = new THREE.Vector3();
             p.setFromMatrixPosition(obj3d.matrixWorld);
-            controls.target.copy(p);
-            controls.update();
+            nav.frame({ x: p.x, y: p.y, z: -p.z }, 1);
             return;
         }
         const center = new THREE.Vector3();
         const size = new THREE.Vector3();
         box.getCenter(center);
         box.getSize(size);
-        const radius = Math.max(size.x, size.y, size.z) * 0.6 || 1;
-        // Distance fitted to vertical FOV with a small padding.
-        const fov = (camera.fov * Math.PI) / 180;
-        const dist = (radius / Math.tan(fov / 2)) * 1.2;
-
-        const dir = camera.position.clone().sub(controls.target).normalize();
-        if (dir.lengthSq() < 1e-6) dir.set(0.5, 0.5, 1).normalize();
-        camera.position.copy(center).addScaledVector(dir, dist);
-        controls.target.copy(center);
-        controls.update();
+        const radius = (Math.max(size.x, size.y, size.z) * 0.6) || 1;
+        // Engine-space centre (the box is in three space, z mirrored).
+        nav.frame({ x: center.x, y: center.y, z: -center.z }, radius);
     }
 
     // ── Click-to-select ──────────────────────────────────────────────

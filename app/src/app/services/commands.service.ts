@@ -267,6 +267,11 @@ export class CommandsService {
         if (go) this._viewport.frameOnObject(go.transform._internalObject3D);
     }
 
+    /** Frames and then follows the selection each frame (Shift+F, D-4). */
+    public frameAndFollowSelection(): void {
+        this._viewport.frameAndFollowSelection();
+    }
+
     // ── Preferences ──────────────────────────────────────────────────
 
     private _preferencesOpen = false;
