@@ -88,6 +88,44 @@ run it in a UTF-8 locale (`LANG=C.UTF-8`): under `C`/`POSIX`, Chromium turns a n
 in the origin-private file system the scenarios use into an empty one, and the wizard scenario
 fails for that reason alone.
 
+Run it under the shared `editor-e2e.lock` while several workers are live (`node .workers/wk.sh
+lock editor-e2e W<n> <ID>`). The suite's URL is its first argument, so a port other than 8044 —
+the platform's own catalog has 8044 — is `npm run e2e -- http://localhost:<port>/editor/`.
+
+### What the suite covers, scenario by scenario
+
+Every scenario drives the editor only the way a user does, and the folder picker is faked to the
+origin-private file system, so both project stores are exercised in every run.
+
+- **Start screen and recents** — nothing opens by itself; open, close, reopen, forget; a recent
+  entry survives a reload and can be removed without touching the folder.
+- **Opening folders** — a folder with other files is not set up silently, an existing project
+  opens without questions, a deleted folder is reported rather than opened.
+- **Unsaved changes** — closing asks, saving never silently replaces another scene, and the
+  three ways out (cancel / don't save / save) all behave.
+- **Honest saving** — the unsaved mark on the status bar, the tab title and the tree row, Save
+  from the dialog, a gizmo drag as an edit, and the browser's own "leave this page?" prompt.
+- **A project in the browser's own store** (R1) — create, the layout under `projects/<id>/`,
+  reopen after a reload with no permission prompt, and *missing* when site data was cleared.
+- **A browser with no `createWritable`** (R1r) — the browser store is not offered, the folder
+  path still works, nothing is created in the browser store; and a browser with neither store
+  shows the unsupported notice and opens no wizard.
+- **A quota failure on save** (R1r) — the named error reaches the user, the edit stays unsaved
+  and the file on disk is untouched.
+- **The new project wizard** — collects, validates and creates; cancelling at any step writes
+  nothing, not even the parent folder.
+- The ScenarioCreator build check (`npm run e2e:build`) is separate: it needs that repository
+  beside this one and is not part of the suite.
+
+**Recorded count:** 274 checks green on the branch this task merges (`.claude-shared/code-foundations/R1r/notes.md`):
+215 on the `origin/master` it branched from, 19 from this task's three R1r scenarios, and 40 from B1's
+navigation and orientation-cube scenarios that merged into `origin/master` while this task ran.
+
+**Manual checks the suite cannot make** (owner's, recorded in `docs/integration-plan.md`):
+the real `showDirectoryPicker` on Edge with a real folder on disk; Firefox and Safari smoke —
+Firefox only through the browser store (no picker), Safari 25 and below reports *unsupported*
+because it has the directory but no `createWritable`.
+
 ## Relationship to the other projects
 
 - **WebEngineTS** — the engine library this editor is built on.
