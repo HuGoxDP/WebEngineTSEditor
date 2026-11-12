@@ -303,8 +303,14 @@ export class CommandsService {
             // scene and its unsaved changes exactly as they were.
             if (!await this._confirmDiscard()) return;
 
-            const folder = await this._project.createFolderIn(result.parent, result.folderName);
-            await this._enter(folder, result.meta);
+            if (result.parent) {
+                const folder = await this._project.createFolderIn(result.parent, result.folderName);
+                await this._enter(folder, result.meta);
+            } else {
+                // The browser's own store: no folder to make, no permission to ask.
+                await this._project.createInBrowser(result.meta);
+                await this._settle();
+            }
             if (result.template === 'lightCamera') this._buildLightAndCamera();
 
             // The starting scene is written now, so a new project has a main scene
