@@ -1014,7 +1014,13 @@ scenario("scene formats: v1, an absent version and a v2 link all open", async ()
         await pick(page, folder);
         await page.getByText("Open folder…").click();
         await page.locator(".work").waitFor();
-        await page.waitForTimeout(500);
+        // Wait for the scene to reach the tree before reading it: under the full
+        // suite's load the scene's arrival lags the workspace's, and a fixed
+        // timeout read the tree too early (a flake, not a refusal).
+        for (let i = 0; i < 50; i++) {
+            if ((await page.locator("app-hierarchy").innerText()).includes(object)) break;
+            await page.waitForTimeout(100);
+        }
         check(`${folder}: the scene opens without questions`,
             (await page.locator(".dlg").count()) === 0 && (await page.locator("app-hierarchy").innerText()).includes(object));
         await menu(page, "File", "Close Project");
@@ -1174,36 +1180,57 @@ scenario("navigation: orbit, zoom, dolly, pan, look, fly — the pose never drif
         JSON.stringify(looked.pos));
     check("looking turns the forward", looked.fwd.x !== beforeLook.fwd.x);
 
-    const beforeFly = await pose();
-    await page.keyboard.down("w");
-    await page.mouse.down({ button: "right" });
-    await page.waitForTimeout(600);
-    await page.mouse.up({ button: "right" });
-    await page.keyboard.up("w");
-    await page.waitForTimeout(200);
-    const flew = await pose();
-    // The distance covered is frame-rate dependent (the fly integrates the
-    // frame dt, capped per frame, and this software-GL browser runs at ~10 fps
-    // under load), so DW-2.4's "moves along the forward" is asserted as a
-    // direction and any movement, not a fixed distance.
-    const step = Math.hypot(flew.pos.x - beforeFly.pos.x, flew.pos.y - beforeFly.pos.y, flew.pos.z - beforeFly.pos.z);
-    const along = (flew.pos.x - beforeFly.pos.x) * beforeFly.fwd.x + (flew.pos.y - beforeFly.pos.y) * beforeFly.fwd.y + (flew.pos.z - beforeFly.pos.z) * beforeFly.fwd.z;
-    check("RMB + W flies along the forward", step > 0.05 && along > 0.9 * step,
-        `${step.toFixed(3)} travelled, ${along.toFixed(3)} of it along the view`);
+    /**
+     * Flies for a measured window and returns the speed it covered. Measured
+     * inside the page and counted in **frames**, because the fly integrates the
+     * frame dt: a loaded browser can stall whole frames, and a millisecond
+     * window that contained none of them would read as "the fly does not work".
+     * It also waits for the first movement, so a dropped key event cannot fake a
+     * standstill.
+     */
+    const flySpeed = async (shift) => {
+        await page.keyboard.down("w");
+        if (shift) await page.keyboard.down("Shift");
+        await page.mouse.down({ button: "right" });
+        const measured = await page.evaluate(async () => {
+            const probe = window.__wetsProbe;
+            const read = () => {
+                const c = probe.camera();
+                return { x: c.position.x, y: c.position.y, z: c.position.z, fx: c.forward.x, fy: c.forward.y, fz: c.forward.z };
+            };
+            const dist = (a, b) => Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+            const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
+            const start = read();
+            let moving = false;
+            for (let i = 0; i < 100 && !moving; i++) {
+                await nextFrame();
+                moving = dist(start, read()) > 0.01;
+            }
+            const a = read();
+            const t0 = performance.now();
+            for (let frames = 0; frames < 10; frames++) {
+                await nextFrame();
+                if (performance.now() - t0 > 5000) break;
+            }
+            const b = read();
+            const seconds = Math.max((performance.now() - t0) / 1000, 0.001);
+            return { moving, seconds, dist: dist(a, b), along: (b.x - a.x) * a.fx + (b.y - a.y) * a.fy + (b.z - a.z) * a.fz };
+        });
+        await page.mouse.up({ button: "right" });
+        await page.keyboard.up("w");
+        if (shift) await page.keyboard.up("Shift");
+        await page.waitForTimeout(200);
+        return { ...measured, speed: measured.dist / measured.seconds };
+    };
 
-    // Shift makes the same gesture faster (the exact ratio is frame-dependent).
-    const beforeShift = await pose();
-    await page.keyboard.down("Shift");
-    await page.keyboard.down("w");
-    await page.mouse.down({ button: "right" });
-    await page.waitForTimeout(400);
-    await page.mouse.up({ button: "right" });
-    await page.keyboard.up("w");
-    await page.keyboard.up("Shift");
-    await page.waitForTimeout(200);
-    const fast = await pose();
-    const fastStep = Math.hypot(fast.pos.x - beforeShift.pos.x, fast.pos.y - beforeShift.pos.y, fast.pos.z - beforeShift.pos.z);
-    check("Shift flies at least three times as far", fastStep >= 3 * step * 0.6, `${fastStep} vs ${step}`);
+    const plain = await flySpeed(false);
+    check("RMB + W flies along the forward", plain.moving && plain.dist > 0.02 && plain.along > 0.9 * plain.dist,
+        `${plain.dist.toFixed(3)} in ${plain.seconds.toFixed(2)}s over ${plain.moving ? "" : "no "}movement, ${plain.along.toFixed(3)} of it along the view`);
+
+    // Shift makes the same gesture four times faster (D-4).
+    const fast = await flySpeed(true);
+    check("Shift flies at least three times as fast", fast.moving && fast.speed >= 3 * plain.speed,
+        `${fast.speed.toFixed(2)}/s vs ${plain.speed.toFixed(2)}/s`);
 
     // DW-2.6: none of it is an edit.
     check("navigating does not mark the scene unsaved", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
@@ -1310,8 +1337,12 @@ scenario("orientation cube: cones snap the camera, the centre toggles iso (B1.3)
     const isoMode = await page.evaluate(() => window.__wetsProbe.orientationMode());
     check("the centre click turns the camera orthographic", isoMode.orthographic === true, JSON.stringify(isoMode));
     check("the label reads Iso", isoMode.label === "Iso", isoMode.label);
-    check("the corner chip says Iso", (await page.locator(".vp-overlay-tr .v").innerText()).trim() === "Iso",
-        JSON.stringify(await page.locator(".vp-overlay-tr").innerText()));
+    // The chip is Angular-bound and updates on the next change-detection tick,
+    // which a loaded page delays, so poll for it rather than reading once.
+    const chipReads = async () => (await page.locator(".vp-overlay-tr .v").innerText()).trim();
+    let chipIso = false;
+    for (let i = 0; i < 30 && !(chipIso = (await chipReads()) === "Iso"); i++) await page.waitForTimeout(100);
+    check("the corner chip says Iso", chipIso, await chipReads());
     const isoSpan = await span();
     check("the framing survives the toggle (<15%)", perspSpan && isoSpan && Math.abs(isoSpan - perspSpan) / perspSpan < 0.15,
         `${perspSpan} -> ${isoSpan}`);
