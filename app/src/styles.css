@@ -768,6 +768,28 @@ body.resizing { cursor: inherit !important; user-select: none; }
 }
 .vp-overlay-tl .chip .k { color: #7e8089; }
 .vp-overlay-tl .chip .v { color: #e8e8ea; }
+/* Under the orientation cube (top-right, above the canvas edge); it never
+   swallows a click. */
+.vp-overlay-tr {
+  position: absolute;
+  /* 12px margin + the cube's 128px viewport + a 6px gap. */
+  right: 12px; top: 146px;
+  font-size: 10px;
+  color: var(--fg-2);
+  font-family: "JetBrains Mono", monospace;
+  z-index: 4;
+  pointer-events: none;
+}
+.vp-overlay-tr .chip {
+  background: rgba(20,22,27,0.7);
+  backdrop-filter: blur(4px);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: var(--radius);
+  padding: 2px 6px;
+  display: inline-flex; gap: 6px;
+}
+.vp-overlay-tr .chip .k { color: #7e8089; }
+.vp-overlay-tr .chip .v { color: #e8e8ea; }
 
 /* ─── Inspector ──────────────────────────────────────────── */
 .insp-head {

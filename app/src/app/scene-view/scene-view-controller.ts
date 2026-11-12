@@ -43,8 +43,11 @@ export interface CameraTarget {
     quaternion: THREE.Quaternion;
     fov: number;
     forward(): THREE.Vector3;
-    lookAt(target: THREE.Vector3): void;
+    /** Aims at the target; the optional up covers the poles (see applyPose). */
+    lookAt(target: THREE.Vector3, up?: THREE.Vector3): void;
     updateProjectionMatrix?(): void;
+    /** Switches the camera between perspective and orthographic for the current pose. */
+    setOrthographic?(orthographic: boolean, orthoSize: number): void;
 }
 
 const DEG = Math.PI / 180;
@@ -54,20 +57,42 @@ const MIN_DISTANCE = 0.01;
 const MAX_FLY = 99;
 const MIN_FLY = 0.01;
 const FRAME_MS = 250;
+/** How close to ±90° counts as the pole (an orbit's clamp stays outside it). */
+const POLE_EPS = 1e-9;
 
 /**
- * The camera's basis, engine space, from a yaw/pitch: right, up and the
- * direction *from the pivot to the camera* (so forward = −that).
+ * The camera's basis in engine space from a yaw/pitch: the direction *from the
+ * pivot to the camera* (so forward = −that). `sin(yaw)` lands on x and
+ * `cos(yaw)` on z, so yaw is `atan2(x, z)` of the offset — the inverse of
+ * {@link lookAlong}'s conversion, and the reason the plan's frozen pose
+ * converts the way it does.
  */
-function basisFromAngles(yaw: number, pitch: number): { dir: THREE.Vector3; right: THREE.Vector3; up: THREE.Vector3 } {
-    const dir = new THREE.Vector3(
+function basisFromAngles(yaw: number, pitch: number): THREE.Vector3 {
+    return new THREE.Vector3(
         Math.cos(pitch) * Math.sin(yaw),
         Math.sin(pitch),
         Math.cos(pitch) * Math.cos(yaw),
     );
-    const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
-    const up = new THREE.Vector3().crossVectors(right, dir).normalize();
-    return { dir, right, up };
+}
+
+/**
+ * The controller's starting state: the pose the renderer placed the camera at
+ * before the controller existed — engine `(6, 6, −10)` from the origin, the
+ * Unity default octant — converted to pivot/yaw/pitch/distance. Written from
+ * the offset rather than as literals, so the derivation is visible and a
+ * changed default stays one edit.
+ */
+function initialNavState(): NavState {
+    const offset = { x: 6, y: 6, z: -10 };
+    const distance = Math.hypot(offset.x, offset.y, offset.z);
+    return {
+        pivot: { x: 0, y: 0, z: 0 },
+        yaw: Math.atan2(offset.x, offset.z),
+        pitch: Math.asin(offset.y / distance),
+        distance,
+        orthographic: false,
+        flySpeed: 5,
+    };
 }
 
 /** The camera's forward direction in three space (its -Z basis vector). */
@@ -75,15 +100,27 @@ function forwardOf(camera: CameraTarget): THREE.Vector3 {
     return new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion).normalize();
 }
 
-/** Applies the derived pose to a CameraTarget (the engine's mirror included). */
+/**
+ * Applies the derived pose to a CameraTarget (the engine's mirror included).
+ *
+ * At the poles — the orientation cube's +Y and −Y snaps, where the view
+ * direction is parallel to world +Y — the roll is undefined and three picks one
+ * arbitrarily (a 180° one, which put engine +Z down the screen in the Top view).
+ * Unity's Top view keeps engine +Z up the screen, so the pose then aims with
+ * that axis as its up; the limit of the ordinary orbit roll at yaw 0 is the
+ * same vector, so an orbit up to the pitch limit never jumps.
+ */
 function applyPose(camera: CameraTarget, s: NavState): void {
-    const { dir } = basisFromAngles(s.yaw, s.pitch);
+    const dir = basisFromAngles(s.yaw, s.pitch);
     // Everything here is engine space; the conversion to three happens once, at
     // the end (space.ts): the pivot and the direction are both mirrored.
     const pivotThree = enginePointToThree(s.pivot);
     const offset = engineDirToThree(dir).multiplyScalar(s.distance);
     camera.position.copy(pivotThree).add(offset);
-    camera.lookAt(pivotThree);
+    const atPole = dir.y >= 1 - POLE_EPS || dir.y <= -1 + POLE_EPS;
+    camera.lookAt(pivotThree, atPole
+        ? engineDirToThree({ x: 0, y: 0, z: dir.y > 0 ? 1 : -1 })
+        : undefined);
 }
 
 export class SceneViewController {
@@ -115,16 +152,17 @@ export class SceneViewController {
     public onCameraGesture: (() => void) | null = null;
 
     constructor(initial?: Partial<NavState>) {
-        // The default pose is the editor's current one, engine (6, 6, −10) from
-        // the origin, so the existing pixel-based gizmo scenario is unaffected:
-        // yaw = atan2(x, z) with the engine z negated, pitch = atan2(y, |x,z|).
+        // The frozen pose the plan requires: engine (6, 6, −10) from the origin,
+        // which is where the renderer left the camera before the controller
+        // existed (placeAt(6, 6, 10) in three space). Overridable for tests.
+        const start = initialNavState();
         this._s = {
-            pivot: initial?.pivot ?? { x: 0, y: 0, z: 0 },
-            yaw: initial?.yaw ?? Math.PI / 4,
-            pitch: initial?.pitch ?? Math.atan2(6, 10),
-            distance: initial?.distance ?? Math.sqrt(36 + 36 + 100),
-            orthographic: initial?.orthographic ?? false,
-            flySpeed: initial?.flySpeed ?? 5,
+            pivot: initial?.pivot ?? start.pivot,
+            yaw: initial?.yaw ?? start.yaw,
+            pitch: initial?.pitch ?? start.pitch,
+            distance: initial?.distance ?? start.distance,
+            orthographic: initial?.orthographic ?? start.orthographic,
+            flySpeed: initial?.flySpeed ?? start.flySpeed,
         };
     }
 
@@ -195,14 +233,44 @@ export class SceneViewController {
 
     // ── Commands (from the shortcuts service and the toolbar) ──────────
 
-    /** Orbit to look along an engine-space axis (Phase 3's cube uses this). */
+    /**
+     * Looks along an engine-space axis (the orientation cube's cones): the
+     * camera moves to the axis side and the forward becomes −axis. Animated,
+     * as three's ViewHelper is — the cube click always eases.
+     */
     public lookAlong(axis: { x: number; y: number; z: number }): void {
         const len = Math.hypot(axis.x, axis.y, axis.z) || 1;
         const d = new THREE.Vector3(axis.x / len, axis.y / len, axis.z / len);
-        this._s.yaw = Math.atan2(d.z, d.x);
-        this._s.pitch = Math.asin(Math.max(-1, Math.min(1, d.y)));
+        const to: NavState = {
+            ...this._s,
+            // yaw = atan2(x, z), pitch = asin(y) — the inverse of
+            // basisFromAngles, so the pose ends exactly on the axis side.
+            yaw: Math.atan2(d.x, d.z),
+            pitch: Math.asin(Math.max(-1, Math.min(1, d.y))),
+        };
+        this._startFrame(to);
         this._touch();
-        this._write();
+    }
+
+    /**
+     * Toggles the orthographic projection (the cube's centre click). The ortho
+     * size is derived from the distance and the FOV so the framing survives
+     * the toggle, as it does in Unity.
+     */
+    public toggleProjection(): void {
+        this._s.orthographic = !this._s.orthographic;
+        this._touch();
+        this._writeCameraProjection();
+    }
+
+    /** The orthographic half-height that matches the current framing. */
+    public get orthoSize(): number {
+        return this._s.distance * Math.tan((this._camera?.fov ?? 50) * DEG / 2);
+    }
+
+    /** Rebuilds the camera as perspective or orthographic for the current pose. */
+    public _writeCameraProjection(): void {
+        this._camera?.setOrthographic?.(this._s.orthographic, this.orthoSize);
     }
 
     /** Frames the given bounds (engine-space centre + radius), animated. */
@@ -236,9 +304,9 @@ export class SceneViewController {
 
     // ── Internals ──────────────────────────────────────────────────────
 
+    /** A user gesture: following ends (a manual look is not a follow). */
     private _touch(): void {
         if (this._follow) this._follow = null;
-        if (this._framing) this._framing = null;
         this.onCameraGesture?.();
     }
 
@@ -250,6 +318,7 @@ export class SceneViewController {
     private _write(): void {
         if (!this._camera) return;
         applyPose(this._camera, this._s);
+        this._writeCameraProjection();
     }
 
     private _tick(dt: number): void {
@@ -262,6 +331,8 @@ export class SceneViewController {
             const b = this._framing.to;
             this._s = {
                 ...this._s,
+                yaw: a.yaw + (b.yaw - a.yaw) * e,
+                pitch: a.pitch + (b.pitch - a.pitch) * e,
                 pivot: {
                     x: a.pivot.x + (b.pivot.x - a.pivot.x) * e,
                     y: a.pivot.y + (b.pivot.y - a.pivot.y) * e,
@@ -322,15 +393,18 @@ export class SceneViewController {
         this._downY = e.clientY;
         this._shift = e.shiftKey;
         // The gesture the button + modifiers mean (D-4). Alt+LMB orbits;
-        // plain LMB is the selection's (Phase 5), never ours.
+        // plain LMB is the selection's (Phase 5), never ours. A movement key
+        // already held wins over Shift+RMB's orbit: Shift is the fly's sprint,
+        // so RMB+Shift+W flies fast instead of orbiting.
         if (e.button === 2 && e.altKey)      this._mode = 'dolly';
-        else if (e.button === 2 && !e.altKey && e.shiftKey) this._mode = 'orbit';
+        else if (e.button === 2 && this._keys.size > 0) this._mode = 'fly';
+        else if (e.button === 2 && e.shiftKey) this._mode = 'orbit';
         else if (e.button === 2)             this._mode = 'look';
         else if (e.button === 1)             this._mode = 'pan';
         else if (e.button === 0 && e.altKey) this._mode = 'orbit';
         else { this._pointerId = null; return; }
 
-        // The right button also starts a fly when a movement key is already held.
+        // A movement key pressed after the right button turns the look into a fly.
         if (this._mode === 'look' && this._keys.size > 0) this._mode = 'fly';
 
         try { canvas.setPointerCapture(e.pointerId); } catch { /* jsdom */ }
@@ -354,11 +428,31 @@ export class SceneViewController {
                 this._s.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, this._s.pitch + dy * ORBIT_PER_PIXEL));
                 this._write();
                 break;
-            case 'look':
-                this._s.yaw -= dx * ORBIT_PER_PIXEL;
-                this._s.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, this._s.pitch + dy * ORBIT_PER_PIXEL));
+            case 'look': {
+                // Unity's RMB look turns the camera in place: the position is
+                // untouched. The pose is derived from the pivot, so the pivot is
+                // re-derived *behind* the new direction — position + offset are
+                // both carried, and the offset keeps its length.
+                const yaw = this._s.yaw - dx * ORBIT_PER_PIXEL;
+                const pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, this._s.pitch + dy * ORBIT_PER_PIXEL));
+                const dir = basisFromAngles(this._s.yaw, this._s.pitch);
+                const d = this._s.distance;
+                const pos = {
+                    x: this._s.pivot.x + dir.x * d,
+                    y: this._s.pivot.y + dir.y * d,
+                    z: this._s.pivot.z + dir.z * d,
+                };
+                const next = basisFromAngles(yaw, pitch);
+                this._s.yaw = yaw;
+                this._s.pitch = pitch;
+                this._s.pivot = {
+                    x: pos.x - next.x * d,
+                    y: pos.y - next.y * d,
+                    z: pos.z - next.z * d,
+                };
                 this._write();
                 break;
+            }
             case 'pan': {
                 // The pivot moves by the drag in the camera plane and the camera
                 // rides with it — the pose is derived, so the distance to the

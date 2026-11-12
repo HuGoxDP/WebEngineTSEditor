@@ -120,6 +120,10 @@ export const uk: Record<MessageKey, string> = {
     'vp.combined': 'Комбіноване перетворення (Y)',
     'vp.tool': 'Інструмент',
     'vp.shortcuts': 'Клавіші',
+    // Unity's own gizmo words for the projection toggle's read-out.
+    'vp.projection': 'Проєкція',
+    'vp.persp': 'Persp',
+    'vp.iso': 'Iso',
     'tool.translate': 'Переміщення',
     'tool.rotate': 'Поворот',
     'tool.scale': 'Масштаб',

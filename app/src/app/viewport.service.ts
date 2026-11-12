@@ -2,6 +2,7 @@ import { EffectRef, Injectable, Injector, NgZone, effect, inject, signal } from 
 import * as THREE from 'three';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 import { SceneViewController } from './scene-view/scene-view-controller';
+import { OrientationGizmo } from './scene-view/orientation-gizmo';
 import {
     GameObject,
     Quaternion,
@@ -11,6 +12,7 @@ import {
     type SerializedScene,
 } from 'WebEngineTS';
 import { HistoryService } from './services/history.service';
+import { I18nService, type MessageKey } from './i18n/i18n.service';
 import { SceneService } from './services/scene.service';
 import { SelectionService } from './services/selection.service';
 import { SettingsService } from './services/settings.service';
@@ -35,6 +37,7 @@ export class ViewportService {
 
     private readonly _renderer = inject(SceneViewRenderer);
     private _nav: SceneViewController | null = null;
+    private _gizmoOri: OrientationGizmo | null = null;
     private _gizmo: TransformControls | null = null;
     private _gizmoHelper: THREE.Object3D | null = null;
     private _selectionEffect: EffectRef | null = null;
@@ -53,6 +56,11 @@ export class ViewportService {
     public readonly fps = signal(0);
     /** Last frame time in milliseconds. */
     public readonly frameMs = signal(0);
+    /**
+     * Whether the Scene view is currently orthographic (the orientation cube's
+     * centre click, D-5). Set only on a change — the cube draws every frame.
+     */
+    public readonly orthographic = signal(false);
 
     constructor(
         private readonly _zone: NgZone,
@@ -61,6 +69,7 @@ export class ViewportService {
         private readonly _settings: SettingsService,
         private readonly _sceneService: SceneService,
         private readonly _history: HistoryService,
+        private readonly _i18n: I18nService,
     ) {}
 
     /** Initializes the viewport on the given canvas. Idempotent. */
@@ -85,6 +94,14 @@ export class ViewportService {
         // ── Grid: depth-tested against the engine scene (D-2 step 3) ──
         const grid = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
         this._renderer.addOverlayLayer('grid', grid);
+
+        // ── Orientation cube (B1 phase 3) ──
+        const orientation = new OrientationGizmo(this._renderer);
+        orientation.onLookAlong = axis => this._nav?.lookAlong(axis);
+        orientation.onToggleProjection = () => this._nav?.toggleProjection();
+        orientation.mount();
+        this._gizmoOri = orientation;
+        this._canvas.addEventListener('pointerdown', this._onOrientationDown);
 
         // ── Transform gizmo ──
         const gizmo = new TransformControls(camera, canvas);
@@ -156,6 +173,11 @@ export class ViewportService {
                 selection: this._selection,
                 canvas: () => this._canvas,
                 nav: nav.state,
+                orientation: () => {
+                    const s = orientation.draw();
+                    return { targets: s.targets, label: this._projectionLabel(s.orthographic) };
+                },
+                orientationClick: (x, y) => orientation.handleClick(x, y),
             });
         }
     }
@@ -166,7 +188,10 @@ export class ViewportService {
             this._canvas.removeEventListener('pointerdown', this._onPointerDown);
             this._canvas.removeEventListener('pointerup',   this._onPointerUp);
         }
+        this._canvas?.removeEventListener('pointerdown', this._onOrientationDown);
         this._canvas = null;
+        this._gizmoOri?.dispose();
+        this._gizmoOri = null;
         this._nav?.detach();
         this._nav = null;
         if (this._gizmo) {
@@ -225,6 +250,10 @@ export class ViewportService {
         // Keep the selection outline in sync with the target's current bounds.
         this._outline?.update();
 
+        // The orientation cube, drawn after the frame in its own corner viewport.
+        const ori = this._gizmoOri?.draw();
+        if (ori && ori.orthographic !== this.orthographic()) this.orthographic.set(ori.orthographic);
+
         // ── FPS / frame time bookkeeping (zone-free signal updates) ──
         const now = performance.now();
         if (this._lastT) this.frameMs.set(+(now - this._lastT).toFixed(1));
@@ -238,9 +267,13 @@ export class ViewportService {
         }
     }
 
+    /** The corner label for a projection mode (Unity's own "Iso"/"Persp"). */
+    private _projectionLabel(orthographic: boolean): string {
+        return this._i18n.t(orthographic ? 'vp.iso' : 'vp.persp');
+    }
+
     /** Frames and then follows the primary selection (Shift+F, D-4). */
-    public frameAndFollowSelection(): void {
-        this._nav?.frameAndFollow(() => {
+    public frameAndFollowSelection(): void {        this._nav?.frameAndFollow(() => {
             const go = this._selection.selected();
             return go ? { ...go.transform.position } : null;
         });
@@ -273,6 +306,11 @@ export class ViewportService {
     }
 
     // ── Click-to-select ──────────────────────────────────────────────
+
+    /** The corner gizmo owns its clicks before the canvas sees them. */
+    private readonly _onOrientationDown = (e: PointerEvent): void => {
+        if (this._gizmoOri?.handleClick(e.clientX, e.clientY)) e.stopPropagation();
+    };
 
     private readonly _onPointerDown = (e: PointerEvent): void => {
         if (e.button !== 0) return;
