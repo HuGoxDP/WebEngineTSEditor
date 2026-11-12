@@ -104,6 +104,9 @@ export const uk: Record<MessageKey, string> = {
     // ── viewport ────────────────────────────────────────────────────
     'vp.pivot': 'Опорна точка',
     'vp.local': 'Локальні',
+    'vp.center': 'Центр',
+    'vp.world': 'Глобальні',
+    'vp.snapTo': 'Прив’язка',
     'vp.localSpace': 'Локальні координати',
     'vp.snap': 'Крок прив’язки',
     'vp.shaded': 'Із затіненням',
@@ -124,9 +127,11 @@ export const uk: Record<MessageKey, string> = {
     'vp.projection': 'Проєкція',
     'vp.persp': 'Persp',
     'vp.iso': 'Iso',
+    'tool.view': 'Огляд',
     'tool.translate': 'Переміщення',
     'tool.rotate': 'Поворот',
     'tool.scale': 'Масштаб',
+    'tool.combined': 'Перетворення',
 
     // ── status bar ──────────────────────────────────────────────────
     'status.playing': 'Гра триває',
@@ -233,6 +238,11 @@ export const uk: Record<MessageKey, string> = {
     'prefs.densityComfy': 'Зручна',
     'prefs.gridSnap': 'Крок прив’язки',
     'prefs.gridSnapHint': 'На скільки одиниць сцени зсувається об’єкт гізмо. 0 вимикає прив’язку.',
+    'prefs.rotateStep': 'Крок повороту (градуси)',
+    'prefs.rotateStepHint': 'На скільки градусів повертається об’єкт гізмо. 0 вимикає прив’язку.',
+    'prefs.scaleStep': 'Крок масштабу',
+    'prefs.scaleStepHint': 'Крок гізло масштабу як частка поточного розміру. 0 вимикає прив’язку.',
+    'prefs.snapHint': 'Прив’язка під час утримання діє, поки натиснуто Ctrl; магнит у виді сцени вмикає її постійно.',
     'prefs.flySpeed': 'Швидкість польоту',
     'prefs.flySpeedHint': 'Одиниць за секунду під час польоту сценою на ПКМ і WASD/QE.',
     'prefs.autosave': 'Автозбереження',

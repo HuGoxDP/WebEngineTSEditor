@@ -81,9 +81,11 @@ export class ShortcutsService {
                     e.shiftKey ? this._cmd.frameAndFollowSelection() : this._cmd.frameSelection();
                 }
                 break;
+            case 'q': this._viewport.setTool('view');      break;
             case 'w': this._viewport.setTool('translate'); break;
             case 'e': this._viewport.setTool('rotate');    break;
             case 'r': this._viewport.setTool('scale');     break;
+            case 'y': this._viewport.setTool('combined');  break;
         }
     };
 
