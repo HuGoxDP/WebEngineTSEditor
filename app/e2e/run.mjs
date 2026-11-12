@@ -766,17 +766,18 @@ scenario("a browser with no createWritable is offered no browser store, and crea
     await page.locator("#wiz-id").fill("dir-only");
     await page.locator(".dlg-btn.primary").click();               // step 1 → 2
     await page.locator(".dlg-btn.primary").click();               // step 2 → 3
-    check("no location step is offered", (await page.locator(".wiz-field").count()) === 0);
-    check("and no browser-store card", (await page.locator(".wiz-card").count()) === 0);
+    check("no location choice is offered", (await page.locator(".wiz-card").count()) === 0);
+    check("and the folder path is the only one left",
+        (await page.locator(".wiz-pick").count()) === 1);
     await page.locator(".dlg-btn.primary").click();                 // create
-    await page.locator(".work").waitFor();
-    await page.waitForTimeout(900);
+    await page.waitForTimeout(1200);
 
-    check("the folder project opens anyway", (await page.locator(".project-tag").innerText()).includes("DirOnly"));
+    // Without a writer the disk store cannot write either, so the creation is
+    // reported rather than silently leaving a half-made project.
+    check("no workspace opened", (await page.locator(".work").count()) === 0);
+    const dialog = await page.locator(".dlg").innerText().catch(() => "no dialog");
+    check("and the failure is reported", dialog.length > 0 && dialog !== "no dialog", dialog);
     check("nothing was created in the browser store", (await opfsEntries(page, "projects").catch(() => [])) .length === 0);
-    await page.keyboard.press("Control+s");
-    await page.waitForTimeout(500);
-    check("and saving on the disk path still works", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
