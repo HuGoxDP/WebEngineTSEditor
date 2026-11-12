@@ -30,6 +30,9 @@ export type OverlayKind = 'grid' | 'above-scene';
 /** The world up every ordinary `lookAt` uses. */
 const WORLD_UP = new THREE.Vector3(0, 1, 0);
 
+/** A full-screen pass drawn after every layer (D-9's selection outline). */
+export type PostPass = (renderer: THREE.WebGLRenderer, camera: THREE.Camera) => void;
+
 /**
  * A D-2 step 6 corner viewport: its own scene and camera, drawn last into a
  * square in the top-right corner (the orientation cube, D-5). Kept apart from
@@ -57,6 +60,8 @@ export class SceneViewRenderer {
     private _aboveScene: THREE.Scene | null = null;
     /** The corner viewport (D-2 step 6); null when nothing owns one. */
     private _cornerLayer: CornerLayer | null = null;
+    /** The final pass (D-9's outline); null when nothing owns one. */
+    private _postPass: PostPass | null = null;
     private _rafId = 0;
     private _canvas: HTMLCanvasElement | null = null;
     private _resizeObs: ResizeObserver | null = null;
@@ -88,6 +93,12 @@ export class SceneViewRenderer {
 
     /** Registers the corner viewport's contents (null clears it). */
     public setCornerLayer(layer: CornerLayer | null): void { this._cornerLayer = layer; }
+
+    /** Registers the final full-screen pass (null clears it). */
+    public setPostPass(pass: PostPass | null): void { this._postPass = pass; }
+
+    /** The WebGLRenderer, for a pass that needs its targets. */
+    public get gl(): THREE.WebGLRenderer | null { return this._renderer; }
 
 
 
@@ -175,6 +186,42 @@ export class SceneViewRenderer {
             r.setScissorTest(false);
             r.setViewport(0, 0, this._canvas.clientWidth, this._canvas.clientHeight);
         }
+
+        // 7: the screen-space post-pass (the selection outline, D-9). It draws
+        // straight onto the canvas after every layer, so the scene itself is
+        // never moved into a render target.
+        if (this._postPass) this._postPass(r, cam);
+    }
+
+    /**
+     * Counts pixels by hue inside a client-pixel rectangle (D-9's proof): the
+     * frame is drawn and read in one task, because the drawing buffer is not
+     * preserved between tasks.
+     */
+    public pixelStats(rect: { left: number; top: number; right: number; bottom: number }): {
+        total: number; orange: number; green: number; white: number;
+    } {
+        const empty = { total: 0, orange: 0, green: 0, white: 0 };
+        if (!this._renderer || !this._canvas) return empty;
+        this.draw();
+        const gl = this._renderer.getContext();
+        const canvasRect = this._canvas.getBoundingClientRect();
+        const x = Math.max(0, Math.round((rect.left - canvasRect.left) * window.devicePixelRatio));
+        const y = Math.max(0, Math.round((rect.top - canvasRect.top) * window.devicePixelRatio));
+        const w = Math.min(gl.drawingBufferWidth - x, Math.round((rect.right - rect.left) * window.devicePixelRatio));
+        const h = Math.min(gl.drawingBufferHeight - y, Math.round((rect.bottom - rect.top) * window.devicePixelRatio));
+        if (w <= 0 || h <= 0) return empty;
+        const pixels = new Uint8Array(w * h * 4);
+        gl.readPixels(x, gl.drawingBufferHeight - y - h, w, h, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
+        const counts = { total: 0, orange: 0, green: 0, white: 0 };
+        for (let i = 0; i < pixels.length; i += 4) {
+            const r = pixels[i], g = pixels[i + 1], b = pixels[i + 2];
+            counts.total++;
+            if (r > 150 && g > 40 && g < 150 && b < 90) counts.orange++;
+            else if (g > 150 && r < 130 && b < 140) counts.green++;
+            else if (r > 210 && g > 210 && b > 210) counts.white++;
+        }
+        return counts;
     }
 
     /**
@@ -205,6 +252,7 @@ export class SceneViewRenderer {
         this._renderer?.dispose();
         this._renderer = null;
         this._cornerLayer = null;
+        this._postPass = null;
         this._projection = null;
         this._gridScene = null;
         this._aboveScene = null;

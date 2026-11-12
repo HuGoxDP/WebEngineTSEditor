@@ -57,6 +57,15 @@ export interface WetsProbe {
     orientationClick(x: number, y: number): boolean;
     /** Every handle set's axis under the pointer, as `set: axis` (D-6). */
     hoverAll(): Record<string, string | null>;
+    /** An object's screen-space bounds, or null when it is behind the camera. */
+    objectScreenRect(name: string): { left: number; top: number; right: number; bottom: number } | null;
+    /**
+     * Counts pixels by hue inside a client-pixel rectangle: the selection
+     * outline's proof (D-9) is a count of orange pixels, not one sample.
+     */
+    pixelStats(rect: { left: number; top: number; right: number; bottom: number }): {
+        total: number; orange: number; green: number; white: number;
+    };
 }
 
 declare global {
@@ -110,6 +119,8 @@ export function installProbe(
         hoverAxis?: () => string | null;
         /** Every handle set's axis under the pointer (the sets can overlap). */
         hoverAll?: () => Record<string, string | null>;
+        /** An object's projected renderer bounds (D-10's rectangle target). */
+        objectScreenRect?: (name: string) => { left: number; top: number; right: number; bottom: number } | null;
         /** The handle's position and axis directions in engine space (D-6). */
         handlePoint?: (axis: 'X' | 'Y' | 'Z', t: number) => { x: number; y: number; z: number } | null;
     },
@@ -153,6 +164,8 @@ export function installProbe(
         },
         hoverAxis: () => deps.hoverAxis?.() ?? null,
         hoverAll: () => deps.hoverAll?.() ?? {},
+        objectScreenRect: (name) => deps.objectScreenRect?.(name) ?? null,
+        pixelStats: (rect) => renderer.pixelStats(rect),
         transformOf: (name) => {
             for (const go of deps.selection.selectedSet()) {
                 if (go.name !== name) continue;

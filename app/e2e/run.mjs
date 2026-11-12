@@ -211,7 +211,14 @@ const menu = async (page, bar, item) => {
     await page.locator(".menubar-item", { hasText: bar }).click();
     await page.locator(".ctx-item", { hasText: item }).click();
 };
-const noErrors = page => page.logs.filter(l => !l.includes("404")).length === 0;
+// "No errors" ignores the two things that are not the app's: a 404 for an asset the
+// static server does not carry, and the GL driver's performance note about the
+// readPixels the probe's pixelStats/pixel reads deliberately perform (D-9/D-13).
+const noErrors = page => page.logs.filter(l =>
+    !l.includes("404")
+    && !l.includes("GL Driver Message")
+    && !l.includes("GPU stall")
+).length === 0;
 
 /** From the start screen: open the (empty) folder the picker returns and accept the set-up. */
 async function openEmptyProject(page) {
@@ -558,7 +565,7 @@ scenario("recovery: unsaved work survives a crash; giving it up is remembered", 
     await page.keyboard.press("Alt+Shift+N");
     await page.waitForTimeout(1000);
     const copy = await autosave();
-    check("a recovery copy appears while there are unsaved changes", copy !== null && JSON.parse(copy).roots.length === 1);
+    check("a recovery copy appears while there are unsaved changes", copy !== null && JSON.parse(copy).roots.length === 1, JSON.stringify(copy?.slice(0, 80)) + " len=" + (copy === null ? "null" : JSON.parse(copy).roots.length));
     check("the Project panel does not show it", !(await page.locator(".proj").innerText()).includes("autosave"));
 
     // With an autosave mid-write. Its open file used to make the removal fail,
@@ -1705,6 +1712,169 @@ scenario("transform handles: snapping, global vs local, multi-select, the tools 
             (await page.locator(".vp-overlay-tl .chip .v").first().innerText()) === label,
             await page.locator(".vp-overlay-tl .chip .v").first().innerText());
     }
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1 phase 5 — selection input (D-10) and the orange outline (D-9).
+scenario("selection: box, modifiers, and the orange outline (B1.5)", async () => {
+    const page = await newPage("SelDemo", { probe: true });
+    await openEmptyProject(page);
+
+    /** One object, created and selected — nothing else, so its create is the
+     * undo stack's top. */
+    const create = async (kind) => {
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+        await page.locator(".ctx-item", { hasText: kind }).last().click();
+        await page.waitForTimeout(300);
+    };
+    /** One cube at x, named after its position. */
+    const cubeAt = async (name, x) => {
+        await create("Cube");
+        await page.keyboard.press("F2");
+        const input = page.locator("app-hierarchy input.rename-input");
+        await input.fill(name);
+        await input.press("Enter");
+        await page.waitForTimeout(250);
+        await page.locator(".insp-body .field").nth(0).locator("input").nth(0).fill(String(x));
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(250);
+    };
+    const selection = () => page.evaluate(() => window.__wetsProbe.selection());
+    const rectOf = (name) => page.evaluate(n => window.__wetsProbe.objectScreenRect(n), name);
+    const centreOf = async (name) => {
+        const r = await rectOf(name);
+        return r ? { x: Math.round((r.left + r.right) / 2), y: Math.round((r.top + r.bottom) / 2) } : null;
+    };
+    const dragRect = async (from, to) => {
+        await page.mouse.move(from.x, from.y, { steps: 4 });
+        await page.mouse.down();
+        await page.mouse.move(to.x, to.y, { steps: 8 });
+        await page.mouse.up();
+        await page.waitForTimeout(350);
+    };
+
+    // Four cubes along X, so a rectangle can take three of them and leave one.
+    for (const [name, x] of [["L3", -3], ["L1", -1], ["R1", 1], ["R3", 3]]) await cubeAt(name, x);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(600);
+
+    const r3 = await rectOf("L3"), r1 = await rectOf("R1");
+    check("all four cubes are on screen", !!r3 && !!r1, JSON.stringify([r3, r1]));
+
+    // ── DW-5.1: a rectangle around the first three, Shift for the fourth ──
+    await dragRect({ x: r3.left - 12, y: r3.top - 12 }, { x: r1.right + 12, y: r1.bottom + 12 });
+    let sel = await selection();
+    check("a rectangle selects the objects it covers", ["L3", "L1", "R1"].every(n => sel.includes(n)) && sel.length === 3,
+        JSON.stringify(sel));
+    const treeLabels = async () => (await page.locator("app-hierarchy li.selected .label").allInnerTexts()).sort().join(",");
+    check("the Hierarchy agrees", await treeLabels() === ["L1", "L3", "R1"].sort().join(","), await treeLabels());
+
+    // Shift + rectangle around the fourth adds it.
+    await page.keyboard.down("Shift");
+    const r4 = await rectOf("R3");
+    await dragRect({ x: r4.left - 12, y: r4.top - 12 }, { x: r4.right + 12, y: r4.bottom + 12 });
+    await page.keyboard.up("Shift");
+    sel = await selection();
+    check("Shift + rectangle adds to the selection", sel.length === 4, JSON.stringify(sel));
+
+    // Ctrl + click on one of them removes it.
+    await page.keyboard.down("Control");
+    const mid = await centreOf("L1");
+    await page.mouse.click(mid.x, mid.y);
+    await page.keyboard.up("Control");
+    await page.waitForTimeout(300);
+    sel = await selection();
+    check("Ctrl + click removes the clicked object", sel.length === 3 && !sel.includes("L1"), JSON.stringify(sel));
+
+    // ── DW-5.3: the orange outline, counted around a selected cube ──
+    // The View tool (Q) hides the handles, so the only colour left in the
+    // rectangle is the outline's.
+    await page.keyboard.press("q");
+    await page.waitForTimeout(250);
+    const stats = async (name) => page.evaluate(n => {
+        const r = window.__wetsProbe.objectScreenRect(n);
+        return window.__wetsProbe.pixelStats({ left: r.left - 20, top: r.top - 20, right: r.right + 20, bottom: r.bottom + 20 });
+    }, name);
+    const on = await stats("R1");
+    check("the outline is orange around a selected cube", on.orange >= 200, JSON.stringify(on));
+    // The green axis line of the grid runs through every cube, so the check is the
+    // difference a selection makes, not the raw count: with the old BoxHelper gone
+    // nothing green appears that the empty scene does not already have.
+    await page.mouse.click(r3.left - 60, r3.top - 60);
+    await page.waitForTimeout(300);
+    const bare = await stats("R1");
+    check("the old green box is gone for meshes", Math.abs(on.green - bare.green) < 10,
+        `selected ${on.green} vs cleared ${bare.green}`);
+    await page.keyboard.press("w");
+    await page.waitForTimeout(150);
+
+    // ── DW-5.2: click, empty click, Shift+click ──
+    // The View tool (Q) hides the handles, so the clicks land on the objects:
+    // under W the handle sits on the active object and its centre box covers the
+    // pivot. Selection still works — Q only changes what the drag does.
+    await page.keyboard.press("q");
+    await page.waitForTimeout(250);
+    const one = await centreOf("R3");
+    await page.mouse.click(one.x, one.y);
+    await page.waitForTimeout(300);
+    check("a click selects", (await selection()).join(",") === "R3", JSON.stringify(await selection()));
+    await page.mouse.click(r3.left - 60, r3.top - 60);
+    await page.waitForTimeout(300);
+    check("a click on nothing clears", (await selection()).length === 0, JSON.stringify(await selection()));
+
+    const off = await stats("R3");
+    check("the outline is gone once nothing is selected", off.orange < 10, JSON.stringify(off));
+
+    const corner = async (name) => {
+        const r = await rectOf(name);
+        return { x: Math.round(r.left + (r.right - r.left) * 0.25), y: Math.round(r.top + (r.bottom - r.top) * 0.25) };
+    };
+    const l3 = await corner("L3");
+    await page.mouse.click(l3.x, l3.y);
+    await page.waitForTimeout(250);
+    check("a click selects the object it hit", (await selection()).join(",") === "L3", JSON.stringify(await selection()));
+    await page.keyboard.down("Shift");
+    const r3c = await corner("R3");
+    await page.mouse.click(r3c.x, r3c.y);
+    await page.waitForTimeout(250);
+    await page.keyboard.up("Shift");
+    check("Shift + click adds", (await selection()).sort().join(",") === "L3,R3", JSON.stringify(await selection()));
+    await page.keyboard.down("Shift");
+    await page.mouse.click(l3.x, l3.y);
+    await page.keyboard.up("Shift");
+    await page.waitForTimeout(250);
+    check("Shift + click removes again", (await selection()).join(",") === "R3", JSON.stringify(await selection()));
+
+    // ── DW-5.4: selection is not an edit ──
+    // One object created AFTER the save (and nothing else edited after it), then
+    // a run of selection changes: the undo stack's top must still be that create,
+    // which is what "adds no undo entry" means.
+    await create("Cube");
+    const treeBefore = (await page.locator("app-hierarchy li .label").allInnerTexts()).join(",");
+    const beforeChanges = (await page.locator(".statusbar .accent").first().innerText());
+    check("the create marks the scene unsaved", beforeChanges === "Unsaved", beforeChanges);
+    for (const name of ["L1", "L3", "R3"]) {
+        const c = await corner(name);
+        await page.mouse.click(c.x, c.y);
+        await page.waitForTimeout(150);
+    }
+    await dragRect({ x: 400, y: 200 }, { x: 430, y: 230 });   // a rectangle on nothing
+    const fresh = await corner("Cube");
+    await page.mouse.click(fresh.x, fresh.y);
+    await page.waitForTimeout(250);
+    check("the selection changes do not mark the scene unsaved",
+        (await page.locator(".statusbar .accent").first().innerText()) === "Unsaved",
+        await page.locator(".statusbar .accent").first().innerText());
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(600);
+    // Had a selection change pushed an entry, this single Ctrl+Z would have undone
+    // *that*, and the cube would still be in the scene.
+    const tree = await page.locator("app-hierarchy li .label").allInnerTexts();
+    check("the undo stack's top is still that create (the selection added nothing)",
+        !tree.includes("Cube") && tree.length === treeBefore.split(",").length - 1,
+        `${treeBefore} -> ${tree.join(",")}`);
+
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 

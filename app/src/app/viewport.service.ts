@@ -2,6 +2,8 @@ import { EffectRef, Injectable, Injector, NgZone, effect, inject, signal } from 
 import * as THREE from 'three';
 import { SceneViewController } from './scene-view/scene-view-controller';
 import { OrientationGizmo } from './scene-view/orientation-gizmo';
+import { ScenePicker } from './scene-view/scene-picker';
+import { SelectionOutline } from './scene-view/selection-outline';
 import { TransformHandles, type HandleSpace, type PivotMode, type ToolMode } from './scene-view/transform-handles';
 import {
     GameObject,
@@ -40,7 +42,14 @@ export class ViewportService {
     private _handles: TransformHandles | null = null;
     private _selectionEffect: EffectRef | null = null;
     private _snapEffect: EffectRef | null = null;
-    private _outline: THREE.BoxHelper | null = null;
+    private _outline: SelectionOutline | null = null;
+    private _picker: ScenePicker | null = null;
+    /** The rectangle draft, in canvas pixels, while the left button drags. */
+    private _rect: { x: number; y: number; endX: number; endY: number } | null = null;
+    /** The rectangle's div, created on the first draft (D-10). */
+    private _rectEl: HTMLDivElement | null = null;
+    private _lastShift = false;
+    private _lastCtrl = false;
     private _raycaster: THREE.Raycaster = new THREE.Raycaster();
     private _ndc: THREE.Vector2 = new THREE.Vector2();
     private _pointerDown: { x: number; y: number } | null = null;
@@ -78,6 +87,7 @@ export class ViewportService {
         canvas.addEventListener('pointerup', this._onClaimUp, true);
         canvas.addEventListener('pointerdown', this._onPointerDown);
         canvas.addEventListener('pointerup',   this._onPointerUp);
+        canvas.addEventListener('pointermove', this._onPointerMove);
 
         this._renderer.attach(canvas, () => this._tick());
 
@@ -89,6 +99,11 @@ export class ViewportService {
         const nav = new SceneViewController();
         nav.attach(canvas, camera as unknown as import('./scene-view/scene-view-controller').CameraTarget);
         this._nav = nav;
+
+        // ── Picking and the outline (B1 phase 5): click and rectangle
+        // selection (D-10), the screen-space silhouette (D-9).
+        this._picker = new ScenePicker(this._renderer);
+        this._outline = new SelectionOutline(this._renderer);
 
         // ── Grid: depth-tested against the engine scene (D-2 step 3) ──
         const grid = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
@@ -132,36 +147,15 @@ export class ViewportService {
             this._writeSnap();
         }, { injector: this._injector });
 
-        // Selection outline — a BoxHelper we re-attach on each selection change.
-        // Lives in the on-top layer so it always renders over the engine scene.
-        // (The multi-selection box is B1.6's; here it stays on the primary.)
-        // The handles follow the selection too, but not from inside an effect:
-        // re-seating them touches the controls, and doing that where Angular
-        // watches every signal read re-queued the effect in a tight loop. The
-        // frame loop polls the revision instead, which is the same trigger with
-        // no signal involved.
-        // Selection outline — a BoxHelper we re-attach on each selection change.
-        // Lives in the on-top layer so it always renders over the engine scene.
-        // (The multi-selection box is B1.6's; here it stays on the primary.) The
-        // handles are NOT seated here: touching the controls from inside an
-        // effect re-queued the effect in a tight loop, so the frame loop polls
-        // the selection revision and seats them instead (see {@link _reseatHandles}).
+        // The selection outline (D-9) follows the whole selection: the silhouette
+        // pass for meshes, a dim box for objects without any. The handles are
+        // seated here too, but through the frame loop rather than an effect —
+        // touching the controls where Angular watches every signal read re-queued
+        // the effect in a tight loop (see _reseatHandles).
         this._selectionEffect = effect(() => {
-            const go = this._selection.selected();
+            this._selection.selected();
             this._selection.revision();
-
-            // Outline
-            if (this._outline) {
-                this._renderer.removeOverlayLayer(this._outline);
-                this._outline.dispose();
-                this._outline = null;
-            }
-            if (go) {
-                const helper = new THREE.BoxHelper(go.transform._internalObject3D, 0x4ade80);
-                // Recompute the box every frame in _tick so it tracks transform changes.
-                this._outline = helper;
-                this._renderer.addOverlayLayer('above-scene', helper);
-            }
+            this._outline?.setTargets([...this._selection.selectedSet()].map(o => o.transform._internalObject3D));
         }, { injector: this._injector });
 
         // The debug probe (D-13) exists only when the flag is set.
@@ -178,6 +172,7 @@ export class ViewportService {
                 hoverAxis: () => this.hoverAxis,
                 hoverAll: () => this.hoverAll,
                 handlePoint: (axis, t) => this.handlePoint(axis, t),
+                objectScreenRect: name => this._picker?.screenRect(name) ?? null,
             });
         }
     }
@@ -208,6 +203,9 @@ export class ViewportService {
         this._snapEffect = null;
         this._outline?.dispose();
         this._outline = null;
+        this._picker = null;
+        this._rectEl?.remove();
+        this._rectEl = null;
         this._renderer.detach();
     }
 
@@ -295,13 +293,16 @@ export class ViewportService {
         this._handlesRevision = this._selection.revision();
         const handles = this._handles;
         if (!handles) return;
-        // The whole selection, in the set's order, so the primary (active) object
-        // is the one the Pivot/Local toggles take their axes from.
-        const targets = [...this._selection.selectedSet()].map(o => ({
+        // The active object FIRST: the Pivot and Local toggles take the handle's
+        // position and axes from it, and Unity's active object is the one the
+        // user toggled last, not the first in the selection set.
+        const primary = this._selection.selected();
+        const ordered = primary ? [primary, ...[...this._selection.selectedSet()].filter(o => o !== primary)] : [];
+        const targets = ordered.map(o => ({
             transform: o.transform,
             object3D: o.transform._internalObject3D,
         }));
-        handles.setTargets(this._selection.selected() && targets.length > 0 ? targets : []);
+        handles.setTargets(targets.length > 0 ? targets : []);
     }
 
     private _writeSnap(): void {
@@ -339,8 +340,8 @@ export class ViewportService {
         if (!this._handles?.dragging && this._selection.revision() !== this._handlesRevision) this._reseatHandles();
         this._handles?.dropDestroyed(() => this._reseatHandles());
 
-        // Keep the selection outline in sync with the target's current bounds.
-        this._outline?.update();
+        // Nothing to do per frame for the outline: its post-pass copies the
+        // world matrices itself, and the rectangle div is painted on the move.
 
         // The orientation cube, drawn after the frame in its own corner viewport.
         const ori = this._gizmoOri?.draw();
@@ -434,26 +435,84 @@ export class ViewportService {
     /** A window blur releases the hold: an alt-tab mid-drag must not snap on. */
     private readonly _onCtrlBlur = (): void => { this.ctrl = false; };
 
+    /**
+     * The left button does three things (D-10): on a handle it drags it, on empty
+     * space it may start a rectangle, anywhere else it is a click. A rectangle
+     * that never grows past a few pixels is a click (an empty-space one clears).
+     */
     private readonly _onPointerDown = (e: PointerEvent): void => {
         if (e.button !== 0) return;
+        // The canvas owns its presses: without this, a Shift+click starts the
+        // browser's native text selection, which then keeps every later mouse
+        // event until the user clicks elsewhere.
+        e.preventDefault();
         // A press that starts on a handle belongs to the handles. Treated as a
         // click on the canvas it would pick whatever is behind the handle — nothing,
-        // for an empty object — and deselect the object being moved. The handles
-        // know which one is under the pointer from the hover before the press.
+        // for an empty object — and deselect the object being moved.
         if (this._handles?.hoverAxis != null) return;
+        const canvas = this._canvas;
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
         this._pointerDown = { x: e.clientX, y: e.clientY };
+        this._lastShift = e.shiftKey;
+        this._lastCtrl = e.ctrlKey || e.metaKey;
+        this._rect = null;
+        // A drag that starts on empty space draws a rectangle; one that starts on
+        // an object is a click. Shift and Ctrl change what the release does
+        // (add / remove), not whether the rectangle is drawn. Under the View tool
+        // (Q) the left button is a pan, as Unity's hand is — no marquee.
+        if (!e.altKey && this.tool() !== 'view' && this._picker?.pick(e.clientX, e.clientY) == null) {
+            this._rect = {
+                x: e.clientX - rect.left, y: e.clientY - rect.top,
+                endX: e.clientX - rect.left, endY: e.clientY - rect.top,
+            };
+            this._showRect();
+        }
     };
 
     private readonly _onPointerUp = (e: PointerEvent): void => {
         this._handles?.releasePointer();
         const down = this._pointerDown;
+        const draft = this._rect;
         this._pointerDown = null;
+        this._rect = null;
+        this._hideRect();
         if (!down || e.button !== 0) return;
+
+        if (draft) {
+            const area = Math.abs(draft.endX - draft.x) * Math.abs(draft.endY - draft.y);
+            if (area < 16) {
+                // No rectangle was drawn: treat it as a click on empty space.
+                this._pickAt(e);
+                return;
+            }
+            // The draft is in canvas pixels; the picker works in client pixels.
+            const origin = this._canvas!.getBoundingClientRect();
+            this._rectSelect({
+                left: Math.min(draft.x, draft.endX) + origin.left,
+                top: Math.min(draft.y, draft.endY) + origin.top,
+                right: Math.max(draft.x, draft.endX) + origin.left,
+                bottom: Math.max(draft.y, draft.endY) + origin.top,
+            });
+            return;
+        }
         // If the pointer moved more than a few pixels, treat as orbit, not click.
         const dx = e.clientX - down.x;
         const dy = e.clientY - down.y;
         if (dx * dx + dy * dy > 16) return;
         this._pickAt(e);
+    };
+
+    /** The rectangle move handler: keeps the draft's far corner painted. */
+    private readonly _onPointerMove = (e: PointerEvent): void => {
+        const draft = this._rect;
+        if (!draft || !this._canvas) return;
+        // A selection drag must not turn into a native text selection either.
+        e.preventDefault();
+        const rect = this._canvas.getBoundingClientRect();
+        draft.endX = e.clientX - rect.left;
+        draft.endY = e.clientY - rect.top;
+        this._paintRect();
     };
 
     private _pickAt(e: PointerEvent): void {
@@ -474,23 +533,72 @@ export class ViewportService {
         // Build Object3D → GameObject map across the current scene.
         const o2g = ViewportService._buildObjectMap();
 
+        const hit = this._firstOwner(hits, o2g);
+        const shift = this._lastShift;
+        const ctrl = this._lastCtrl;
         this._zone.run(() => {
-            for (const hit of hits) {
-                let obj: THREE.Object3D | null = hit.object;
-                while (obj) {
-                    const go = o2g.get(obj);
-                    if (go) {
-                        this._selection.select(go);
-                        return;
-                    }
-                    obj = obj.parent;
-                }
-            }
-            this._selection.clear();
+            if (!hit) { this._selection.clear(); return; }
+            if (ctrl) { this._selection.toggle(hit); return; }   // remove (or put back)
+            if (shift) { this._selection.toggle(hit); return; }  // add (or remove)
+            this._selection.select(hit);
         });
     }
 
+    /** The GameObject that owns the nearest hit's object, if any. */
+    private _firstOwner(hits: THREE.Intersection[], o2g: Map<THREE.Object3D, GameObject>): GameObject | null {
+        for (const hit of hits) {
+            let obj: THREE.Object3D | null = hit.object;
+            while (obj) {
+                const go = o2g.get(obj);
+                if (go) return go;
+                obj = obj.parent;
+            }
+        }
+        return null;
+    }
+
     /** @internal Walks the engine scene once and maps each Object3D to its GameObject. */
+    /** Applies a rectangle's selection (D-10: clear unless Shift/Ctrl). */
+    private _rectSelect(rect: { left: number; top: number; right: number; bottom: number }): void {
+        const picker = this._picker;
+        if (!picker) return;
+        const found = picker.pickRect(rect);
+        const shift = this._lastShift;
+        const ctrl = this._lastCtrl;
+        this._zone.run(() => {
+            if (!shift && !ctrl) this._selection.clear();
+            for (const go of found) {
+                if (ctrl && this._selection.isSelected(go)) continue;   // remove
+                if (shift && this._selection.isSelected(go)) continue;  // already in
+                this._selection.toggle(go);
+            }
+        });
+    }
+
+    private _showRect(): void {
+        const canvas = this._canvas;
+        if (!canvas) return;
+        const el = this._rectEl ?? (this._rectEl = document.createElement('div'));
+        el.className = 'vp-rect';
+        if (!el.parentNode) canvas.parentElement?.appendChild(el);
+        this._paintRect();
+    }
+
+    private _paintRect(): void {
+        const draft = this._rect;
+        const el = this._rectEl;
+        if (!draft || !el) return;
+        el.style.display = 'block';
+        el.style.left = `${Math.min(draft.x, draft.endX)}px`;
+        el.style.top = `${Math.min(draft.y, draft.endY)}px`;
+        el.style.width = `${Math.abs(draft.endX - draft.x)}px`;
+        el.style.height = `${Math.abs(draft.endY - draft.y)}px`;
+    }
+
+    private _hideRect(): void {
+        if (this._rectEl) this._rectEl.style.display = 'none';
+    }
+
     private static _buildObjectMap(): Map<THREE.Object3D, GameObject> {
         const map = new Map<THREE.Object3D, GameObject>();
         const roots = SceneManager.activeScene.getRootGameObjects();

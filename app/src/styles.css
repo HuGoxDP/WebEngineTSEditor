@@ -741,6 +741,10 @@ body.resizing { cursor: inherit !important; user-select: none; }
   width: 100%;
   height: 100%;
   display: block;
+  /* The canvas owns its presses: a Shift+click must extend the selection, not
+     start the browser's native text selection over the drawing surface. */
+  user-select: none;
+  -webkit-user-select: none;
 }
 .vp-overlay-tl {
   position: absolute;
@@ -770,6 +774,16 @@ body.resizing { cursor: inherit !important; user-select: none; }
 .vp-overlay-tl .chip .v { color: #e8e8ea; }
 /* Under the orientation cube (top-right, above the canvas edge); it never
    swallows a click. */
+/* The rectangle-select draft (D-10): an editor-owned div over the canvas, so it
+   never enters the WebGL frame. */
+.vp-rect {
+  position: absolute;
+  display: none;
+  border: 1px solid #ffd28a;
+  background: rgba(255, 209, 138, 0.12);
+  pointer-events: none;
+  z-index: 5;
+}
 .vp-overlay-tr {
   position: absolute;
   /* 12px margin + the cube's 128px viewport + a 6px gap. */
