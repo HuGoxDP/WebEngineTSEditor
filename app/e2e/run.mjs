@@ -372,7 +372,9 @@ scenario("unsaved changes: closing asks, saving never silently replaces a scene"
 });
 
 scenario("honest saving: the mark, Save from the dialog, the gizmo, closing the tab", async () => {
-    const page = await newPage("SaveDemo");
+    // The probe is on here too: the move tool's handle is found through it, so
+    // the scenario does not encode the camera's pixels (B1.3 changed them).
+    const page = await newPage("SaveDemo", { probe: true });
     await openEmptyProject(page);
     const status = () => page.locator(".statusbar .accent").first().innerText();
     const dot = () => page.locator(".project-tag .dot.unsaved").count();
@@ -400,8 +402,17 @@ scenario("honest saving: the mark, Save from the dialog, the gizmo, closing the 
     const position = () => page.locator(".insp-body .field").first().locator("input").evaluateAll(els => els.map(e => e.value).join(","));
     const before = await position();
 
+    // The arrow's tip comes from the probe (handlePoint projects the pivot + the
+    // axis), so the check does not depend on where the camera happens to sit:
+    // B1.3 restored the frozen initial pose and the pixels moved with it.
+    const arrow = await page.evaluate(() => {
+        const p = window.__wetsProbe.handlePoint("x", 0.8);
+        return p ? { x: p.x, y: p.y } : null;
+    });
+    check("the move tool's X handle is on screen", !!arrow, JSON.stringify(arrow));
+
     // Pressing a handle without dragging changes nothing, so it must not make the scene unsaved.
-    await page.mouse.move(800, 388, { steps: 3 });
+    await page.mouse.move(arrow.x, arrow.y, { steps: 3 });
     await page.waitForTimeout(200);
     await page.mouse.down();
     await page.mouse.up();
@@ -409,11 +420,11 @@ scenario("honest saving: the mark, Save from the dialog, the gizmo, closing the 
     check("pressing a handle without dragging is not an edit", (await status()) === "Saved");
     check("and does not deselect the object", (await position()) === before, await position());
 
-    await page.mouse.move(800, 388, { steps: 3 });
+    await page.mouse.move(arrow.x, arrow.y, { steps: 3 });
     await page.waitForTimeout(200);
     await page.mouse.down();
     await page.waitForTimeout(100);
-    for (let i = 1; i <= 10; i++) { await page.mouse.move(800 + i * 8, 388 + i * 2, { steps: 2 }); await page.waitForTimeout(40); }
+    for (let i = 1; i <= 10; i++) { await page.mouse.move(arrow.x + i * 8, arrow.y + i * 2, { steps: 2 }); await page.waitForTimeout(40); }
     await page.mouse.up();
     await page.waitForTimeout(300);
     const after = await position();
@@ -1119,7 +1130,13 @@ scenario("scene formats: v1, an absent version and a v2 link all open", async ()
         await pick(page, folder);
         await page.getByText("Open folder…").click();
         await page.locator(".work").waitFor();
-        await page.waitForTimeout(500);
+        // Wait for the scene to reach the tree before reading it: under the full
+        // suite's load the scene's arrival lags the workspace's, and a fixed
+        // timeout read the tree too early (a flake, not a refusal).
+        for (let i = 0; i < 50; i++) {
+            if ((await page.locator("app-hierarchy").innerText()).includes(object)) break;
+            await page.waitForTimeout(100);
+        }
         check(`${folder}: the scene opens without questions`,
             (await page.locator(".dlg").count()) === 0 && (await page.locator("app-hierarchy").innerText()).includes(object));
         await menu(page, "File", "Close Project");
@@ -1199,6 +1216,266 @@ scenario("scene formats: the too-new refusal is translated (uk)", async () => {
     check("uk: the too-new message is Ukrainian", (await page.locator(".dlg").innerText()).includes("збережено новішою версією редактора"));
     await dialogButton(page, "Гаразд").click();
     check("uk: the refusal keeps the open scene", (await page.locator("app-hierarchy").innerText()).includes("SeededUk"));
+});
+
+// B1 phase 2 — Unity's Scene navigation (D-4), asserted in the engine space the
+// probe speaks. Phase 2 verified these by hand-run probes; the plan asked for a
+// scenario, and this is it (the notes record the move).
+scenario("navigation: orbit, zoom, dolly, pan, look, fly — the pose never drifts (B1.2)", async () => {
+    const page = await newPage("NavDemo", { probe: true });
+    await openEmptyProject(page);
+    const pose = () => page.evaluate(() => {
+        const p = window.__wetsProbe;
+        const c = p.camera();
+        const pivot = p.pivot();
+        return {
+            pos: c.position, fwd: c.forward, pivot,
+            distance: Math.hypot(c.position.x - pivot.x, c.position.y - pivot.y, c.position.z - pivot.z),
+        };
+    });
+    const canvas = await page.locator("canvas").boundingBox();
+    const move = (dx, dy) => page.mouse.move(canvas.x + dx, canvas.y + dy);
+    const start = await pose();
+    const near0 = (v) => Math.abs(v) < 1e-9;
+    check("the initial pose is the frozen one", near0(start.pos.x - 6) && near0(start.pos.y - 6) && near0(start.pos.z + 10)
+        && near0(start.pivot.x) && near0(start.pivot.y) && near0(start.pivot.z), JSON.stringify(start.pos));
+
+    // DW-2.1: Alt+LMB orbits — the distance to the pivot is exact by construction.
+    await page.keyboard.down("Alt");
+    await page.mouse.move(canvas.x + 700, canvas.y + 400, { steps: 3 });
+    await page.mouse.down();
+    for (let i = 1; i <= 10; i++) { await page.mouse.move(canvas.x + 700 + i * 10, canvas.y + 400, { steps: 2 }); await page.waitForTimeout(30); }
+    await page.mouse.up();
+    await page.keyboard.up("Alt");
+    const orbited = await pose();
+    check("orbit keeps the distance to the pivot", Math.abs(orbited.distance - start.distance) < 1e-3,
+        `${start.distance} -> ${orbited.distance}`);
+    check("orbit moves the camera around the pivot (Δx sign)", orbited.pos.x > start.pos.x,
+        `${start.pos.x} -> ${orbited.pos.x}`);
+
+    // DW-2.2: the wheel zooms toward the pivot; the pivot itself does not move.
+    await page.mouse.move(canvas.x + 700, canvas.y + 400);
+    await page.mouse.wheel(0, -120);
+    await page.waitForTimeout(200);
+    const zoomed = await pose();
+    check("the wheel zooms in", zoomed.distance < orbited.distance - 0.5, `${orbited.distance} -> ${zoomed.distance}`);
+    check("zooming leaves the pivot alone", zoomed.pivot.x === orbited.pivot.x && zoomed.pivot.y === orbited.pivot.y && zoomed.pivot.z === orbited.pivot.z,
+        JSON.stringify(zoomed.pivot));
+
+    // Alt+RMB dollies by the same rule as the wheel: dragging UP zooms in.
+    await page.keyboard.down("Alt");
+    await page.mouse.down({ button: "right" });
+    for (let i = 1; i <= 8; i++) { await page.mouse.move(canvas.x + 700, canvas.y + 400 - i * 10, { steps: 2 }); await page.waitForTimeout(30); }
+    await page.mouse.up({ button: "right" });
+    await page.keyboard.up("Alt");
+    const dollied = await pose();
+    check("Alt+RMB dollies", dollied.distance < zoomed.distance - 0.5, `${zoomed.distance} -> ${dollied.distance}`);
+
+    // DW-2.3: the middle button pans — camera and pivot travel together.
+    const beforePan = await pose();
+    await page.mouse.move(canvas.x + 700, canvas.y + 400, { steps: 3 });
+    await page.mouse.down({ button: "middle" });
+    for (let i = 1; i <= 10; i++) { await page.mouse.move(canvas.x + 700 + i * 8, canvas.y + 400, { steps: 2 }); await page.waitForTimeout(30); }
+    await page.mouse.up({ button: "middle" });
+    const panned = await pose();
+    const dPos = Math.hypot(panned.pos.x - beforePan.pos.x, panned.pos.y - beforePan.pos.y, panned.pos.z - beforePan.pos.z);
+    const dPivot = Math.hypot(panned.pivot.x - beforePan.pivot.x, panned.pivot.y - beforePan.pivot.y, panned.pivot.z - beforePan.pivot.z);
+    check("pan moves the pivot", dPivot > 0.05, String(dPivot));
+    check("pan moves the camera by the same vector", Math.abs(dPos - dPivot) < 1e-6, `${dPos} vs ${dPivot}`);
+    check("pan keeps the forward and the distance", panned.fwd.x === beforePan.fwd.x && panned.fwd.y === beforePan.fwd.y && panned.fwd.z === beforePan.fwd.z
+        && Math.abs(panned.distance - beforePan.distance) < 1e-6, JSON.stringify(panned.fwd));
+
+    // DW-2.4: RMB looks without moving; RMB + W flies along the forward.
+    const beforeLook = await pose();
+    await page.mouse.move(canvas.x + 700, canvas.y + 400, { steps: 3 });
+    await page.mouse.down({ button: "right" });
+    for (let i = 1; i <= 6; i++) { await page.mouse.move(canvas.x + 700 + i * 12, canvas.y + 400 + i * 3, { steps: 2 }); await page.waitForTimeout(30); }
+    await page.mouse.up({ button: "right" });
+    const looked = await pose();
+    check("looking does not move the camera", looked.pos.x === beforeLook.pos.x && looked.pos.y === beforeLook.pos.y && looked.pos.z === beforeLook.pos.z,
+        JSON.stringify(looked.pos));
+    check("looking turns the forward", looked.fwd.x !== beforeLook.fwd.x);
+
+    /**
+     * Flies for a measured window and returns the speed it covered. Measured
+     * inside the page and counted in **frames**, because the fly integrates the
+     * frame dt: a loaded browser can stall whole frames, and a millisecond
+     * window that contained none of them would read as "the fly does not work".
+     * It also waits for the first movement, so a dropped key event cannot fake a
+     * standstill.
+     */
+    const flySpeed = async (shift) => {
+        await page.keyboard.down("w");
+        if (shift) await page.keyboard.down("Shift");
+        await page.mouse.down({ button: "right" });
+        const measured = await page.evaluate(async () => {
+            const probe = window.__wetsProbe;
+            const read = () => {
+                const c = probe.camera();
+                return { x: c.position.x, y: c.position.y, z: c.position.z, fx: c.forward.x, fy: c.forward.y, fz: c.forward.z };
+            };
+            const dist = (a, b) => Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+            const nextFrame = () => new Promise(r => requestAnimationFrame(() => r()));
+            const start = read();
+            let moving = false;
+            for (let i = 0; i < 100 && !moving; i++) {
+                await nextFrame();
+                moving = dist(start, read()) > 0.01;
+            }
+            const a = read();
+            const t0 = performance.now();
+            for (let frames = 0; frames < 10; frames++) {
+                await nextFrame();
+                if (performance.now() - t0 > 5000) break;
+            }
+            const b = read();
+            const seconds = Math.max((performance.now() - t0) / 1000, 0.001);
+            return { moving, seconds, dist: dist(a, b), along: (b.x - a.x) * a.fx + (b.y - a.y) * a.fy + (b.z - a.z) * a.fz };
+        });
+        await page.mouse.up({ button: "right" });
+        await page.keyboard.up("w");
+        if (shift) await page.keyboard.up("Shift");
+        await page.waitForTimeout(200);
+        return { ...measured, speed: measured.dist / measured.seconds };
+    };
+
+    const plain = await flySpeed(false);
+    check("RMB + W flies along the forward", plain.moving && plain.dist > 0.02 && plain.along > 0.9 * plain.dist,
+        `${plain.dist.toFixed(3)} in ${plain.seconds.toFixed(2)}s over ${plain.moving ? "" : "no "}movement, ${plain.along.toFixed(3)} of it along the view`);
+
+    // Shift makes the same gesture four times faster (D-4).
+    const fast = await flySpeed(true);
+    check("Shift flies at least three times as fast", fast.moving && fast.speed >= 3 * plain.speed,
+        `${fast.speed.toFixed(2)}/s vs ${plain.speed.toFixed(2)}/s`);
+
+    // DW-2.6: none of it is an edit.
+    check("navigating does not mark the scene unsaved", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1 phase 3 — the orientation cube (D-5): its cones drive the camera, its
+// centre toggles the projection, and its axes read in engine space.
+scenario("orientation cube: cones snap the camera, the centre toggles iso (B1.3)", async () => {
+    const page = await newPage("OriDemo", { probe: true });
+    await openEmptyProject(page);
+    await page.waitForTimeout(400);
+    const pose = () => page.evaluate(() => {
+        const c = window.__wetsProbe.camera();
+        return { pos: c.position, fwd: c.forward };
+    });
+    const targets = () => page.evaluate(() => window.__wetsProbe.orientationTargets());
+    const centre = () => page.evaluate(() => {
+        const s = window.__wetsProbe.size();
+        const r = document.querySelector("canvas").getBoundingClientRect();
+        return { x: r.left + s.width - 64, y: r.top + 64 };
+    });
+    /**
+     * Waits until the camera's forward is the given engine-space direction (the
+     * snap is animated, and this browser draws with a software GL at
+     * single-digit FPS, so a fixed timeout reads the pose mid-flight). Each
+     * DW-3.1 row states where the camera must end, so waiting for that end is
+     * the assertion itself.
+     */
+    const waitForForward = (x, y, z) => page.evaluate(async ([ex, ey, ez]) => {
+        const until = performance.now() + 10000;
+        while (performance.now() < until) {
+            const f = window.__wetsProbe.camera().forward;
+            if (Math.abs(f.x - ex) < 1e-6 && Math.abs(f.y - ey) < 1e-6 && Math.abs(f.z - ez) < 1e-6) return true;
+            await new Promise(r => setTimeout(r, 100));
+        }
+        return false;
+    }, [x, y, z]);
+    /** Waits for the pose to hold still for half a second (no stated target). */
+    const settle = () => page.evaluate(async () => {
+        const read = () => {
+            const f = window.__wetsProbe.camera().forward;
+            return `${f.x}|${f.y}|${f.z}`;
+        };
+        let last = read();
+        let steady = 0;
+        const until = performance.now() + 10000;
+        while (performance.now() < until) {
+            await new Promise(r => setTimeout(r, 100));
+            const now = read();
+            steady = now === last ? steady + 100 : 0;
+            if (steady >= 500) return true;
+            last = now;
+        }
+        return false;
+    });
+    const span = () => page.evaluate(() => {
+        const a = window.__wetsProbe.handlePoint("x", -1);
+        const b = window.__wetsProbe.handlePoint("x", 1);
+        return a && b ? Math.hypot(b.x - a.x, b.y - a.y) : null;
+    });
+
+    // DW-3.1: each cone snaps to look along −its axis, pivot untouched. The
+    // order matters: the probe reports only the cones a click can reach (the
+    // far side of the hub is hidden), so each is clicked from a view that faces
+    // it — X, then Y, then Z, then X again, and −Z from that side view.
+    const clickCone = async (label, x, y, z) => {
+        const t = await targets();
+        const p = t[label];
+        check(`${label} is clickable on the gizmo`, !!p, JSON.stringify(Object.keys(t)));
+        if (!p) return;
+        await page.mouse.click(p.x, p.y);
+        const arrived = await waitForForward(x, y, z);
+        check(`${label} cone: forward is (${x},${y},${z})`, arrived, await fwdText());
+    };
+    const fwdText = () => page.evaluate(() => {
+        const f = window.__wetsProbe.camera().forward;
+        return `(${f.x.toFixed(4)}, ${f.y.toFixed(4)}, ${f.z.toFixed(4)})`;
+    });
+
+    await clickCone("X", -1, 0, 0);
+    await clickCone("Y", 0, -1, 0);
+    await clickCone("Z", 0, 0, -1);
+    // Back to a side view, where −Z faces the camera again.
+    await clickCone("X", -1, 0, 0);
+    await clickCone("−Z", 0, 0, 1);
+    const pivotNow = await page.evaluate(() => window.__wetsProbe.pivot());
+    check("the pivot is still the origin", pivotNow.x === 0 && pivotNow.y === 0 && pivotNow.z === 0, JSON.stringify(pivotNow));
+
+    // DW-3.3: after +Y (Top view) the cube reads engine space: +Z up the screen,
+    // +X to the right. Unity's top view has Z up the screen in a left-handed world.
+    await clickCone("Y", 0, -1, 0);
+    await settle();
+    const top = await targets();
+    const c = await centre();
+    check("Top view: +Z is above the gizmo centre", top.Z && top.Z.y < c.y - 4, `${top.Z?.y} vs ${c.y}`);
+    check("Top view: +X is right of the gizmo centre", top.X && top.X.x > c.x + 4, `${top.X?.x} vs ${c.x}`);
+
+    // DW-3.2: the centre toggles the projection and keeps the framing.
+    const before = await pose();
+    const perspSpan = await span();
+    await page.mouse.click(c.x, c.y);
+    await page.waitForTimeout(400);
+    const isoMode = await page.evaluate(() => window.__wetsProbe.orientationMode());
+    check("the centre click turns the camera orthographic", isoMode.orthographic === true, JSON.stringify(isoMode));
+    check("the label reads Iso", isoMode.label === "Iso", isoMode.label);
+    // The chip is Angular-bound and updates on the next change-detection tick,
+    // which a loaded page delays, so poll for it rather than reading once.
+    const chipReads = async () => (await page.locator(".vp-overlay-tr .v").innerText()).trim();
+    let chipIso = false;
+    for (let i = 0; i < 30 && !(chipIso = (await chipReads()) === "Iso"); i++) await page.waitForTimeout(100);
+    check("the corner chip says Iso", chipIso, await chipReads());
+    const isoSpan = await span();
+    check("the framing survives the toggle (<15%)", perspSpan && isoSpan && Math.abs(isoSpan - perspSpan) / perspSpan < 0.15,
+        `${perspSpan} -> ${isoSpan}`);
+    const after2 = await pose();
+    check("the pose is unchanged by the toggle",
+        Math.abs(after2.pos.x - before.pos.x) < 1e-6 && Math.abs(after2.pos.y - before.pos.y) < 1e-6 && Math.abs(after2.pos.z - before.pos.z) < 1e-6,
+        `${JSON.stringify(after2.pos)} vs ${JSON.stringify(before.pos)}`);
+
+    await page.mouse.click(c.x, c.y);
+    await page.waitForTimeout(300);
+    const perspMode = await page.evaluate(() => window.__wetsProbe.orientationMode());
+    check("the centre click turns it back", perspMode.orthographic === false, JSON.stringify(perspMode));
+    check("the label reads Persp", perspMode.label === "Persp", perspMode.label);
+
+    // DW-2.6 again: looking along an axis is navigation, not an edit.
+    check("the cube does not mark the scene unsaved", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+    check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
 // ═══ Run ═══
