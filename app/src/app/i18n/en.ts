@@ -125,6 +125,10 @@ export const en = {
     'vp.combined': 'Combined transform (Y)',
     'vp.tool': 'Tool',
     'vp.shortcuts': 'Shortcuts',
+    // Unity's own gizmo words for the projection toggle's read-out.
+    'vp.projection': 'Projection',
+    'vp.persp': 'Persp',
+    'vp.iso': 'Iso',
     'tool.translate': 'Move',
     'tool.rotate': 'Rotate',
     'tool.scale': 'Scale',

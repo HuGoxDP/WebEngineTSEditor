@@ -35,6 +35,12 @@ export interface WetsProbe {
     pixel(x: number, y: number): [number, number, number, number] | null;
     /** Client size of the drawing surface. */
     size(): { width: number; height: number };
+    /** The orientation cube's cone centres, in client pixels (D-5's read-back). */
+    orientationTargets(): Record<string, { x: number; y: number }>;
+    /** The orientation cube's projection mode and view name. */
+    orientationMode(): { orthographic: boolean; label: string };
+    /** Clicks the orientation cube at a client pixel (DW-3.1). */
+    orientationClick(x: number, y: number): boolean;
 }
 
 declare global {
@@ -47,16 +53,20 @@ export function probeEnabled(): boolean {
 }
 
 /** The engine-space pose of a three camera (phase 1's space.ts conversion, probe-local). */
-function enginePose(camera: THREE.Camera): {
+/**
+ * The engine-space pose of the editor camera. The renderer's camera is the
+ * scene-view's own projection camera (phase 3), which carries position and
+ * quaternion directly — no world matrices to walk.
+ */
+function enginePose(camera: THREE.Camera & { position: THREE.Vector3; quaternion: THREE.Quaternion }): {
     position: { x: number; y: number; z: number };
     forward: { x: number; y: number; z: number };
     up: { x: number; y: number; z: number };
     orthographic: boolean;
 } {
-    const forward = new THREE.Vector3();
-    camera.getWorldDirection(forward);
-    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.getWorldQuaternion(new THREE.Quaternion()));
-    const pos = camera.getWorldPosition(new THREE.Vector3());
+    const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion).normalize();
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+    const pos = camera.position;
     return {
         position: { x: pos.x, y: pos.y, z: -pos.z },
         forward: { x: forward.x, y: forward.y, z: -forward.z },
@@ -76,13 +86,17 @@ export function installProbe(
         canvas: () => HTMLCanvasElement | null;
         /** The navigation controller's state, engine space, while one exists. */
         nav?: { pivot: { x: number; y: number; z: number }; distance: number; yaw: number; pitch: number; orthographic: boolean; flySpeed: number };
+        /** The orientation cube's current state, when the gizmo exists. */
+        orientation?: () => { targets: Record<string, { x: number; y: number }>; label: string };
+        /** Routes a client-pixel click to the orientation cube. */
+        orientationClick?: (x: number, y: number) => boolean;
     },
 ): void {
     const probe: WetsProbe = {
         camera: () => {
-            const cam = renderer.camera;
+            const cam = renderer.projectionCamera ?? renderer.camera;
             if (!cam) throw new Error('probe: no camera attached');
-            return enginePose(cam);
+            return enginePose(cam as unknown as THREE.Camera);
         },
         pivot: () => {
             if (deps.nav) return { ...deps.nav.pivot };
@@ -106,6 +120,19 @@ export function installProbe(
         size: () => {
             const canvas = deps.canvas();
             return { width: canvas?.clientWidth ?? 0, height: canvas?.clientHeight ?? 0 };
+        },
+        orientationTargets: () => deps.orientation?.().targets ?? {},
+        orientationMode: () => {
+            const s = deps.orientation?.();
+            const cam = renderer.camera;
+            return {
+                orthographic: (cam as unknown as { isOrthographicCamera?: boolean }).isOrthographicCamera === true,
+                label: s?.label ?? '',
+            };
+        },
+        orientationClick: (x, y) => {
+            const handler = deps.orientationClick;
+            return handler ? handler(x, y) : false;
         },
         pixel: (x, y) => renderer.readPixel(x, y),
     };

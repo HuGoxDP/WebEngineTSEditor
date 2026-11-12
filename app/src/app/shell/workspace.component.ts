@@ -149,6 +149,14 @@ import { StatusbarComponent } from './statusbar.component';
                                     <span class="v">W · E · R · Del · Alt+Shift+N</span>
                                 </div>
                             </div>
+
+                            <!-- Under the orientation cube: the projection its centre click toggles. -->
+                            <div class="vp-overlay-tr">
+                                <div class="chip">
+                                    <span class="k">{{ 'vp.projection' | t }}</span>
+                                    <span class="v">{{ (viewport.orthographic() ? 'vp.iso' : 'vp.persp') | t }}</span>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>

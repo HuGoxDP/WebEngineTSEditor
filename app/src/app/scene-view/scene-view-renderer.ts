@@ -1,5 +1,6 @@
 import { Injectable } from '@angular/core';
 import * as THREE from 'three';
+import type { CameraTarget } from './scene-view-controller';
 import { SceneManager } from 'WebEngineTS';
 
 /**
@@ -26,14 +27,36 @@ import { SceneManager } from 'WebEngineTS';
 /** An overlay kind decides which D-2 step its objects draw in. */
 export type OverlayKind = 'grid' | 'above-scene';
 
+/** The world up every ordinary `lookAt` uses. */
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+
+/**
+ * A D-2 step 6 corner viewport: its own scene and camera, drawn last into a
+ * square in the top-right corner (the orientation cube, D-5). Kept apart from
+ * the overlay layers because the cube must not be projected by the scene
+ * camera — it has its own, aimed along the editor camera's direction.
+ */
+export interface CornerLayer {
+    /** The scene holding the cube. Never the engine's. */
+    scene: THREE.Scene;
+    /** The camera that looks at the cube. */
+    camera: THREE.Camera;
+    /** The square's side, in client pixels. */
+    size: number;
+}
+
 @Injectable({ providedIn: 'root' })
 export class SceneViewRenderer {
 
     private _renderer: THREE.WebGLRenderer | null = null;
     private _camera: THREE.PerspectiveCamera | null = null;
+    /** The camera implementation: one object, perspective and orthographic modes. */
+    private _projection: ProjectionCamera | null = null;
 
     private _gridScene: THREE.Scene | null = null;
     private _aboveScene: THREE.Scene | null = null;
+    /** The corner viewport (D-2 step 6); null when nothing owns one. */
+    private _cornerLayer: CornerLayer | null = null;
     private _rafId = 0;
     private _canvas: HTMLCanvasElement | null = null;
     private _resizeObs: ResizeObserver | null = null;
@@ -46,6 +69,25 @@ export class SceneViewRenderer {
 
     /** The editor camera. */
     public get camera(): THREE.PerspectiveCamera | null { return this._camera; }
+
+    /** The camera as a projection target for the navigation controller. */
+    public get projectionCamera(): ProjectionCamera | null { return this._projection; }
+
+    /** The drawing surface's client size (for the corner gizmo). */
+    public get viewportSize(): { width: number; height: number } {
+        return { width: this._canvas?.clientWidth ?? 0, height: this._canvas?.clientHeight ?? 0 };
+    }
+
+    /** The canvas's client rect, for pointer work in client pixels. */
+    public get canvasRect(): { left: number; top: number; width: number; height: number } | null {
+        const c = this._canvas;
+        if (!c) return null;
+        const r = c.getBoundingClientRect();
+        return { left: r.left, top: r.top, width: r.width, height: r.height };
+    }
+
+    /** Registers the corner viewport's contents (null clears it). */
+    public setCornerLayer(layer: CornerLayer | null): void { this._cornerLayer = layer; }
 
 
 
@@ -61,12 +103,14 @@ export class SceneViewRenderer {
         this._gridScene = new THREE.Scene();
         this._aboveScene = new THREE.Scene();
 
-        const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 1000);
-        camera.position.set(6, 6, 10);
-        camera.lookAt(0, 0, 0);
-        this._camera = camera;
+        // One camera object, two modes: the orthographic toggle (B1 phase 3)
+        // re-projects the same object instead of swapping cameras, so the
+        // controller keeps a stable handle on it.
+        const projection = new ProjectionCamera(50, 1, 0.1, 1000);
+        projection.placeAt(6, 6, 10);
+        this._projection = projection;
+        this._camera = projection;
 
-        // The navigation controller (B1 phase 2) owns the pose. The controls
         // The navigation controller (B1 phase 2) owns the pose; a second set of
         // mouse handlers on the same canvas would fight it. The controls are
         // not created at all — the pivot lives in the controller's state.
@@ -98,7 +142,7 @@ export class SceneViewRenderer {
     /** Draws one frame in the D-2 order. */
     public draw(): void {
         const r = this._renderer;
-        const cam = this._camera;
+        const cam = this._projection;
         if (!r || !cam || !this._gridScene || !this._aboveScene) return;
 
         // The navigation controller owns the camera pose; the OrbitControls
@@ -113,6 +157,24 @@ export class SceneViewRenderer {
         // 4+: depth drop, then the on-top layers.
         r.clearDepth();
         r.render(this._aboveScene, cam);
+
+        // 6: the corner viewport (the orientation cube). Scissored, so neither
+        // its depth clear nor its draw touches the rest of the canvas; the
+        // colour is not cleared, so the cube reads over the scene behind it.
+        const corner = this._cornerLayer;
+        if (corner && this._canvas) {
+            const w = Math.min(corner.size, this._canvas.clientWidth);
+            const h = Math.min(corner.size, this._canvas.clientHeight);
+            const x = Math.max(0, this._canvas.clientWidth - w);
+            const y = Math.max(0, this._canvas.clientHeight - h);
+            r.setScissorTest(true);
+            r.setScissor(x, y, w, h);
+            r.setViewport(x, y, w, h);
+            r.clearDepth();
+            r.render(corner.scene, corner.camera);
+            r.setScissorTest(false);
+            r.setViewport(0, 0, this._canvas.clientWidth, this._canvas.clientHeight);
+        }
     }
 
     /**
@@ -142,6 +204,8 @@ export class SceneViewRenderer {
         this._resizeObs = null;
         this._renderer?.dispose();
         this._renderer = null;
+        this._cornerLayer = null;
+        this._projection = null;
         this._gridScene = null;
         this._aboveScene = null;
         this._camera = null;
@@ -153,7 +217,102 @@ export class SceneViewRenderer {
         const h = canvas.clientHeight;
         if (w === 0 || h === 0 || !this._renderer || !this._camera) return;
         this._renderer.setSize(w, h, false);
-        this._camera.aspect = w / h;
-        this._camera.updateProjectionMatrix();
+        this._projection?.setAspect(w / h);
+    }
+}
+
+
+/**
+ * One camera with two projections (B1 phase 3). three splits perspective and
+ * orthographic into different classes; the editor's Scene view toggles between
+ * them on the orientation cube's centre click, and the controller needs one
+ * stable object to aim.
+ *
+ * So this is one real `PerspectiveCamera` that becomes orthographic: the mode
+ * flips the flags three branches on and takes the orthographic frustum's
+ * matrices as its own. Everything else in the app (the render loop, the
+ * TransformControls handles, the raycasters, the probe) keeps one object with a
+ * current `matrixWorld`, `projectionMatrix` and `fov` — a stand-in object
+ * without them broke the handles' `updateMatrixWorld` and their raycasts, which
+ * is exactly the bug this shape avoids.
+ */
+class ProjectionCamera extends THREE.PerspectiveCamera {
+
+    /** Distinguishes the two modes the way three does, for the probe's read. */
+    public isOrthographicCamera = false;
+
+    private readonly _ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 1000);
+    private _orthoSize = 5;
+
+    constructor(fov: number, near: number, far: number, orthoSize = 5) {
+        super(fov, near, far);
+        this._orthoSize = orthoSize;
+        this._ortho.near = near;
+        this._ortho.far = far;
+        this._project();
+    }
+
+    /** Places the camera at a three-space point looking at the origin. */
+    public placeAt(x: number, y: number, z: number): void {
+        this.position.set(x, y, z);
+        this.lookAt(new THREE.Vector3(0, 0, 0));
+    }
+
+    /** The orthographic half-height that matches the current framing. */
+    public get orthoSize(): number { return this._orthoSize; }
+
+    /** The orthographic frustum's bounds, which the handles' scale reads. */
+    public get top(): number { return this._ortho.top; }
+    public get bottom(): number { return this._ortho.bottom; }
+
+    /**
+     * Aims the camera (three's own Object3D.lookAt, written out: there is no
+     * parent to compensate for). The optional `up` matters at the poles, where
+     * world +Y is parallel to the view and the roll is otherwise three's
+     * arbitrary choice — see the controller's {@link applyPose}. Overloads keep
+     * the `(x, y, z)` form three's own signature allows, so this stays a
+     * PerspectiveCamera for every three API that takes one.
+     */
+    public override lookAt(target: THREE.Vector3, up?: THREE.Vector3): void;
+    public override lookAt(x: number, y: number, z: number, up?: THREE.Vector3): void;
+    public override lookAt(target: THREE.Vector3, up?: THREE.Vector3): void;
+    public override lookAt(x: number, y: number, z: number, up?: THREE.Vector3): void;
+    public override lookAt(targetOrX: THREE.Vector3 | number, yOrUp?: THREE.Vector3 | number, z?: number, upMaybe?: THREE.Vector3): void;
+    public override lookAt(targetOrX: THREE.Vector3 | number, yOrUp?: THREE.Vector3 | number, z?: number, upMaybe?: THREE.Vector3): void {
+        const target = typeof targetOrX === 'number'
+            ? new THREE.Vector3(targetOrX, (yOrUp as number) ?? 0, z ?? 0)
+            : targetOrX;
+        const up = typeof yOrUp === 'number' ? upMaybe : yOrUp;
+        this.quaternion.setFromRotationMatrix(
+            new THREE.Matrix4().lookAt(this.position, target, up ?? WORLD_UP),
+        );
+    }
+
+    public setOrthographic(orthographic: boolean, orthoSize: number): void {
+        if (this.isOrthographicCamera === orthographic && this._orthoSize === orthoSize) return;
+        this._orthoSize = orthoSize;
+        (this as { isOrthographicCamera: boolean }).isOrthographicCamera = orthographic;
+        (this as { isPerspectiveCamera: boolean }).isPerspectiveCamera = !orthographic;
+        this._project();
+    }
+
+    public setAspect(aspect: number): void {
+        this.aspect = aspect;
+        this._project();
+    }
+
+    /** Rebuilds both frustums and adopts the active one's matrices. */
+    private _project(): void {
+        const h = this._orthoSize;
+        this._ortho.left = -h * this.aspect;
+        this._ortho.right = h * this.aspect;
+        this._ortho.top = h;
+        this._ortho.bottom = -h;
+        this._ortho.updateProjectionMatrix();
+        this.updateProjectionMatrix();
+        if (this.isOrthographicCamera) {
+            this.projectionMatrix.copy(this._ortho.projectionMatrix);
+            this.projectionMatrixInverse.copy(this._ortho.projectionMatrixInverse);
+        }
     }
 }
