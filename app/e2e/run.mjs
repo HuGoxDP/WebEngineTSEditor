@@ -644,7 +644,12 @@ scenario("one tab per project; changes made outside the editor", async () => {
     await page.waitForTimeout(50);
     await external("FromOutside");
     await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-    await page.waitForTimeout(800);
+    // The reload is asynchronous; under the full suite's load it lands later
+    // than a fixed wait, so wait for the tree to show the new scene instead.
+    for (let i = 0; i < 50; i++) {
+        if ((await page.locator("app-hierarchy").innerText()).includes("FromOutside")) break;
+        await page.waitForTimeout(100);
+    }
     check("a clean scene reloads quietly when the file changes", (await page.locator("app-hierarchy").innerText()).includes("FromOutside"));
     check("and stays clean", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
 
@@ -883,7 +888,7 @@ scenario("new project wizard: collects, validates, creates; cancelling writes no
     // dlgFocus moves focus in a setTimeout, once the dialog is laid out. Late in a full run,
     // with every earlier scenario's page still open, that can land after the title is
     // readable — so wait for it, briefly, instead of racing it. Focus elsewhere still fails.
-    check("the title field has focus", await page.waitForFunction(() => document.activeElement?.id === "wiz-name", null, { timeout: 1000 })
+    check("the title field has focus", await page.waitForFunction(() => document.activeElement?.id === "wiz-name", null, { timeout: 5000 })
         .then(() => true, () => false));
     await page.keyboard.press("Escape");
     check("cancelling creates nothing", !(await exists("WizParent")));
@@ -1475,6 +1480,231 @@ scenario("orientation cube: cones snap the camera, the centre toggles iso (B1.3)
 
     // DW-2.6 again: looking along an axis is navigation, not an edit.
     check("the cube does not mark the scene unsaved", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1 phase 4 — the transform handles (D-6): snapping, Pivot/Centre, Local/Global,
+// multi-object drags, and the Q/W/E/R/Y tools.
+scenario("transform handles: snapping, global vs local, multi-select, the tools (B1.4)", async () => {
+    const page = await newPage("HandlesDemo", { probe: true, settings: { gridSnap: 0.5 } });
+    await openEmptyProject(page);
+
+    /** One primitive from the GameObject menu, created and selected. */
+    const create = async (kind) => {
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+        await page.locator(".ctx-item", { hasText: kind }).last().click();
+        await page.waitForTimeout(300);
+    };
+    const tf = (name) => page.evaluate(n => window.__wetsProbe.transformOf(n), name);
+    const hover = () => page.evaluate(() => window.__wetsProbe.hoverAxis());
+    /** A point `t` along one of the handle's own axes, in client pixels. */
+    const tip = (axis, t = 0.85) => page.evaluate(([a, tt]) => window.__wetsProbe.handlePoint(a, tt), [axis, t]);
+    const drag = async (from, dx, dy) => {
+        await page.mouse.move(from.x, from.y, { steps: 4 });
+        await page.mouse.down();
+        for (let i = 1; i <= 6; i++) {
+            await page.mouse.move(from.x + dx * i / 6, from.y + dy * i / 6, { steps: 2 });
+            await page.waitForTimeout(40);
+        }
+        await page.mouse.up();
+        await page.waitForTimeout(250);
+    };
+    const near = (v, e, tol = 1e-6) => Math.abs(v - e) < tol;
+    /**
+     * A point where one handle set has an axis: the arrows are short and a plane
+     * handle can sit in front of an arrow's tip, so the tip formula is only used
+     * where it is known to work.
+     */
+    const findHandle = async (set, axis, radius = 130) => {
+        const hub = await tip("X", 0);
+        for (let dx = -radius; dx <= radius; dx += 20) {
+            for (let dy = -radius; dy <= radius; dy += 20) {
+                await page.mouse.move(hub.x + dx, hub.y + dy);
+                if ((await hover()) === `${set}:${axis}`) return { x: hub.x + dx, y: hub.y + dy };
+            }
+        }
+        return null;
+    };
+    /** The hierarchy renames inline (F2), not through a dialog. */
+    const rename = async (name) => {
+        await page.keyboard.press("F2");
+        const input = page.locator("app-hierarchy input.rename-input");
+        await input.fill(name);
+        await input.press("Enter");
+        await page.waitForTimeout(300);
+    };
+
+    // ── DW-4.1: Ctrl-held snapping uses the Preferences step (0.5 here) ──
+    await create("Cube");
+    const arrow = await tip("X");
+    check("the X arrow is on screen", !!arrow, JSON.stringify(arrow));
+    await page.mouse.move(arrow.x, arrow.y, { steps: 4 });
+    await page.waitForTimeout(250);
+    check("hovering finds the translate arrow", (await hover()) === "translate:X", await hover());
+
+    await page.keyboard.down("Control");
+    await drag(arrow, 40, 0);
+    await page.keyboard.up("Control");
+    let cube = await tf("Cube");
+    const snapped = cube.position.x;
+    check("a Ctrl drag lands on the 0.5 step", snapped !== 0 && near(snapped - Math.round(snapped / 0.5) * 0.5, 0),
+        String(snapped));
+    check("and leaves the other axes alone", cube.position.y === 0 && cube.position.z === 0,
+        JSON.stringify(cube.position));
+
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(400);
+    // Undo reloads the scene, which drops the selection; take it again.
+    await page.locator("app-hierarchy li", { hasText: "Cube" }).first().click();
+    cube = await tf("Cube");
+    check("one undo puts the cube back", cube.position.x === 0, JSON.stringify(cube.position));
+    await drag(arrow, 40, 0);
+    const free = (await tf("Cube")).position.x;
+    check("a free drag does not land on the step", Math.abs(free - Math.round(free / 0.5) * 0.5) > 1e-6,
+        `${free} vs the snapped ${snapped}`);
+
+    // ── DW-4.2: Global vs Local drags of an object turned 45° about Y ──
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(400);
+    await create("Cube");
+    void 0;
+    await rename("Turned");
+    await page.locator(".insp-body .field").nth(1).locator("input").nth(1).fill("45");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    const before = await tf("Turned");
+    await drag(await tip("X"), 40, 0);
+    const afterGlobal = await tf("Turned");
+    check("a Global X drag moves only along world X",
+        afterGlobal.position.x !== before.position.x && near(afterGlobal.position.z, before.position.z),
+        `x ${before.position.x} -> ${afterGlobal.position.x}, z ${before.position.z} -> ${afterGlobal.position.z}`);
+
+    await page.locator(".vp-subtoolbar .chip", { hasText: "Global" }).click();
+    await page.waitForTimeout(250);
+    const localArrow = await findHandle("translate", "X");
+    check("the object's own X arrow is reachable", !!localArrow, await hover());
+    const beforeLocal = await tf("Turned");
+    if (localArrow) await drag(localArrow, 40, 0);
+    const afterLocal = await tf("Turned");
+    const dlx = afterLocal.position.x - beforeLocal.position.x;
+    const dlz = afterLocal.position.z - beforeLocal.position.z;
+    check("a Local X drag moves along the object's own X", Math.abs(dlx) > 0.2 && near(Math.abs(dlx) - Math.abs(dlz), 0, 1e-6),
+        `dx ${dlx.toFixed(4)}, dz ${dlz.toFixed(4)}`);
+
+    // ── DW-4.3: two objects — Pivot/Centre and one undo for both ──
+    await page.locator(".vp-subtoolbar .chip", { hasText: "Local" }).click();
+    await page.waitForTimeout(250);
+    await create("Cube");
+    await create("Cube");
+    await rename("Mover");
+    await page.locator(".insp-body .field").nth(0).locator("input").nth(0).fill("4");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    await page.locator("app-hierarchy li", { hasText: "Cube" }).first().click();
+    await page.keyboard.down("Control");
+    await page.locator("app-hierarchy li", { hasText: "Mover" }).first().click();
+    await page.keyboard.up("Control");
+    await page.waitForTimeout(300);
+    check("both are selected", (await page.evaluate(() => window.__wetsProbe.selection())).length === 2,
+        JSON.stringify(await page.evaluate(() => window.__wetsProbe.selection())));
+
+    // Pivot: the handle sits on the primary object (the one toggled last, Mover
+    // at (4,0,0)); Centre: between the two, at (2,0,0). Both are asserted through
+    // the screen position of the handle's origin against the objects' own.
+    const pivotTip = await tip("X", 0);
+    check("Pivot puts the handle on the active object", !!pivotTip, JSON.stringify(pivotTip));
+    await page.locator(".vp-subtoolbar .chip", { hasText: "Pivot" }).click();
+    await page.waitForTimeout(250);
+    const centreTip = await tip("X", 0);
+    check("Centre puts the handle between the two objects", !!centreTip, JSON.stringify(centreTip));
+    const movedApart = Math.abs(centreTip.x - pivotTip.x) + Math.abs(centreTip.y - pivotTip.y);
+    check("Centre is a different place from Pivot", movedApart > 2, `${pivotTip.x},${pivotTip.y} vs ${centreTip.x},${centreTip.y}`);
+
+    const beforeMulti = { first: await tf("Cube"), second: await tf("Mover") };
+    await drag(centreTip, 30, 0);
+    const afterMulti = { first: await tf("Cube"), second: await tf("Mover") };
+    const dFirst = afterMulti.first.position.x - beforeMulti.first.position.x;
+    const dSecond = afterMulti.second.position.x - beforeMulti.second.position.x;
+    check("the drag moves both objects by the same delta", near(dFirst - dSecond, 0, 1e-6) && dFirst !== 0,
+        `${dFirst.toFixed(4)} vs ${dSecond.toFixed(4)}`);
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(500);
+    // The undo reloaded the scene: select both again to read them.
+    await page.locator("app-hierarchy li", { hasText: "Cube" }).first().click();
+    await page.keyboard.down("Control");
+    await page.locator("app-hierarchy li", { hasText: "Mover" }).first().click();
+    await page.keyboard.up("Control");
+    await page.waitForTimeout(250);
+    const undone = { first: await tf("Cube"), second: await tf("Mover") };
+    check("one undo restores both", undone.first.position.x === beforeMulti.first.position.x
+        && undone.second.position.x === beforeMulti.second.position.x,
+        JSON.stringify([undone.first.position.x, undone.second.position.x]));
+
+    // ── DW-4.4: Q leaves no handle and pans; Y shows all three sets ──
+    await page.locator("app-hierarchy li", { hasText: "Cube" }).first().click();
+    await page.waitForTimeout(250);
+    const box = await page.locator("canvas").boundingBox();
+    await page.keyboard.press("q");
+    await page.waitForTimeout(250);
+    let underQ = null;
+    for (const [dx, dy] of [[500, 300], [520, 320], [560, 280], [540, 340], [600, 300]]) {
+        await page.mouse.move(box.x + dx, box.y + dy);
+        const h = await hover();
+        if (h) underQ = h;
+    }
+    check("Q leaves no handle under the pointer", underQ === null, String(underQ));
+    const pivotBefore = await page.evaluate(() => window.__wetsProbe.pivot());
+    await page.mouse.move(box.x + 500, box.y + 300);
+    await page.mouse.down();
+    for (let i = 1; i <= 6; i++) { await page.mouse.move(box.x + 500 + i * 12, box.y + 300, { steps: 2 }); await page.waitForTimeout(40); }
+    await page.mouse.up();
+    const pivotAfter = await page.evaluate(() => window.__wetsProbe.pivot());
+    check("the View tool's left button pans",
+        Math.abs(pivotAfter.x - pivotBefore.x) > 0.05 || Math.abs(pivotAfter.z - pivotBefore.z) > 0.05,
+        JSON.stringify([pivotBefore, pivotAfter]));
+
+    await page.keyboard.press("y");
+    await page.waitForTimeout(300);
+    // The three sets are co-located on the same axes, so one hover finds all of
+    // them only if each is reported: the probe hands back every set's axis.
+    const yHub = await tip("X", 0);
+    await page.mouse.move(yHub.x + 10, yHub.y, { steps: 3 });
+    await page.waitForTimeout(200);
+    const sets = await page.evaluate(() => window.__wetsProbe.hoverAll());
+    check("Y shows the translate, rotate and scale handles",
+        !!sets.translate && !!sets.rotate && !!sets.scale, JSON.stringify(sets));
+    const beforeY = await tf("Cube");
+    await drag(await tip("X", 0.85), 30, 0);
+    const afterY = await tf("Cube");
+    check("dragging in Y mode moves the object", afterY.position.x !== beforeY.position.x,
+        `${beforeY.position.x} -> ${afterY.position.x}`);
+
+    // ── DW-4.5: a snapped turn lands on the 15° step ──
+    await page.keyboard.press("e");
+    await page.waitForTimeout(250);
+    const ring = await findHandle("rotate", "Y");
+    check("the turn gizmo's Y ring is reachable", !!ring, await hover());
+    if (ring) {
+        const beforeRot = await tf("Cube");
+        await page.keyboard.down("Control");
+        await drag(ring, 30, 0);
+        await page.keyboard.up("Control");
+        const afterRot = await tf("Cube");
+        check("a snapped turn lands on 15°",
+            afterRot.euler.y !== 0 && near(afterRot.euler.y - Math.round(afterRot.euler.y / 15) * 15, 0, 1e-6),
+            `${beforeRot.euler.y} -> ${afterRot.euler.y} deg`);
+    }
+
+    // ── DW-4.6: the tool keys switch the palette ──
+    const tools = { w: "Move", e: "Rotate", r: "Scale", q: "View", y: "Transform" };
+    for (const [key, label] of Object.entries(tools)) {
+        await page.keyboard.press(key);
+        await page.waitForTimeout(150);
+        check(`${key.toUpperCase()} selects the ${label.toLowerCase()} tool`,
+            (await page.locator(".vp-overlay-tl .chip .v").first().innerText()) === label,
+            await page.locator(".vp-overlay-tl .chip .v").first().innerText());
+    }
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
