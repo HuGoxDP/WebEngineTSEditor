@@ -117,8 +117,8 @@ origin-private file system, so both project stores are exercised in every run.
 - The ScenarioCreator build check (`npm run e2e:build`) is separate: it needs that repository
   beside this one and is not part of the suite.
 
-**Recorded count:** <COUNT> checks green (see `.claude-shared/code-foundations/<ID>/notes.md` for the
-run that produced it).
+**Recorded count:** 234 checks green (`.claude-shared/code-foundations/R1r/notes.md`; 215 on
+`origin/master` before the three R1r scenarios, so this task added 19).
 
 **Manual checks the suite cannot make** (owner's, recorded in `docs/integration-plan.md`):
 the real `showDirectoryPicker` on Edge with a real folder on disk; Firefox and Safari smoke —
