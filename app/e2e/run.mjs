@@ -744,6 +744,121 @@ scenario("a project in the browser's own store: create, reopen after a reload, m
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
+// No writer, no store (R1r, DW-2.2): `createWritable` is the write primitive, and
+// Safari below 26 has the directory without it. A project there would open
+// read-only — which is not a store — so the browser store must not be offered,
+// and nothing may be created on its behalf. The picker is still faked here (the
+// harness fakes it), so this is the shape every other browser gets: no location
+// step, the folder path unchanged.
+scenario("a browser with no createWritable is offered no browser store, and creates nothing in it", async () => {
+    const page = await newPage("NoWriterParent");
+    await page.addInitScript(() => {
+        Object.defineProperty(FileSystemFileHandle.prototype, "createWritable", {
+            value: undefined, configurable: true,
+        });
+    });
+    await page.goto(URL_, { waitUntil: "load" });
+    await page.waitForTimeout(300);
+
+    check("the editor still starts", await page.locator(".start-card").isVisible());
+    await page.getByText("Create project").click();
+    await page.locator("#wiz-name").fill("DirOnly");
+    await page.locator("#wiz-id").fill("dir-only");
+    await page.locator(".dlg-btn.primary").click();               // step 1 → 2
+    await page.locator(".dlg-btn.primary").click();               // step 2 → 3
+    check("no location step is offered", (await page.locator(".wiz-field").count()) === 0);
+    check("and no browser-store card", (await page.locator(".wiz-card").count()) === 0);
+    await page.locator(".dlg-btn.primary").click();                 // create
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(900);
+
+    check("the folder project opens anyway", (await page.locator(".project-tag").innerText()).includes("DirOnly"));
+    check("nothing was created in the browser store", (await opfsEntries(page, "projects").catch(() => [])) .length === 0);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(500);
+    check("and saving on the disk path still works", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// The same, with no store at all (R1r, DW-2.2): a browser with neither the folder
+// picker nor a writer must say so on its start screen, and no wizard may open.
+scenario("a browser with neither store says unsupported, and opens no wizard", async () => {
+    const page = await newPage("NoStoreAtAll");
+    await page.addInitScript(() => {
+        Object.defineProperty(FileSystemFileHandle.prototype, "createWritable", {
+            value: undefined, configurable: true,
+        });
+        delete window.showDirectoryPicker;
+    });
+    await page.goto(URL_, { waitUntil: "load" });
+    await page.waitForTimeout(300);
+
+    check("the unsupported notice is shown",
+        (await page.locator(".start-unsupported").innerText()).includes("Project folders are not available"));
+    check("and the create button is not there", (await page.getByText("Create project").count()) === 0);
+    check("no project folder was made", (await opfsEntries(page).catch(() => [])) .length === 0);
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// A full origin (R1r, DW-2.3): the quota failure must reach the user as the named
+// error and must not mark the in-memory edit saved. The write path is
+// `ProjectService.write` → `handle.createWritable()`, so the scene file's writer
+// is made to reject — the real path the user's Save goes through.
+scenario("a quota exceeded on save reaches the user and keeps the edit unsaved", async () => {
+    const page = await newPage("QuotaParent");
+
+    // A browser-store project, created normally, with the scene already saved.
+    await page.getByText("Create project").click();
+    await page.locator("#wiz-name").fill("Квота");
+    await page.locator("#wiz-id").fill("quota-demo");
+    await page.locator(".dlg-btn.primary").click();               // step 1 → 2
+    await page.locator(".dlg-btn.primary").click();               // step 2 → 3
+    await page.getByText("The browser’s own storage").click();
+    await page.locator(".dlg-btn.primary").click();                 // create
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(900);
+    check("the project is open", (await page.locator(".project-tag").innerText()).includes("Квота"));
+
+    const projects = await opfsEntries(page, "projects");
+    const id = projects.find(n => n.endsWith("/"))?.slice(0, -1);
+    const scenePath = `projects/${id}/assets/scenes/main.scene.json`;
+    const before = await opfsRead(page, scenePath);
+    check("the starting scene is on disk", !!before);
+
+    // One edit, then the origin fills up.
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(300);
+    check("the edit is unsaved", (await page.locator(".statusbar .accent").first().innerText()) === "Unsaved");
+
+    await page.evaluate(() => {
+        const real = FileSystemFileHandle.prototype.createWritable;
+        Object.defineProperty(FileSystemFileHandle.prototype, "createWritable", {
+            configurable: true,
+            value: async function (...args) {
+                if (this.name === "main.scene.json") {
+                    const err = new Error("The storage quota has been exceeded.");
+                    err.name = "QuotaExceededError";
+                    throw err;
+                }
+                return real.apply(this, args);
+            },
+        });
+    });
+
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(700);
+    const dialog = await page.locator(".dlg").innerText().catch(() => "no dialog");
+    check("the save failure names the error", dialog.includes("Could not save") && dialog.includes("quota"), dialog);
+    await dialogButton(page, "OK").click();
+    await page.waitForTimeout(300);
+
+    check("the edit is still unsaved", (await page.locator(".statusbar .accent").first().innerText()) === "Unsaved");
+    check("and the unsaved mark is still there", (await page.locator(".project-tag .dot.unsaved").count()) === 1);
+    check("the scene file was not replaced", (await opfsRead(page, scenePath)) === before);
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
 scenario("new project wizard: collects, validates, creates; cancelling writes nothing", async () => {
     const page = await newPage("WizParent");
     const exists = name => page.evaluate(async n => {
