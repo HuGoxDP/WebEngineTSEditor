@@ -110,6 +110,14 @@ const SHORTCUTS: ReadonlyArray<{ label: MessageKey; keys: string }> = [
                         </div>
                         <p class="prefs-hint">{{ 'prefs.gridSnapHint' | t }}</p>
 
+                        <div class="prefs-row">
+                            <label for="prefs-fly">{{ 'prefs.flySpeed' | t }}</label>
+                            <input id="prefs-fly" class="num" type="number" min="0.1" step="0.5"
+                                [value]="settings.flySpeed()"
+                                (change)="onFly($any($event.target).value)">
+                        </div>
+                        <p class="prefs-hint">{{ 'prefs.flySpeedHint' | t }}</p>
+
                         <div class="prefs-row check">
                             <input id="prefs-autosave" type="checkbox" [checked]="settings.autosave()"
                                 (change)="settings.autosave.set($any($event.target).checked)">
@@ -220,5 +228,11 @@ export class SettingsDialogComponent {
     public onSnap(raw: string): void {
         const value = Number(raw);
         if (Number.isFinite(value) && value >= 0) this.settings.gridSnap.set(value);
+    }
+
+    /** The fly speed is a strictly positive rate; anything else keeps the old one. */
+    public onFly(raw: string): void {
+        const value = Number(raw);
+        if (Number.isFinite(value) && value > 0) this.settings.flySpeed.set(value);
     }
 }

@@ -229,6 +229,8 @@ export const uk: Record<MessageKey, string> = {
     'prefs.densityComfy': 'Зручна',
     'prefs.gridSnap': 'Крок прив’язки',
     'prefs.gridSnapHint': 'На скільки одиниць сцени зсувається об’єкт гізмо. 0 вимикає прив’язку.',
+    'prefs.flySpeed': 'Швидкість польоту',
+    'prefs.flySpeedHint': 'Одиниць за секунду під час польоту сценою на ПКМ і WASD/QE.',
     'prefs.autosave': 'Автозбереження',
     'prefs.autosaveHint': 'Зберігати резервну копію сцени, поки в ній є незбережені зміни.',
     'prefs.confirmDelete': 'Питати перед видаленням файлів',

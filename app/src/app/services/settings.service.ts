@@ -13,6 +13,8 @@ export interface Settings {
     density: Density;
     /** Gizmo snap step in world units. `0` turns snapping off. */
     gridSnap: number;
+    /** Scene-view fly speed in world units per second (D-4). */
+    flySpeed: number;
     /** Writes `.editor/autosave.scene.json` while a scene has unsaved changes. */
     autosave: boolean;
     /** Asks before deleting objects and files. */
@@ -29,6 +31,7 @@ function defaults(): Settings {
         theme: 'dark',
         density: 'compact',
         gridSnap: 1,
+        flySpeed: 5,
         autosave: true,
         confirmDelete: true,
     };
@@ -50,6 +53,7 @@ export class SettingsService {
     public readonly theme         = signal<Theme>('dark');
     public readonly density       = signal<Density>('compact');
     public readonly gridSnap      = signal(1);
+    public readonly flySpeed      = signal(5);
     public readonly autosave      = signal(true);
     public readonly confirmDelete = signal(true);
 
@@ -74,6 +78,7 @@ export class SettingsService {
             theme: this.theme(),
             density: this.density(),
             gridSnap: this.gridSnap(),
+            flySpeed: this.flySpeed(),
             autosave: this.autosave(),
             confirmDelete: this.confirmDelete(),
         };
@@ -88,6 +93,7 @@ export class SettingsService {
         this.theme.set(s.theme);
         this.density.set(s.density);
         this.gridSnap.set(s.gridSnap);
+        this.flySpeed.set(s.flySpeed);
         this.autosave.set(s.autosave);
         this.confirmDelete.set(s.confirmDelete);
     }
@@ -102,6 +108,7 @@ export class SettingsService {
             if (p.theme === 'dark' || p.theme === 'light') out.theme = p.theme;
             if (p.density === 'compact' || p.density === 'comfy') out.density = p.density;
             if (typeof p.gridSnap === 'number' && p.gridSnap >= 0 && Number.isFinite(p.gridSnap)) out.gridSnap = p.gridSnap;
+            if (typeof p.flySpeed === 'number' && p.flySpeed > 0 && Number.isFinite(p.flySpeed)) out.flySpeed = p.flySpeed;
             if (typeof p.autosave === 'boolean') out.autosave = p.autosave;
             if (typeof p.confirmDelete === 'boolean') out.confirmDelete = p.confirmDelete;
         } catch {
