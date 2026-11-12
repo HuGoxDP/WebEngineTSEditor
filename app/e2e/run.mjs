@@ -234,6 +234,63 @@ const sceneWith = name => JSON.stringify({
 const scenarios = [];
 const scenario = (name, fn) => scenarios.push([name, fn]);
 
+// C4 phase 1: the Code tab. A script file is a file like any other — it opens
+// in the Code tab, types, saves back through the project store, and an edit of
+// a source never marks the scene unsaved (only its own file). Monaco's own
+// editor is what the tab renders, and the platform CSP allows its blob workers
+// (`worker-src 'self' blob:`).
+scenario("a script file opens in the Code tab, edits, and saves", async () => {
+  const page = await newPage("CodeParent");
+  await openEmptyProject(page);
+  await page.waitForTimeout(600);
+
+  // The layout already ships one script; open it from the Project panel —
+  // the panel shows the project root first, so `scripts` is opened like a
+  // folder click in the other scenarios.
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(600);
+  const script = page.locator(".proj .asset", { hasText: "Scenario.ts" }).first();
+  check("a script file is listed in the project panel", (await script.count()) === 1);
+  await script.dblclick();
+  await page.waitForTimeout(1500);
+
+  check("the Code tab opened", (await page.locator(".pane-tab", { hasText: "Code" }).first().getAttribute("class")).includes("active"));
+  check("the file's text is in the editor",
+    (await page.evaluate(() => document.querySelector(".code-name")?.textContent ?? "")) .includes("Scenario.ts"));
+  check("the scene is not marked unsaved by opening a source",
+    (await page.locator(".statusbar .accent").first().innerText()) !== "Unsaved");
+
+  // Type into Monaco and save. Monaco's textarea is the real input.
+  const before = await readDisk(page, "CodeParent", "scripts/Scenario.ts");
+  check("the file on disk is the one opened", before.includes("Scenario extends ScenarioBehaviour"), before.slice(0, 80));
+  // Monaco's own textarea takes the keys; focusing it is enough, and no click
+  // has to be stable for it.
+  await page.locator(".monaco-editor").waitFor({ timeout: 15000 });
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.type("\n// C4 phase 1: the Code tab saves\n");
+  await page.waitForTimeout(400);
+  check("editing marks the file unsaved", (await page.locator(".pane-tab .dot.unsaved").count()) > 0);
+  check("and the scene still is not", (await page.locator(".statusbar .accent").first().innerText()) !== "Unsaved");
+
+  await page.locator(".pane-btn.primary").click();                       // Save
+  await page.waitForTimeout(700);
+  check("saving clears the file's mark", (await page.locator(".pane-tab .dot.unsaved").count()) === 0);
+
+  const after = await readDisk(page, "CodeParent", "scripts/Scenario.ts");
+  check("the file on disk holds the edit", after.includes("C4 phase 1: the Code tab saves"), after.slice(0, 120));
+
+  // A reload reopens the project, and the file is what was saved.
+  await page.reload({ waitUntil: "load" });
+  await page.locator(".recent").first().click();
+  await page.locator(".work").waitFor();
+  await page.waitForTimeout(600);
+  check("the edited file is still there after a reload",
+    (await readDisk(page, "CodeParent", "scripts/Scenario.ts")).includes("C4 phase 1: the Code tab saves"));
+
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+  await shot(page, "e2e-code-tab");
+});
+
 scenario("start screen: no workspace without a project; open, close, recent, forget", async () => {
     const page = await newPage("LifeDemo");
     check("no workspace before a project", (await page.locator(".work").count()) === 0);

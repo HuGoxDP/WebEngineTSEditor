@@ -103,8 +103,15 @@ export const en = {
     'panel.inspector': 'Inspector',
     'panel.project': 'Project',
     'panel.console': 'Console',
+    'panel.code': 'Code',
     'panel.lock': 'Lock',
     'panel.menu': 'Menu',
+
+    // ── code tab ─────────────────────────────────────────────────────
+    'code.empty': 'No script open',
+    'code.emptyHint': 'Double-click a .ts or .js file in the Project panel to edit it here.',
+    'code.save': 'Save',
+    'code.unsaved': 'This file has unsaved changes',
 
     // ── viewport ────────────────────────────────────────────────────
     'vp.pivot': 'Pivot',

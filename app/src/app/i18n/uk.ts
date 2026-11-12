@@ -98,8 +98,15 @@ export const uk: Record<MessageKey, string> = {
     'panel.inspector': 'Інспектор',
     'panel.project': 'Проєкт',
     'panel.console': 'Консоль',
+    'panel.code': 'Код',
     'panel.lock': 'Заблокувати',
     'panel.menu': 'Меню',
+
+    // ── code tab ─────────────────────────────────────────────────────
+    'code.empty': 'Жодного скрипта не відкрито',
+    'code.emptyHint': 'Двічі клацніть файл .ts або .js у панелі «Проєкт», щоб редагувати його тут.',
+    'code.save': 'Зберегти',
+    'code.unsaved': 'У цьому файлі є незбережені зміни',
 
     // ── viewport ────────────────────────────────────────────────────
     'vp.pivot': 'Опорна точка',

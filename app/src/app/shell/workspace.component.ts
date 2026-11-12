@@ -22,6 +22,9 @@ import { HierarchyComponent } from '../panels/hierarchy/hierarchy.component';
 import { InspectorComponent } from '../panels/inspector/inspector.component';
 import { ProjectComponent } from '../panels/project/project.component';
 import { ConsoleComponent } from '../panels/console/console.component';
+import type { ProjectEntry } from '../services/project.service';
+import { CodeComponent } from '../panels/code/code.component';
+import { CodeEditorService } from '../services/code-editor.service';
 import { IconComponent } from '../icon.component';
 import { TPipe } from '../i18n/t.pipe';
 import { ToolbarComponent } from './toolbar.component';
@@ -40,7 +43,7 @@ import { StatusbarComponent } from './statusbar.component';
     selector: 'app-workspace',
     standalone: true,
     imports: [
-        HierarchyComponent, InspectorComponent, ProjectComponent, ConsoleComponent,
+        HierarchyComponent, InspectorComponent, ProjectComponent, ConsoleComponent, CodeComponent,
         IconComponent, ToolbarComponent, StatusbarComponent, TPipe,
     ],
     changeDetection: ChangeDetectionStrategy.OnPush,
@@ -191,6 +194,14 @@ import { StatusbarComponent } from './statusbar.component';
                         <span>{{ 'panel.project' | t }}</span>
                     </div>
                     <div class="pane-tab"
+                        [class.active]="bottomTab() === 'code'"
+                        (click)="bottomTab.set('code')"
+                    >
+                        <wets-icon name="file"></wets-icon>
+                        <span>{{ 'panel.code' | t }}</span>
+                        @if (code.dirty()) { <span class="dot unsaved"></span> }
+                    </div>
+                    <div class="pane-tab"
                         [class.active]="bottomTab() === 'console'"
                         (click)="bottomTab.set('console')"
                     >
@@ -207,7 +218,11 @@ import { StatusbarComponent } from './statusbar.component';
                 </div>
                 <div class="pane-body">
                     @if (bottomTab() === 'project') {
-                        <app-project (openEntry)="cmd.openProjectEntry($event)"></app-project>
+                        <app-project (openEntry)="onOpenEntry($event)"></app-project>
+                    } @else if (bottomTab() === 'code') {
+                        @for (f of [code.file()]; track f?.path ?? 'none') {
+                            <app-code></app-code>
+                        }
                     } @else {
                         <app-console></app-console>
                     }
@@ -235,12 +250,30 @@ export class WorkspaceComponent implements AfterViewInit, OnDestroy {
     public readonly settings = inject(SettingsService);
     public readonly cmd = inject(CommandsService);
     public readonly consoleService = inject(ConsoleService);
+    public readonly code = inject(CodeEditorService);
     private readonly _shortcuts = inject(ShortcutsService);
     private readonly _history = inject(HistoryService);
     private readonly _selection = inject(SelectionService);
 
     /** Active bottom pane tab. */
-    public readonly bottomTab = signal<'project' | 'console'>('project');
+    public readonly bottomTab = signal<'project' | 'code' | 'console'>('project');
+
+    /**
+     * A file double-clicked in the Project panel. A scene opens through the
+     * command; a script goes to the Code tab, whose dirty guard is the file's
+     * own — editing a source never unsaves a scene, and the scene's "discard
+     * changes?" question would be the wrong one to ask.
+     */
+    public async onOpenEntry(entry: ProjectEntry): Promise<void> {
+        if (entry.kind === 'script') {
+            // The file is read first and the tab shown after, so the panel is
+            // created with its file already open — the editor mounts once,
+            // in ngAfterViewInit, instead of racing the tab switch.
+            if (await this.code.open(entry.path)) this.bottomTab.set('code');
+            return;
+        }
+        await this.cmd.openProjectEntry(entry);
+    }
 
     /** Active splitter while dragging — drives the dragging-state highlight. */
     public readonly dragAxis = signal<'left' | 'right' | 'bottom' | null>(null);
