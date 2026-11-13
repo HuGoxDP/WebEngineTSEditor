@@ -72,7 +72,15 @@ export class ScriptRuntimeService {
         const files = await this._scriptFiles();
         const compiled = new Map<string, string>();
         for (const file of files) {
-            const text = await this._project.readText(file);
+            // A file listed and then gone (the whole project cleared under the
+            // editor's feet, which the app supports) is a file the project no
+            // longer has, not an error to shout about.
+            let text: string;
+            try {
+                text = await this._project.readText(file);
+            } catch {
+                continue;
+            }
             const key = file.replace(/\.tsx?$/, '.js');
             const code = await this._compile(file, text);
             // A file that did not transpile is left out of the link entirely: the
