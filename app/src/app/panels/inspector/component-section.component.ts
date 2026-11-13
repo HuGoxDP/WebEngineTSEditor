@@ -11,6 +11,7 @@ import {
     FieldMeta,
     FieldType,
     GameObject,
+    MissingComponent,
     SceneManager,
     TypeRegistry,
     Vector2,
@@ -47,7 +48,12 @@ import { TPipe } from '../../i18n/t.pipe';
                 <span class="ico">
                     <wets-icon [name]="iconName"></wets-icon>
                 </span>
-                <span class="title">{{ typeName }}</span>
+                <span class="title" [class.missing]="isMissing()">{{ typeName }}</span>
+                @if (isMissing()) {
+                    <span class="missing-tag" [title]="'comp.missingHint' | t">
+                        {{ 'comp.missingTag' | t }}
+                    </span>
+                }
                 <div class="actions" (click)="$event.stopPropagation()">
                     <span class="a-btn" [title]="'comp.reset' | t" (click)="onReset()">
                         <wets-icon name="reset"></wets-icon>
@@ -70,6 +76,17 @@ import { TPipe } from '../../i18n/t.pipe';
 
             @if (open()) {
                 <div class="comp-body">
+                    @if (isMissing()) {
+                        <p class="comp-missing">{{ 'comp.missingBody' | t }}</p>
+                        <table class="missing-fields">
+                            @for (entry of missingFields(); track entry.key) {
+                                <tr>
+                                    <th>{{ entry.key }}</th>
+                                    <td>{{ entry.text }}</td>
+                                </tr>
+                            }
+                        </table>
+                    }
                     @for (field of visibleFields(); track field.name) {
                         @if (field.header) {
                             <div class="comp-header-section">{{ field.header }}</div>
@@ -347,7 +364,32 @@ export class ComponentSectionComponent {
     }
 
     public get typeName(): string {
+        // A placeholder names the class the saved scene asked for, so the
+        // inspector says that name rather than the generic "Component" it used to.
+        if (this.isMissing()) {
+            const missing = this.component as unknown as MissingComponent;
+            return missing.originalType || 'Component';
+        }
         return TypeRegistry.getTypeName(this.component) ?? 'Component';
+    }
+
+    /** Whether this component is the engine's placeholder for a class it could not find. */
+    public isMissing(): boolean {
+        return this.component instanceof MissingComponent;
+    }
+
+    /**
+     * The placeholder's saved data, as rows — the fields the scene holds, which
+     * the engine writes back unchanged and so are read-only here: nothing can
+     * reinterpret a shape whose class is not loaded.
+     */
+    public missingFields(): { key: string; text: string }[] {
+        if (!this.isMissing()) return [];
+        const fields = (this.component as unknown as MissingComponent).originalFields ?? {};
+        return Object.keys(fields).map(key => ({
+            key,
+            text: typeof fields[key] === 'string' ? fields[key] as string : JSON.stringify(fields[key]),
+        }));
     }
 
     /** Picks an inspector icon name based on the component class. */

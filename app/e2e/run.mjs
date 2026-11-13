@@ -373,6 +373,133 @@ scenario("a component script loads, attaches to its object, and swaps on save", 
   await shot(page, "e2e-script-runtime");
 });
 
+// C4 phase 3: a script that does not compile never breaks the scene, says so in
+// the Console with the line, and its class stays loaded; a component whose class
+// is missing says that, with the data it kept.
+const BROKEN_ROTATOR = `import { ScriptableBehaviour, Serializable } from "WebEngineTS";
+
+@Serializable({ typeName: "Rotator" })
+export default class Rotator extends ScriptableBehaviour {
+    public speed = 1;
+
+    protected override update(): void {
+        this.transform.position.x += this.speed * Time.deltaTime)   // ) is one too many
+    }
+}
+`;
+const GOOD_ROTATOR = `import { ScriptableBehaviour, Serializable, SerializedField } from "WebEngineTS";
+
+@Serializable({ typeName: "Rotator" })
+export default class Rotator extends ScriptableBehaviour {
+    @SerializedField() public speed = 2;
+}
+`;
+
+scenario("a broken script keeps its class, points at its line, and the scene is intact", async () => {
+  const page = await newPage("BrokenParent");
+  await seed(page, "BrokenParent", {
+    "scenario.meta.json": JSON.stringify({ id: "broken", name: "BrokenParent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": "export {};\n",
+    "scripts/components/Rotator.ts": GOOD_ROTATOR,
+    "assets/scenes/main.scene.json": JSON.stringify({
+      name: "Main", version: 1,
+      roots: [{
+        name: "Spinner", active: true,
+        transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+        components: [{ type: "Rotator", fields: { speed: 4 } }],
+        children: [],
+      }],
+    }),
+  });
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(() => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false, null, { timeout: 30000 });
+  const sceneBefore = await readDisk(page, "BrokenParent", "assets/scenes/main.scene.json");
+
+  // Break the script through the editor, and save.
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: "Rotator.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(text => navigator.clipboard.writeText(text), BROKEN_ROTATOR);
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(600);
+  await page.locator(".pane-btn.primary").click();
+  await page.waitForTimeout(2500);
+
+  // The Console names the line, and the row is a jump target.
+  await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+  await page.waitForTimeout(400);
+  const consoleText = await page.locator(".cons-list").innerText();
+  check("the Console names the file and the line", /Rotator\.ts:\d+/.test(consoleText), consoleText.slice(0, 240));
+  check("and the row is clickable", (await page.locator(".log .src.jump").count()) > 0);
+
+  // The component survived the broken save: the class stays loaded, and the
+  // object keeps it and its saved value — select it again, as the author would.
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(500);
+  const body = () => page.locator(".insp-body").innerText();
+  check("the component is still there", (await body()).includes("Rotator"), (await body()).slice(0, 160));
+  check("with its saved value", (await page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value))).includes("4"));
+  check("the scene file is untouched", (await readDisk(page, "BrokenParent", "assets/scenes/main.scene.json")) === sceneBefore);
+
+  // Clicking the row opens the file at that line.
+  await page.locator(".log .src.jump").first().click();
+  await page.waitForTimeout(900);
+  check("the click opened the script", (await page.locator(".code-name").innerText()).includes("Rotator.ts"));
+  check("the file on disk is the broken one",
+    (await readDisk(page, "BrokenParent", "scripts/components/Rotator.ts")).includes("is one too many"));
+  await shot(page, "e2e-script-broken");
+});
+
+scenario("a component whose class is gone says Missing script and keeps its data", async () => {
+  const page = await newPage("MissingParent");
+  await seed(page, "MissingParent", {
+    "scenario.meta.json": JSON.stringify({ id: "missing", name: "MissingParent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": "export {};\n",
+    "assets/scenes/main.scene.json": JSON.stringify({
+      name: "Main", version: 1,
+      roots: [{
+        name: "Holder", active: true,
+        transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+        components: [{ type: "Rotator", fields: { speed: 7, name: "kept" } }],
+        children: [],
+      }],
+    }),
+  });
+
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(() => document.querySelector("app-hierarchy")?.innerText?.includes("Holder") ?? false, null, { timeout: 30000 });
+  await page.locator("app-hierarchy li", { hasText: "Holder" }).first().click();
+  await page.waitForTimeout(500);
+
+  const body = () => page.locator(".insp-body").innerText();
+  check("the title names the class the scene used", (await body()).includes("Rotator"), (await body()).slice(0, 200));
+  check("and it is marked as a missing script", (await body()).includes("Missing script"));
+  const rows = await page.locator(".missing-fields th, .missing-fields td").allInnerTexts();
+  check("the saved fields are shown read-only",
+    rows.join(" ").includes("speed") && rows.join(" ").includes("7"), rows.join(" | "));
+  // The Transform is hand-rolled and is not the script: only an app-component-section counts.
+  const editable = await page.locator("app-component-section .field input").count();
+  check("and nothing is editable", editable === 0, String(editable));
+
+  // Saving does not lose the data: the engine writes a placeholder back exactly
+  // as it read it, so the scene keeps the component and its fields.
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(900);
+  const after = await readDisk(page, "MissingParent", "assets/scenes/main.scene.json");
+  check("the saved scene keeps the component and its fields",
+    after.includes("Rotator") && after.includes("speed") && after.includes("kept"), after.slice(0, 240));
+  await shot(page, "e2e-missing-script");
+});
+
 // C4 phase 1: the Code tab. A script file is a file like any other — it opens
 // in the Code tab, types, saves back through the project store, and an edit of
 // a source never marks the scene unsaved (only its own file). Monaco's own

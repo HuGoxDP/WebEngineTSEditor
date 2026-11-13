@@ -191,6 +191,10 @@ export const en = {
     'insp.held': 'This object already has one — an object holds only one.',
 
     'comp.reset': 'Reset',
+    'comp.missingTag': 'Missing script',
+    'comp.missingHint': 'The class this scene was saved with is not loaded — its script is missing or does not compile.',
+    'comp.missingBody': 'The saved data is kept exactly as it was. Fix or add the script and it becomes a component again.',
+    'comp.missingKey': 'Saved field',
     'comp.menu': 'Component menu',
     'comp.pick': 'Pick',
     'comp.clear': 'Clear',
@@ -206,6 +210,7 @@ export const en = {
     'cons.clear': 'Clear',
     'cons.collapse': 'Collapse',
     'cons.empty': 'Console is empty.',
+    'cons.jumpHint': 'Open this file at that line',
 
     // ── project panel ───────────────────────────────────────────────
     'proj.unsupportedTitle': 'Project folders are not available in this browser',

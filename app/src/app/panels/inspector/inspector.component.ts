@@ -9,6 +9,7 @@ import { FormsModule } from '@angular/forms';
 import {
     type Component as EngineComponent,
     GameObject,
+    MissingComponent,
     Quaternion,
     TypeRegistry,
     Vector3,
@@ -237,7 +238,9 @@ export class InspectorComponent {
         if (!g) return [];
         this._selection.revision();
         const raw = (g as unknown as { _components: object[] })._components;
-        return raw.filter(c => TypeRegistry.getTypeName(c) !== null);
+        // A placeholder names a class the registry has no entry for, which is
+        // why it carries its original type name — it is shown, not filtered.
+        return raw.filter(c => c instanceof MissingComponent || TypeRegistry.getTypeName(c) !== null);
     });
 
     public onRename(name: string): void {

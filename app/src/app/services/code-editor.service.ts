@@ -116,9 +116,18 @@ export class CodeEditorService {
      */
     public readonly jumpTo = signal<{ path: string; line: number } | null>(null);
 
-    /** Opens `path` and asks the panel to reveal `line` once it is laid out. */
+    /** Bumped whenever a Console row asks for a file: the workspace shows the tab. */
+    public readonly showRequest = signal(0);
+
+    /**
+     * Opens `path` and asks the panel to reveal `line` once it is laid out.
+     *
+     * The line is kept in `jumpTo` until the panel's mount consumes it, so a
+     * click from the Console works whether or not the Code tab was open.
+     */
     public async reveal(path: string, line: number): Promise<void> {
         if (this.file()?.path !== path) await this.open(path);
         this.jumpTo.set({ path, line });
+        this.showRequest.update(n => n + 1);
     }
 }

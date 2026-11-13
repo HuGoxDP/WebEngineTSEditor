@@ -297,6 +297,13 @@ export class WorkspaceComponent implements AfterViewInit, OnDestroy {
     public readonly dragAxis = signal<'left' | 'right' | 'bottom' | null>(null);
 
     constructor() {
+        // A Console row clicked elsewhere asks for its file: the Code tab is
+        // shown, so the jump the author asked for is the one they see.
+        effect(() => {
+            this.code.showRequest();
+            if (this.code.file()) this.bottomTab.set('code');
+        });
+
         // End the current "edit session" whenever the selection changes, so the
         // next field edit starts a fresh undo entry.
         effect(() => {

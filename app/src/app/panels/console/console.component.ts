@@ -1,5 +1,6 @@
 import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
-import { ConsoleService } from '../../services/console.service';
+import { ConsoleService, type LogEntry } from '../../services/console.service';
+import { CodeEditorService } from '../../services/code-editor.service';
 import { IconComponent } from '../../icon.component';
 import { TPipe } from '../../i18n/t.pipe';
 
@@ -52,7 +53,12 @@ import { TPipe } from '../../i18n/t.pipe';
                                 <span class="rep">×{{ e.count }}</span>
                             }
                         </span>
-                        <span class="src">{{ e.source }}</span>
+                        @if (e.jump) {
+                            <button class="src jump" [title]="'cons.jumpHint' | t"
+                                (click)="jump(e)">{{ e.source }}</button>
+                        } @else {
+                            <span class="src">{{ e.source }}</span>
+                        }
                     </div>
                 } @empty {
                     <div class="cons-empty">{{ 'cons.empty' | t }}</div>
@@ -155,8 +161,17 @@ import { TPipe } from '../../i18n/t.pipe';
           font-size: 9px;
         }
         .log .src  { color: var(--fg-2); font-size: 10px; text-align: right; overflow: hidden; text-overflow: ellipsis; }
+        .log .src.jump { cursor: pointer; text-decoration: underline dotted; }
+        .log .src.jump:hover { color: var(--accent); }
     `],
 })
 export class ConsoleComponent {
     public readonly logs = inject(ConsoleService);
+
+    /** The file click: opens the script the row names, at its line. */
+    public readonly jump = (e: LogEntry): void => {
+        if (!e.jump) return;
+        void this._code.reveal(e.jump.path, e.jump.line);
+    };
+    private readonly _code = inject(CodeEditorService);
 }

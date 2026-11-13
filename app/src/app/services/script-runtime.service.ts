@@ -1,6 +1,10 @@
 import { Injectable, signal } from '@angular/core';
 import { ProjectService } from './project.service';
+import { ConsoleService } from './console.service';
+import { SelectionService } from './selection.service';
+import { SceneService } from './scene.service';
 import {
+    GameObject,
     SceneManager,
     SceneSerializer,
     TypeRegistry,
@@ -47,7 +51,12 @@ export class ScriptRuntimeService {
 
     private readonly _urls: string[] = [];
 
-    public constructor(private readonly _project: ProjectService) {}
+    public constructor(
+        private readonly _project: ProjectService,
+        private readonly _console: ConsoleService,
+        private readonly _selection: SelectionService,
+        private readonly _scene: SceneService,
+    ) {}
 
     /**
      * Compiles, links, imports and registers the project's scripts, then
@@ -65,7 +74,12 @@ export class ScriptRuntimeService {
         for (const file of files) {
             const text = await this._project.readText(file);
             const key = file.replace(/\.tsx?$/, '.js');
-            compiled.set(key, await this._compile(file, text));
+            const code = await this._compile(file, text);
+            // A file that did not transpile is left out of the link entirely: the
+            // class the project already loaded stays registered, so a broken edit
+            // costs a fresh module and not the component on the GameObject.
+            if (code.trim().length === 0) continue;
+            compiled.set(key, code);
         }
 
         const deps = new Map<string, Set<string>>();
@@ -120,7 +134,7 @@ export class ScriptRuntimeService {
         this.classNames.set(names.sort());
         this.notes.set(notes);
         console.info(`[Script] loaded ${compiled.size} module(s), classes: ${names.join(', ') || 'none'}; notes: ${notes.join(' / ') || 'none'}`);
-        this._rebuildScene();
+        await this._rebuildScene();
         return notes;
     }
 
@@ -181,12 +195,30 @@ export class ScriptRuntimeService {
             return out.code ?? text;
         } catch (err) {
             // A syntax error is a diagnostics problem, not a reason to refuse the
-            // load: the panel's model reports it, where the author can see it.
-            // The panel's model will report it; the load is not the place.
-            const n = text.split(String.fromCharCode(10)).length;
-            console.warn('[Script] compile ' + path + ' failed, ' + n + ' lines: ' + JSON.stringify(text.slice(0, 80)) + ' :: ' + String(err).slice(0, 120));
-            return text;
+            // load: Babel hands back a `loc`, the row is reported with it, and the
+            // module is skipped — the class the project already has stays loaded,
+            // so the scene does not lose its component.
+            this._reportDiagnostic(path, err);
+            return "";
         }
+    }
+
+    /**
+     * Reports a transpile failure as a Console row naming the file and the line.
+     *
+     * Babel's `loc` is on the thrown error (`Position { line, column, index }`);
+     * the message carries the same location as `…/file.ts: Unexpected token
+     * (3:6)`, which is what a human reads first, so the row shows that.
+     */
+    private _reportDiagnostic(path: string, err: unknown): void {
+        const loc = (err as { loc?: { line?: number } }).loc;
+        const line = typeof loc?.line === "number" ? loc.line : 1;
+        const detail = err instanceof Error ? err.message : String(err);
+        this._console.push({
+            level: 'error',
+            message: `[Script] ${path} could not be compiled: ${detail.split(String.fromCharCode(10))[0]}`,
+            jump: { path, line },
+        });
     }
 
     /** Registers or swaps the class, and reports the name it took. */
@@ -200,14 +232,23 @@ export class ScriptRuntimeService {
         return meta.typeName;
     }
 
-    /** Rebuilds the open scene so the freshly registered classes attach. */
+    /**
+     * Rebuilds the open scene so the freshly registered classes attach.
+     *
+     * Through {@link SceneService.loadFromJSON}, which is the editor's own
+     * "replace the world" operation: it clears, deserializes and refreshes the
+     * panels. Rebuilding by hand would leave the hierarchy holding destroyed
+     * objects — a click on such a row selects an object whose components are
+     * gone, which is exactly what the author must never see after a save.
+     */
     private _rebuildScene(): void {
         const scene = SceneManager.activeScene;
         const roots = scene.getRootGameObjects();
         if (roots.length === 0) return;
-        const saved = JSON.parse(JSON.stringify(SceneSerializer.serializeScene(scene)));
-        for (const root of roots) root.destroyImmediate();
-        SceneSerializer.deserializeScene(saved);
+
+        const saved = JSON.parse(JSON.stringify(SceneSerializer.serializeScene(scene))) as ReturnType<typeof SceneSerializer.serializeScene>;
+        this._scene.loadFromJSON(saved);
+        this._selection.clear();
     }
 }
 
