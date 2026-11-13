@@ -59,6 +59,12 @@ export interface WetsProbe {
     hoverAll(): Record<string, string | null>;
     /** An object's screen-space bounds, or null when it is behind the camera. */
     objectScreenRect(name: string): { left: number; top: number; right: number; bottom: number } | null;
+    /** How many gizmos of each kind the selection draws (D-11's read-back). */
+    gizmoCounts(): Record<string, number>;
+    /** How far one object's gizmo of a kind reaches, in engine units. */
+    gizmoExtent(name: string, kind: string): number | null;
+    /** The Gizmos menu's switches, as the menu left them. */
+    gizmoSettings(): { enabled: boolean; camera: boolean; lights: boolean; colliders: boolean; audio: boolean; iconSize: number };
     /**
      * Counts pixels by hue inside a client-pixel rectangle: the selection
      * outline's proof (D-9) is a count of orange pixels, not one sample.
@@ -121,6 +127,10 @@ export function installProbe(
         hoverAll?: () => Record<string, string | null>;
         /** An object's projected renderer bounds (D-10's rectangle target). */
         objectScreenRect?: (name: string) => { left: number; top: number; right: number; bottom: number } | null;
+        /** The component gizmos over the selection (D-11). */
+        gizmoCounts?: () => Record<string, number>;
+        gizmoExtent?: (name: string, kind: string) => number | null;
+        gizmoSettings?: () => { enabled: boolean; camera: boolean; lights: boolean; colliders: boolean; audio: boolean; iconSize: number };
         /** The handle's position and axis directions in engine space (D-6). */
         handlePoint?: (axis: 'X' | 'Y' | 'Z', t: number) => { x: number; y: number; z: number } | null;
     },
@@ -165,6 +175,9 @@ export function installProbe(
         hoverAxis: () => deps.hoverAxis?.() ?? null,
         hoverAll: () => deps.hoverAll?.() ?? {},
         objectScreenRect: (name) => deps.objectScreenRect?.(name) ?? null,
+        gizmoCounts: () => deps.gizmoCounts?.() ?? {},
+        gizmoExtent: (name, kind) => deps.gizmoExtent?.(name, kind) ?? null,
+        gizmoSettings: () => deps.gizmoSettings?.() ?? { enabled: true, camera: true, lights: true, colliders: true, audio: true, iconSize: 1 },
         pixelStats: (rect) => renderer.pixelStats(rect),
         transformOf: (name) => {
             for (const go of deps.selection.selectedSet()) {

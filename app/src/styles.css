@@ -776,6 +776,30 @@ body.resizing { cursor: inherit !important; user-select: none; }
    swallows a click. */
 /* The rectangle-select draft (D-10): an editor-owned div over the canvas, so it
    never enters the WebGL frame. */
+/* The Gizmos menu (D-11): opens under its chip, view state not scene data. */
+.gz-menu { position: relative; display: inline-flex; }
+.gz-panel {
+  position: absolute;
+  top: 100%; left: 0;
+  margin-top: 4px;
+  min-width: 168px;
+  background: var(--bg-1);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  padding: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  z-index: 6;
+  font-size: 11px;
+  color: var(--fg-1);
+}
+.gz-row { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 4px; cursor: pointer; }
+.gz-row:hover { background: var(--bg-2); }
+.gz-row input[type="checkbox"] { accent-color: var(--accent); }
+.gz-row.master { font-weight: 600; color: var(--fg-0); }
+.gz-sep { height: 1px; background: var(--line); margin: 3px 2px; }
+.gz-slider { flex: 1; accent-color: var(--accent); }
+.gz-val { min-width: 18px; text-align: right; color: var(--fg-2); font-variant-numeric: tabular-nums; }
 .vp-rect {
   position: absolute;
   display: none;

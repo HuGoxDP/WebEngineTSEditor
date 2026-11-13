@@ -2,6 +2,9 @@ import { EffectRef, Injectable, Injector, NgZone, effect, inject, signal } from 
 import * as THREE from 'three';
 import { SceneViewController } from './scene-view/scene-view-controller';
 import { OrientationGizmo } from './scene-view/orientation-gizmo';
+import { ComponentGizmos, type GizmoKind, type GizmoSettings,
+    loadGizmoSettings, saveGizmoSettings } from './scene-view/component-gizmos';
+import { GizmoIcons } from './scene-view/gizmo-icons';
 import { ScenePicker } from './scene-view/scene-picker';
 import { SelectionOutline } from './scene-view/selection-outline';
 import { TransformHandles, type HandleSpace, type PivotMode, type ToolMode } from './scene-view/transform-handles';
@@ -44,6 +47,10 @@ export class ViewportService {
     private _snapEffect: EffectRef | null = null;
     private _outline: SelectionOutline | null = null;
     private _picker: ScenePicker | null = null;
+    private _componentGizmos: ComponentGizmos | null = null;
+    private _icons: GizmoIcons | null = null;
+    /** The Gizmos menu's switches: view state, kept in the browser (D-11). */
+    public readonly gizmoSettings = signal<GizmoSettings>(loadGizmoSettings());
     /** The rectangle draft, in canvas pixels, while the left button drags. */
     private _rect: { x: number; y: number; endX: number; endY: number } | null = null;
     /** The rectangle's div, created on the first draft (D-10). */
@@ -104,6 +111,13 @@ export class ViewportService {
         // selection (D-10), the screen-space silhouette (D-9).
         this._picker = new ScenePicker(this._renderer);
         this._outline = new SelectionOutline(this._renderer);
+        // Component gizmos and their billboard icons (D-11): rebuilt per frame
+        // from the components' fields, drawn in the depth-tested and on-top
+        // layers respectively.
+        this._componentGizmos = new ComponentGizmos(this._renderer);
+        this._icons = new GizmoIcons(this._renderer);
+        this._icons.mount();
+        this._componentGizmos.setSettings(this.gizmoSettings());
 
         // ── Grid: depth-tested against the engine scene (D-2 step 3) ──
         const grid = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
@@ -173,6 +187,9 @@ export class ViewportService {
                 hoverAll: () => this.hoverAll,
                 handlePoint: (axis, t) => this.handlePoint(axis, t),
                 objectScreenRect: name => this._picker?.screenRect(name) ?? null,
+                gizmoCounts: () => this.gizmoCounts,
+                gizmoExtent: (name, kind) => this.gizmoExtent(name, kind),
+                gizmoSettings: () => this.gizmoSettings(),
             });
         }
     }
@@ -204,6 +221,10 @@ export class ViewportService {
         this._outline?.dispose();
         this._outline = null;
         this._picker = null;
+        this._componentGizmos?.dispose();
+        this._componentGizmos = null;
+        this._icons?.dispose();
+        this._icons = null;
         this._rectEl?.remove();
         this._rectEl = null;
         this._renderer.detach();
@@ -340,8 +361,10 @@ export class ViewportService {
         if (!this._handles?.dragging && this._selection.revision() !== this._handlesRevision) this._reseatHandles();
         this._handles?.dropDestroyed(() => this._reseatHandles());
 
-        // Nothing to do per frame for the outline: its post-pass copies the
-        // world matrices itself, and the rectangle div is painted on the move.
+        // Component gizmos: rebuilt from the components' fields each frame
+        // (D-11), and the icons follow the same objects.
+        this._componentGizmos?.update();
+        this._placeIcons();
 
         // The orientation cube, drawn after the frame in its own corner viewport.
         const ori = this._gizmoOri?.draw();
@@ -558,6 +581,69 @@ export class ViewportService {
     }
 
     /** @internal Walks the engine scene once and maps each Object3D to its GameObject. */
+    /** One Gizmos menu switch (D-11): stored for the next session too. */
+    public setGizmoSetting(key: 'enabled' | 'camera' | 'lights' | 'colliders' | 'audio', value: boolean): void {
+        const next = { ...this.gizmoSettings(), [key]: value };
+        this.gizmoSettings.set(next);
+        saveGizmoSettings(next);
+        this._componentGizmos?.setSettings(next);
+        this._icons?.setVisibleIf(next.enabled);
+    }
+
+    public setIconSize(size: number): void {
+        const next = { ...this.gizmoSettings(), iconSize: size };
+        this.gizmoSettings.set(next);
+        saveGizmoSettings(next);
+        if (this._icons) this._icons.size = size;
+    }
+
+    /** The gizmos one kind reached over the selection, for the probe (D-11). */
+    public get gizmoCounts(): Record<string, number> {
+        const out: Record<string, number> = {};
+        const gizmos = this._componentGizmos;
+        if (!gizmos) return out;
+        for (const go of this._selection.selectedSet()) {
+            for (const drawn of gizmos.drawnFor(go.transform._internalObject3D)) {
+                out[drawn.kind] = (out[drawn.kind] ?? 0) + 1;
+            }
+        }
+        return out;
+    }
+
+    /** How far one object's gizmo of a kind reaches, in engine units. */
+    public gizmoExtent(name: string, kind: GizmoKind | string): number | null {
+        const gizmos = this._componentGizmos;
+        if (!gizmos) return null;
+        for (const go of this._selection.selectedSet()) {
+            if (go.name !== name) continue;
+            const drawn = gizmos.drawnFor(go.transform._internalObject3D).find(d => d.kind === kind);
+            return drawn ? drawn.extent : null;
+        }
+        return null;
+    }
+
+    /**
+     * Places the billboard icons over the objects carrying the gizmos'
+     * components: one per object, just above it (D-11).
+     */
+    private _placeIcons(): void {
+        const icons = this._icons;
+        if (!icons) return;
+        const place: Record<string, { x: number; y: number; z: number }[]> = { camera: [], light: [], audio: [] };
+        for (const go of this._selection.selectedSet()) {
+            const position = go.transform.position;
+            for (const component of go.getAllComponents()) {
+                const name = component.constructor.name;
+                if (name === 'Camera') place.camera.push({ ...position });
+                else if (name.endsWith('Light')) place.light.push({ ...position });
+                else if (name === 'AudioSource') place.audio.push({ ...position });
+            }
+        }
+        icons.place('camera', place.camera);
+        icons.place('light', place.light);
+        icons.place('audio', place.audio);
+    }
+
     /** Applies a rectangle's selection (D-10: clear unless Shift/Ctrl). */
     private _rectSelect(rect: { left: number; top: number; right: number; bottom: number }): void {
         const picker = this._picker;
