@@ -1878,6 +1878,176 @@ scenario("selection: box, modifiers, and the orange outline (B1.5)", async () =>
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
+// B1 phase 6 — component gizmos and the Gizmos menu (B1.6, D-11).
+scenario("component gizmos: lights, camera and colliders, switched per type (B1.6)", async () => {
+    const page = await newPage("GizDemo", { probe: true });
+    await openEmptyProject(page);
+
+    /** One entry from the GameObject menu (submenus open on hover). */
+    const menu = async (item, sub) => {
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.waitForTimeout(150);
+        if (sub) {
+            await page.locator(".ctx-item", { hasText: sub }).first().hover();
+            await page.waitForTimeout(150);
+            await page.locator(".ctx-item", { hasText: item }).last().click();
+        } else {
+            await page.locator(".ctx-item", { hasText: item }).last().click();
+        }
+        await page.waitForTimeout(400);
+    };
+    // A previous scenario can leave the Gizmos menu open, which would swallow
+    // every later menu-bar click; close it before anything else.
+    await page.keyboard.press("Escape");
+    const counts = () => page.evaluate(() => window.__wetsProbe.gizmoCounts());
+    const extent = (name, kind) => page.evaluate(([n, k]) => window.__wetsProbe.gizmoExtent(n, k), [name, kind]);
+    const settings = () => page.evaluate(() => window.__wetsProbe.gizmoSettings());
+    const row = (label) => page.locator(".gz-row", { hasText: label }).locator("input");
+
+    // The template's two objects: a camera and a directional light.
+    await menu("Camera");
+    await menu("Directional Light", "Light");
+    await page.locator("app-hierarchy li .label", { hasText: "Camera" }).first().click();
+    await page.waitForTimeout(300);
+
+    // ── DW-6.1: the menu's switches, and that they survive a reload ──
+    let c = await counts();
+    check("the camera draws a frustum", c.cameraFrustum === 1, JSON.stringify(c));
+    await page.keyboard.down("Control");
+    await page.locator("app-hierarchy li .label", { hasText: "Directional Light" }).first().click();
+    await page.keyboard.up("Control");
+    await page.waitForTimeout(300);
+    c = await counts();
+    check("the light draws its rays", c.cameraFrustum === 1 && c.directionalLight === 1, JSON.stringify(c));
+
+    /**
+     * Turns a kind off and waits until the scene agrees, not just the DOM: a
+     * box that is already off is left alone (unchecking it again would time out
+     * waiting for a state that never changes).
+     */
+    /** The panel's rows are only reachable while it is open. */
+    const ensureOpen = async () => {
+        if ((await page.locator(".gz-panel").count()) === 0) {
+            await page.locator(".gz-menu .chip").click();
+            await page.waitForTimeout(250);
+        }
+    };
+    const turnOff = async (label, key) => {
+        await ensureOpen();
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (await row(label).isChecked()) await row(label).uncheck();
+            await page.waitForTimeout(400);
+            if ((await counts())[key] === undefined) return;
+        }
+    };
+    await turnOff("Camera", "cameraFrustum");
+    c = await counts();
+    check("unchecking Camera hides the frustum", c.cameraFrustum === undefined && c.directionalLight === 1,
+        JSON.stringify(c));
+    check("the light is still drawn", c.directionalLight === 1, JSON.stringify(c));
+
+    await turnOff("Lights", "directionalLight");
+    check("unchecking Lights hides the light too", (await counts()).directionalLight === undefined,
+        JSON.stringify(await counts()));
+
+    await ensureOpen();
+    await row("Lights").check();
+    await row("Camera").check();
+    await page.waitForTimeout(300);
+
+    // DW-6.4: gizmos are editor-owned, so the scene JSON cannot carry them.
+    /** The scene text, once the editor has written it (a null stays null). */
+    const sceneText = async () => {
+        for (let i = 0; i < 30; i++) {
+            const text = await readDisk(page, "GizDemo", "assets/scenes/main.scene.json");
+            if (text !== null && text.length > 0) return text;
+            await page.waitForTimeout(100);
+        }
+        return null;
+    };
+    await menu("Cube", "3D Object");
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    const withGizmos = JSON.parse((await sceneText()) ?? "null");
+    await page.locator(".gz-row.master input").uncheck();
+    await page.waitForTimeout(400);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    const withoutGizmos = JSON.parse((await sceneText()) ?? "null");
+    check("the gizmo lines never reach the scene file",
+        JSON.stringify(withGizmos) === JSON.stringify(withoutGizmos),
+        `${JSON.stringify(withGizmos).length} vs ${JSON.stringify(withoutGizmos).length} bytes`);
+    await page.locator(".gz-row.master input").check();
+    await page.waitForTimeout(300);
+
+    /** Closes the Gizmos menu so a menu-bar click reaches the menu. */
+    const closeMenu = async () => {
+        if ((await page.locator(".gz-panel").count()) > 0) {
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(200);
+        }
+    };
+
+    // ── DW-6.2: a cube's collider wireframe and the range that follows ──
+    await closeMenu();
+    c = await counts();
+    check("a cube's collider draws one wireframe", c.boxCollider === 1, JSON.stringify(c));
+    check("its wireframe spans the cube", Math.abs((await extent("Cube", "boxCollider")) - Math.sqrt(3) / 2) < 1e-3,
+        String(await extent("Cube", "boxCollider")));
+
+    await menu("Point Light", "Light");
+    await page.locator("app-hierarchy li .label", { hasText: "Point Light" }).first().click();
+    await page.waitForTimeout(300);
+    const before = await extent("Point Light", "pointLight");
+    check("the point light's circles are its range", Math.abs(before - 10) < 1e-3, String(before));
+    await page.locator(".insp-body .field", { hasText: "Range" }).locator("input").first().fill("4");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    const after = await extent("Point Light", "pointLight");
+    check("the circles follow the range edited in the inspector", Math.abs(after - 4) < 1e-3,
+        `${before} -> ${after}`);
+
+    // ── DW-6.1 again: the menu's state survives a reload ──
+    await ensureOpen();
+    await page.waitForTimeout(200);
+    await page.locator(".gz-row.master input").uncheck();
+    await page.waitForTimeout(500);
+    const everythingOff = await counts();
+    check("the master switch hides everything", Object.keys(everythingOff).length === 0,
+        JSON.stringify(everythingOff));
+    await page.reload({ waitUntil: "load" });
+    await page.locator(".recent").first().click();
+    await page.locator(".work").waitFor({ state: "attached", timeout: 90000 });
+    await page.waitForTimeout(600);
+    const stored = await settings();
+    check("the Gizmos menu's switches survive a reload",
+        stored.enabled === false && stored.camera === true && stored.lights === true
+        && stored.colliders === true && stored.audio === true,
+        JSON.stringify(stored));
+
+    /** Opens the menu if it is closed, so a row is always reachable. */
+    const openMenu = async () => {
+        if ((await page.locator(".gz-panel").count()) === 0) {
+            await page.locator(".gz-menu .chip").click();
+            await page.waitForTimeout(250);
+        }
+    };
+
+    // ── DW-6.3: the screenshots for the report ── (the reload closed the menu)
+    await openMenu();
+    await page.locator(".gz-row.master input").check();
+    await page.locator(".gz-row", { hasText: "Camera" }).locator("input").check();
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    await shot(page, "b1-gizmos-on");
+    await openMenu();
+    await page.locator(".gz-row.master input").uncheck();
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+    await shot(page, "b1-gizmos-off");
+
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
 // ═══ Run ═══
 const only = process.env.ONLY;
 for (const [name, fn] of scenarios) {
