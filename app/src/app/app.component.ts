@@ -38,6 +38,16 @@ export class AppComponent {
     public readonly state = inject(AppStateService);
     private readonly _cmd = inject(CommandsService);
 
+    constructor() {
+        // The transpiler is a chunk nothing else needs until a project is opened,
+        // and it is the largest one there is. Fetching it while the start screen
+        // is still up means the first project opens without waiting on it.
+        void import('@babel/standalone').catch(() => {
+            // A failed warm-up costs nothing: the runtime loads it on demand and
+            // reports a failure through the Console, as it already does.
+        });
+    }
+
     /**
      * Preferences are reachable from every screen and while typing, so this
      * listens here rather than with the workspace shortcuts, which stand down

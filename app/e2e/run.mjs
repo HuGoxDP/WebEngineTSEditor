@@ -500,6 +500,213 @@ scenario("a component whose class is gone says Missing script and keeps its data
   await shot(page, "e2e-missing-script");
 });
 
+// C4r4, F1+F2: every form of the engine import resolves. The clause-level
+// rewrite this replaces spanned statements — a sibling import first, or a
+// comment mentioning the word `import`, turned the engine's import into
+// `from undefined`, which is a SyntaxError, so the module never loaded and the
+// component showed as missing; a default import read an undefined binding, and
+// `export *`, `export { X } from` and a dynamic `import()` never bound at all.
+// The rewrite is now the engine's own token regex pointed at one shim module,
+// so the browser resolves each form. One marker per form is read at module
+// evaluation: a broken form shows as a false, or as a class that never
+// registers.
+const IMPORT_SIBLING = `export class Stats { public value = 42; }
+`;
+const IMPORT_STAR = `export * from "WebEngineTS";
+`;
+const IMPORT_REEXPORT = `export { ScriptableBehaviour as SB } from "WebEngineTS";
+`;
+const IMPORT_FORMS = `import { Stats } from "./sibling";
+// import order matters — a comment that mentions the word import
+import WebEngine, { Vector3 } from "WebEngineTS";
+import * as Engine from "WebEngineTS";
+import { SceneManager } from "./star";
+import { SB } from "./reexport";
+
+// Each entry is one import form, evaluated at module load: a form that does not
+// bind (or a syntax error the broken rewrite produced) shows up here, and the
+// class below never registers when the module itself fails.
+const dynamic = await import("WebEngineTS");
+const MARKERS = [
+    WebEngine !== undefined,                                     // default import
+    typeof Vector3 === "function",                                // named import
+    Engine !== undefined && Engine.GameObject !== undefined,      // namespace import
+    typeof Stats === "function",                                  // sibling import first
+    SceneManager !== undefined,                                   // export * via a module
+    typeof SB === "function",                                     // export { X } from
+    dynamic.GameObject !== undefined,                             // dynamic import()
+].join(",");
+
+@Serializable({ typeName: "Forms" })
+export default class Forms extends SB {
+    @SerializedField() public markers = MARKERS;
+}
+`;
+scenario("every form of the engine import resolves — sibling first, default, namespace, star, dynamic", async () => {
+  const page = await newPage("ImportForms", { probe: true });
+  const scene = {
+    name: "Main", version: 1,
+    roots: [{
+      name: "Form", active: true,
+      transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+      components: [{ type: "Forms", fields: {} }],
+      children: [],
+    }],
+  };
+  await seed(page, "ImportForms", {
+    "scenario.meta.json": JSON.stringify({ id: "forms", name: "ImportForms", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/sibling.ts": IMPORT_SIBLING,
+    "scripts/components/star.ts": IMPORT_STAR,
+    "scripts/components/reexport.ts": IMPORT_REEXPORT,
+    "scripts/components/Forms.ts": IMPORT_FORMS,
+    "assets/scenes/main.scene.json": JSON.stringify(scene),
+  });
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(
+    () => document.querySelector("app-hierarchy")?.innerText?.includes("Form") ?? false,
+    null, { timeout: 30000 },
+  );
+
+  // A module that failed to evaluate cannot register: the component would read
+  // "Missing script", exactly the old `from undefined` produced.
+  await page.locator("app-hierarchy li", { hasText: "Form" }).first().click();
+  await page.waitForTimeout(500);
+  const body = () => page.locator(".insp-body").innerText();
+  check("the class from the module that uses every form is attached",
+    (await body()).includes("Forms") && !(await body()).includes("Missing script"),
+    (await body()).slice(0, 200));
+  check("the class is in the registry", await page.evaluate(() => window.__wetsProbe.scriptClass("Forms") !== null));
+
+  // One marker per form, evaluated when the module ran.
+  const markers = await page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  const forms = (await markers.find(v => (v || "").includes(",")) ?? "").split(",");
+  check("the default import bound",
+    forms[0] === "true", JSON.stringify(forms));
+  check("a named import bound alongside it",
+    forms[1] === "true", JSON.stringify(forms));
+  check("the namespace import has the engine's exports",
+    forms[2] === "true", JSON.stringify(forms));
+  check("a sibling import before the engine's still made it in",
+    forms[3] === "true", JSON.stringify(forms));
+  check("a module that only does export * resolved",
+    forms[4] === "true", JSON.stringify(forms));
+  check("a module that re-exports a name resolved",
+    forms[5] === "true", JSON.stringify(forms));
+  check("a dynamic import() resolved",
+    forms[6] === "true", JSON.stringify(forms));
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+  await shot(page, "e2e-import-forms");
+});
+
+// C4r4, F3: editing a base module reaches the modules that import it, and F4:
+// a module whose code did not change is not evaluated again, so the class it
+// exports keeps its object identity. `Enemy` extends `BaseMover` — the probe
+// reports the class token of each, and of the parent `Enemy` extends. The proof
+// is in the identity: an importer left on the old base keeps the old parent
+// token, and a base evaluated twice mints a second class object that is not the
+// one the registry holds.
+const F3_BASE = `import { ScriptableBehaviour, Serializable, SerializedField } from "WebEngineTS";
+
+@Serializable({ typeName: "BaseMover" })
+export default class BaseMover extends ScriptableBehaviour {
+    @SerializedField() public speed = 1;
+    // MARK_STEP
+}
+`;
+const F3_ENEMY = `import { ScriptableBehaviour, Serializable, SerializedField } from "WebEngineTS";
+import BaseMover from "./Base";
+
+@Serializable({ typeName: "Enemy" })
+export default class Enemy extends BaseMover {
+    @SerializedField() public label = "idle";
+}
+`;
+const editScript = async (page, name, text) => {
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: name }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(t => navigator.clipboard.writeText(t), text);
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(600);
+  await page.locator(".pane-btn.primary").click();
+};
+scenario("editing a base module reaches its importer, and leaves the other class its identity", async () => {
+  const page = await newPage("F3Parent", { probe: true });
+  const scene = {
+    name: "Main", version: 1,
+    roots: [{
+      name: "Enemy1", active: true,
+      transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+      components: [{ type: "Enemy", fields: {} }, { type: "BaseMover", fields: {} }],
+      children: [],
+    }],
+  };
+  await seed(page, "F3Parent", {
+    "scenario.meta.json": JSON.stringify({ id: "f3", name: "F3Parent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Base.ts": F3_BASE,
+    "scripts/components/Enemy.ts": F3_ENEMY,
+    "assets/scenes/main.scene.json": JSON.stringify(scene),
+  });
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(
+    () => document.querySelector("app-hierarchy")?.innerText?.includes("Enemy1") ?? false,
+    null, { timeout: 30000 },
+  );
+  const classes = () => page.evaluate(() => ({
+    base: window.__wetsProbe.scriptClass("BaseMover"),
+    enemy: window.__wetsProbe.scriptClass("Enemy"),
+  }));
+
+  const first = await classes();
+  check("both classes registered", first.base !== null && first.enemy !== null, JSON.stringify(first));
+  check("Enemy extends BaseMover", first.enemy.parent === "BaseMover", first.enemy.parent);
+  check("and its parent is the very class the registry holds",
+    first.enemy.parentToken === first.base.token, `${first.enemy.parentToken} vs ${first.base.token}`);
+
+  // Edit the base module only. Its importers must be re-linked against the new
+  // class, so Enemy's parent token moves with it (F3).
+  await editScript(page, "Base.ts", F3_BASE.replace("// MARK_STEP", "// MARK_STEP2\n    public tag = \"v2\";"));
+  await page.waitForFunction(old => window.__wetsProbe.scriptClass("BaseMover")?.token !== old, first.base.token, { timeout: 20000 });
+  await page.waitForTimeout(800);                       // the importer is re-imported in the same pass
+  const second = await classes();
+  check("the base class was replaced",
+    second.base.token !== first.base.token, `${first.base.token} → ${second.base.token}`);
+  check("the importer was re-linked against the new base",
+    second.enemy.parentToken === second.base.token, `${second.enemy.parentToken} vs ${second.base.token}`);
+
+  // Edit the importer only. The base module is untouched, so the class it
+  // exported — the same object Enemy extends and the registry holds — stays
+  // (F4: no second evaluation of an unchanged dependency).
+  await editScript(page, "Enemy.ts", F3_ENEMY.replace('public label = "idle";', 'public label = "hunting";'));
+  await page.waitForFunction(old => window.__wetsProbe.scriptClass("Enemy")?.token !== old, second.enemy.token, { timeout: 20000 });
+  const third = await classes();
+  check("the importer was replaced",
+    third.enemy.token !== second.enemy.token, `${second.enemy.token} → ${third.enemy.token}`);
+  check("and the untouched base kept its class object",
+    third.base.token === second.base.token, `${second.base.token} → ${third.base.token}`);
+  check("the new importer extends that same class, not a second copy",
+    third.enemy.parentToken === third.base.token, `${third.enemy.parentToken} vs ${third.base.token}`);
+  check("the scene still holds the object",
+    (await page.locator("app-hierarchy").innerText()).includes("Enemy1"));
+  // Re-registering a class under a name the registry already holds is the swap
+  // itself: the engine's registry refuses the second constructor and the editor
+  // answers with `TypeRegistry.replace` — the same advisory the phase-2 scenario
+  // tolerates. Everything else in the console must be quiet.
+  const swap = "already registered to a different class";
+  check("nothing but the swap advisories in the console",
+    page.logs.filter(l => !l.includes(swap) && !l.includes("404") && !l.includes("GL Driver Message") && !l.includes("GPU stall")).length === 0,
+    page.logs.join(" | "));
+  await shot(page, "e2e-base-edit-reaches-importers");
+});
+
 // C4 phase 1: the Code tab. A script file is a file like any other — it opens
 // in the Code tab, types, saves back through the project store, and an edit of
 // a source never marks the scene unsaved (only its own file). Monaco's own
