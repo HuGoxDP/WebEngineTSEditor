@@ -2414,6 +2414,16 @@ for (const [name, fn] of scenarios) {
         await lastPage?.screenshot({ path: `${SHOTS}/e2e-failure.png` }).catch(() => {});
         check("scenario completed", false, String(err.message ?? err).split("\n").slice(0, 12).join(" | "));
     }
+    // Every context the scenario opened is closed before the next one starts.
+    // A live context keeps a whole editor running - its WebGL renderer, its
+    // requestAnimationFrame loop, its workers - and the suite opens ~30 of them.
+    // Left open they accumulate: measured over 14 project opens, the time from
+    // "Open folder" to a visible workspace grew 192 ms -> 20463 ms, which is the
+    // late-suite `.work` timeout the whole suite kept flaking on (ROADMAP T2).
+    // Closed, the same 14 opens stay between 250 and 890 ms. No timeout is
+    // raised and no check retried: every scenario still gets the same 30 s.
+    for (const context of browser.contexts()) await context.close().catch(() => {});
+    lastPage = null;
 }
 await browser.close();
 console.log(failed === 0 ? "\nAll checks passed." : `\n${failed} check(s) failed.`);
