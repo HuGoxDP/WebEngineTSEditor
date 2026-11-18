@@ -518,7 +518,7 @@ const IMPORT_REEXPORT = `export { ScriptableBehaviour as SB } from "WebEngineTS"
 `;
 const IMPORT_FORMS = `import { Stats } from "./sibling";
 // import order matters — a comment that mentions the word import
-import WebEngine, { Vector3 } from "WebEngineTS";
+import WebEngine, { Vector3, Serializable, SerializedField } from "WebEngineTS";
 import * as Engine from "WebEngineTS";
 import { SceneManager } from "./star";
 import { SB } from "./reexport";
@@ -623,6 +623,9 @@ export default class Enemy extends BaseMover {
 }
 `;
 const editScript = async (page, name, text) => {
+  // The first edit leaves the bottom pane on the Code tab; the Project panel is
+  // only mounted while its own tab is active, so the second edit must ask for it.
+  await page.locator(".pane-tab", { hasText: "Project" }).first().click();
   await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
   await page.waitForTimeout(400);
   await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
