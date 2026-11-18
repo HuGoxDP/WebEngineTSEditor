@@ -145,11 +145,7 @@ export class CommandsService {
         // creates and two undo steps, not one coalesced edit (B1 phase 1).
         this._history.record(`Create ${entry.label}`, () => {
             const go = this._scene.createEmpty(this._i18n.t(entry.label));
-            if (parent) {
-                go.transform.parent = parent.transform;
-            } else {
-                go.transform.localPosition = new Vector3(pivot.x, pivot.y, pivot.z);
-            }
+            this._placeUnder(go, parent, pivot);
             go.addComponent(MeshFilter).sharedMesh = entry.mesh();
             go.addComponent(MeshRenderer).sharedMaterial = new StandardMaterial();
             if (entry.collider) go.addComponent(entry.collider as never);
@@ -160,7 +156,7 @@ export class CommandsService {
     public createEmpty(parent: GameObject | null = null): void {
         this._history.record('Create GameObject', () => {
             const go = this._scene.createEmpty(this._i18n.t('go.newName'));
-            if (parent) go.transform.parent = parent.transform;
+            this._placeUnder(go, parent, this._viewport.pivot);
             this._selection.select(go);
         });
     }
@@ -171,10 +167,34 @@ export class CommandsService {
         const name = this._i18n.t(entry.label);
         this._history.record(`Create ${entry.component}`, () => {
             const go = this._scene.createEmpty(name);
-            if (parent) go.transform.parent = parent.transform;
+            this._placeUnder(go, parent, this._viewport.pivot);
             go.addComponent(found.ctor as any);
             this._selection.select(go);
         });
+    }
+
+    /**
+     * Where a create lands: a root at the Scene-view pivot, a child at its
+     * parent's local zero with identity rotation and unit scale.
+     *
+     * `transform.parent = p` is `setParent(p, true)`, which *preserves the world
+     * pose* — under a moved, rotated or scaled parent the child would not be at
+     * local zero. Unity's own menu entries use `SetParentAndAlign` (local zero,
+     * identity rotation, unit scale), so the alignment is written after the
+     * reparent (B1r).
+     */
+    private _placeUnder(go: GameObject, parent: GameObject | null, pivot: { x: number; y: number; z: number }): void {
+        if (!parent) {
+            go.transform.localPosition = new Vector3(pivot.x, pivot.y, pivot.z);
+            return;
+        }
+        go.transform.setParent(parent.transform, false);
+        go.transform.localPosition = new Vector3(0, 0, 0);
+        go.transform.localRotation = new Quaternion(0, 0, 0, 1);
+        go.transform.localScale = new Vector3(1, 1, 1);
+        // The GO was created (and the roots captured) while still a root; the
+        // reparent must be published or the Hierarchy shows it twice (B1r).
+        this._scene.notify();
     }
 
     public addComponent(target: GameObject, ctor: CtorOf, name: string): void {

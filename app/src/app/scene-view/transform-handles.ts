@@ -304,7 +304,13 @@ export class TransformHandles {
             this._proxy.position.copy(box.getCenter(new THREE.Vector3()));
         }
 
-        if (this.space === 'local') {
+        // Unity seats the scale handle at the object's own rotation for a *single*
+        // object whatever the toggle — "Allow global space scaling for multi-selection
+        // but not for a single object" (UnityCsReference BuiltinTools.cs, ScaleTool).
+        // A world-axis scale handle over a rotated object would stretch along an axis
+        // it does not show, because the write-back is `localScale` (B1r2).
+        const scaleSeat = this.mode === 'scale' && this._targets.length === 1;
+        if (this.space === 'local' || scaleSeat) {
             // Local: the handle's axes are the active object's world axes, which
             // under the mirror read as the conjugate of its engine rotation.
             this._proxy.quaternion.copy(engineQuatToThree(primary.transform.rotation));
@@ -317,6 +323,9 @@ export class TransformHandles {
 
     /** Shows the handle sets the current tool asks for, and aims them. */
     private _applyMode(): void {
+        // A single object's scale handle is seated on its own axes whatever the
+        // toggle (B1r2), so that set must also *drag* in local space.
+        const scaleSeat = this.mode === 'scale' && this._targets.length === 1;
         for (const mode of MODES) {
             const on = this.mode === mode || this.mode === 'combined';
             this._helpers[mode].visible = on;
@@ -325,7 +334,7 @@ export class TransformHandles {
             // telling the controls that it is in Local space is what makes the
             // drag move *along* them (three takes the offset's component in the
             // object's frame rather than the world's).
-            this._controls[mode].space = this.space === 'local' ? 'local' : 'world';
+            this._controls[mode].space = this.space === 'local' || (scaleSeat && mode === 'scale') ? 'local' : 'world';
         }
     }
 
