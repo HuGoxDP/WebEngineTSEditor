@@ -2,25 +2,20 @@ import { EffectRef, Injectable, Injector, NgZone, effect, inject, signal } from 
 import * as THREE from 'three';
 import { SceneViewController } from './scene-view/scene-view-controller';
 import { OrientationGizmo } from './scene-view/orientation-gizmo';
-import { ComponentGizmos, type GizmoKind, type GizmoSettings,
-    loadGizmoSettings, saveGizmoSettings } from './scene-view/component-gizmos';
-import { GizmoIcons } from './scene-view/gizmo-icons';
+import { ComponentGizmos, type DrawnInfo, type GizmoKind, type GizmoSettings,
+    kindOfType, loadGizmoSettings, saveGizmoSettings } from './scene-view/component-gizmos';
+import { GizmoIcons, type IconKind } from './scene-view/gizmo-icons';
 import { ScenePicker } from './scene-view/scene-picker';
 import { SelectionOutline } from './scene-view/selection-outline';
 import { TransformHandles, type HandleSpace, type PivotMode, type ToolMode } from './scene-view/transform-handles';
-import {
-    GameObject,
-    SceneManager,
-    Transform,
-    type SerializedScene,
-} from 'WebEngineTS';
+import { Behaviour, GameObject, SceneManager, Transform, TypeRegistry, type Component, type SerializedScene } from 'WebEngineTS';
 import { HistoryService } from './services/history.service';
 import { I18nService, type MessageKey } from './i18n/i18n.service';
 import { SceneService } from './services/scene.service';
 import { SelectionService } from './services/selection.service';
 import { SettingsService } from './services/settings.service';
 import { SceneViewRenderer } from './scene-view/scene-view-renderer';
-import { installProbe, probeEnabled } from './scene-view/debug-probe';
+import { installProbe, probeEnabled, type ProbeTransform } from './scene-view/debug-probe';
 
 /** The Scene view's tools: Q view, W/E/R the three handle modes, Y all of them. */
 export type { Tool, PivotMode, HandleSpace } from './scene-view/transform-handles';
@@ -49,6 +44,17 @@ export class ViewportService {
     private _picker: ScenePicker | null = null;
     private _componentGizmos: ComponentGizmos | null = null;
     private _icons: GizmoIcons | null = null;
+    /** The selection's backing objects, reused across selection changes (D-11). */
+    private readonly _gizmoSelected = new Set<THREE.Object3D>();
+    /** The icon pass's pooled points and counts — nothing allocated per frame. */
+    private readonly _iconPoints: Record<IconKind, { x: number; y: number; z: number; selected: boolean }[]> =
+        { camera: [], light: [], audio: [] };
+    private readonly _iconMat = new THREE.Matrix4();
+    /** Icons placed per stable component type this frame (the probe's read-back). */
+    private readonly _iconTypeCounts: Record<string, number> =
+        { Camera: 0, DirectionalLight: 0, PointLight: 0, SpotLight: 0, AudioSource: 0 };
+    /** The whole-scene walk's reused list (icons per frame, gizmoInfo for the probe). */
+    private readonly _sceneWalk: GameObject[] = [];
     /** The Gizmos menu's switches: view state, kept in the browser (D-11). */
     public readonly gizmoSettings = signal<GizmoSettings>(loadGizmoSettings());
     /** The rectangle draft, in canvas pixels, while the left button drags. */
@@ -118,6 +124,8 @@ export class ViewportService {
         this._icons = new GizmoIcons(this._renderer);
         this._icons.mount();
         this._componentGizmos.setSettings(this.gizmoSettings());
+        this._icons.size = this.gizmoSettings().iconSize;
+        this._syncGizmoSelection();
 
         // ── Grid: depth-tested against the engine scene (D-2 step 3) ──
         const grid = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
@@ -169,7 +177,10 @@ export class ViewportService {
         this._selectionEffect = effect(() => {
             this._selection.selected();
             this._selection.revision();
-            this._outline?.setTargets([...this._selection.selectedSet()].map(o => o.transform._internalObject3D));
+            const objects = [...this._selection.selectedSet()].map(o => o.transform._internalObject3D);
+            this._outline?.setTargets(objects);
+            // D-11: the selection's gizmos are drawn brighter.
+            this._syncGizmoSelection();
         }, { injector: this._injector });
 
         // The debug probe (D-13) exists only when the flag is set.
@@ -189,6 +200,11 @@ export class ViewportService {
                 objectScreenRect: name => this._picker?.screenRect(name) ?? null,
                 gizmoCounts: () => this.gizmoCounts,
                 gizmoExtent: (name, kind) => this.gizmoExtent(name, kind),
+                gizmoInfo: (name, kind) => this.gizmoInfo(name, kind),
+                iconCounts: () => this.iconCounts,
+                transformOf: name => this.transformOf(name),
+                setComponentEnabled: (goName, typeName, index, enabled) =>
+                    this.setComponentEnabled(goName, typeName, index, enabled),
                 gizmoSettings: () => this.gizmoSettings(),
             });
         }
@@ -580,7 +596,14 @@ export class ViewportService {
         return null;
     }
 
-    /** @internal Walks the engine scene once and maps each Object3D to its GameObject. */
+    /** D-11: the selection's gizmos draw brighter — one reused set, no per-change allocation. */
+    private _syncGizmoSelection(): void {
+        const set = this._gizmoSelected;
+        set.clear();
+        for (const go of this._selection.selectedSet()) set.add(go.transform._internalObject3D);
+        this._componentGizmos?.setSelected(set);
+    }
+
     /** One Gizmos menu switch (D-11): stored for the next session too. */
     public setGizmoSetting(key: 'enabled' | 'camera' | 'lights' | 'colliders' | 'audio', value: boolean): void {
         const next = { ...this.gizmoSettings(), [key]: value };
@@ -610,7 +633,7 @@ export class ViewportService {
         return out;
     }
 
-    /** How far one object's gizmo of a kind reaches, in engine units. */
+    /** How far one object's gizmo of a kind reaches, in engine units (the selection, as the existing e2e asserts). */
     public gizmoExtent(name: string, kind: GizmoKind | string): number | null {
         const gizmos = this._componentGizmos;
         if (!gizmos) return null;
@@ -623,25 +646,162 @@ export class ViewportService {
     }
 
     /**
-     * Places the billboard icons over the objects carrying the gizmos'
-     * components: one per object, just above it (D-11).
+     * Every gizmo record of a kind for the named object, searched over the WHOLE
+     * scene (the tests check unselected objects too). `kind` accepts a stable
+     * component type name ("PointLight") or the gizmo kind ("pointLight");
+     * omitted returns every kind. The returned records carry the TYPE name in
+     * `kind` (DrawnInfo); they are copied so a caller never holds the recycled
+     * read-back objects.
+     */
+    public gizmoInfo(name: string, kind?: GizmoKind | string): DrawnInfo[] {
+        const gizmos = this._componentGizmos;
+        const out: DrawnInfo[] = [];
+        if (!gizmos) return out;
+        const filter = kind === undefined ? null : (kindOfType(kind) ?? kind as GizmoKind);
+        for (const go of this._sceneObjects()) {
+            if (go.name !== name) continue;
+            for (const d of gizmos.drawnFor(go.transform._internalObject3D)) {
+                if (filter !== null && d.kind !== filter) continue;
+                out.push({
+                    kind: d.typeName,
+                    extent: d.extent,
+                    center: { ...d.center },
+                    half: { ...d.half },
+                    circles: d.circles.map(c => ({ center: { ...c.center }, normal: { ...c.normal }, radius: c.radius })),
+                    selected: d.selected,
+                });
+            }
+        }
+        return out;
+    }
+
+    /** How many icons per stable component type are placed and visible, whole scene. */
+    public get iconCounts(): Record<string, number> {
+        const out: Record<string, number> = {};
+        if (!this._icons || !this.gizmoSettings().enabled) return out;
+        for (const [name, n] of Object.entries(this._iconTypeCounts)) if (n > 0) out[name] = n;
+        return out;
+    }
+
+    /**
+     * An object's engine-space transform by name, over the WHOLE scene (not only
+     * the selection): world pose plus the local TRS the Inspector edits.
+     */
+    public transformOf(name: string): ProbeTransform | null {
+        for (const go of this._sceneObjects()) {
+            if (go.name !== name) continue;
+            const t = go.transform;
+            const p = t.position, q = t.rotation, s = t.lossyScale, e = t.eulerAngles;
+            const lp = t.localPosition, lq = t.localRotation, ls = t.localScale;
+            return {
+                position: { x: p.x, y: p.y, z: p.z },
+                rotation: { x: q.x, y: q.y, z: q.z, w: q.w },
+                euler: { x: e.x, y: e.y, z: e.z },
+                scale: { x: s.x, y: s.y, z: s.z },
+                localPosition: { x: lp.x, y: lp.y, z: lp.z },
+                localRotation: { x: lq.x, y: lq.y, z: lq.z, w: lq.w },
+                localScale: { x: ls.x, y: ls.y, z: ls.z },
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Toggles one component's enabled flag (the serializer does not persist it,
+     * so the probe is the write path). `typeName` resolves through the engine's
+     * TypeRegistry; `index` picks among the object's components of that type in
+     * add order. Only Behaviours carry an enabled flag.
+     */
+    public setComponentEnabled(goName: string, typeName: string, index: number, enabled: boolean): boolean {
+        const type = TypeRegistry.get(typeName);
+        if (!type) return false;
+        for (const go of this._sceneObjects()) {
+            if (go.name !== goName) continue;
+            const comps = go.getComponents(type as unknown as new (...args: never[]) => Component);
+            const comp = comps[index];
+            if (!comp || !(comp instanceof Behaviour)) return false;
+            comp.enabled = enabled;
+            this._selection.notifyChanged();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Places the billboard icons over EVERY object carrying a gizmo component
+     * (D-11: icons mark every camera, light and audio object, not only the
+     * selection). Types come from the engine's registry — constructor.name does
+     * not survive the production build's minification. The Gizmos menu gates
+     * each icon kind; children of an inactive parent get none.
      */
     private _placeIcons(): void {
         const icons = this._icons;
         if (!icons) return;
-        const place: Record<string, { x: number; y: number; z: number }[]> = { camera: [], light: [], audio: [] };
-        for (const go of this._selection.selectedSet()) {
-            const position = go.transform.position;
-            for (const component of go.getAllComponents()) {
-                const name = component.constructor.name;
-                if (name === 'Camera') place.camera.push({ ...position });
-                else if (name.endsWith('Light')) place.light.push({ ...position });
-                else if (name === 'AudioSource') place.audio.push({ ...position });
+        const s = this.gizmoSettings();
+        icons.visible = s.enabled;
+        const camera = this._iconPoints.camera, light = this._iconPoints.light, audio = this._iconPoints.audio;
+        let nCamera = 0, nLight = 0, nAudio = 0;
+        const counts = this._iconTypeCounts;
+        counts.Camera = 0; counts.DirectionalLight = 0; counts.PointLight = 0; counts.SpotLight = 0; counts.AudioSource = 0;
+        if (s.enabled) {
+            for (const go of this._sceneObjects()) {
+                if (!go.activeInHierarchy) continue;
+                // One pose read per object, through the engine's allocation-free
+                // matrix accessor (the position getter returns a clone).
+                const e = go.transform._engineWorldMatrix(this._iconMat).elements;
+                const selected = this._selection.isSelected(go);
+                // The backing store, not getAllComponents() — that copies per call.
+                const components = (go as unknown as { _components: unknown[] })._components;
+                for (let ci = 0; ci < components.length; ci++) {
+                    const component = components[ci];
+                    const isActive = (component as { isActiveAndEnabled?: boolean }).isActiveAndEnabled;
+                    if (isActive === false) continue;
+                    const typeName = TypeRegistry.getTypeName(component as object);
+                    let pool: { x: number; y: number; z: number; selected: boolean }[] | null = null;
+                    switch (typeName) {
+                        case 'Camera':
+                            if (s.camera) pool = camera;
+                            break;
+                        case 'DirectionalLight': case 'PointLight': case 'SpotLight':
+                            if (s.lights) pool = light;
+                            break;
+                        case 'AudioSource':
+                            if (s.audio) pool = audio;
+                            break;
+                    }
+                    if (!pool || !typeName) continue;
+                    let n = 0;
+                    if (pool === camera) n = nCamera++;
+                    else if (pool === light) n = nLight++;
+                    else n = nAudio++;
+                    const p = pool[n] ?? (pool[n] = { x: 0, y: 0, z: 0, selected: false });
+                    p.x = e[12]; p.y = e[13]; p.z = e[14]; p.selected = selected;
+                    counts[typeName]++;
+                }
             }
         }
-        icons.place('camera', place.camera);
-        icons.place('light', place.light);
-        icons.place('audio', place.audio);
+        icons.place('camera', camera, nCamera);
+        icons.place('light', light, nLight);
+        icons.place('audio', audio, nAudio);
+    }
+
+    /**
+     * Every GameObject in the active scene, in one reused list (per-frame icons,
+     * probe read-backs). Roots come from the engine's backing store — the public
+     * getter copies (the component-gizmos precedent); the walk closure is a
+     * field, so a frame allocates nothing.
+     */
+    private readonly _walkScene = (go: GameObject): void => {
+        this._sceneWalk.push(go);
+        const children = go.transform._internalChildren;
+        for (let i = 0; i < children.length; i++) this._walkScene(children[i].gameObject);
+    };
+    private _sceneObjects(): readonly GameObject[] {
+        const out = this._sceneWalk;
+        out.length = 0;
+        const roots = (SceneManager.activeScene as unknown as { _rootGameObjects: GameObject[] })._rootGameObjects;
+        for (let i = 0; i < roots.length; i++) this._walkScene(roots[i]);
+        return out;
     }
 
     /** Applies a rectangle's selection (D-10: clear unless Shift/Ctrl). */

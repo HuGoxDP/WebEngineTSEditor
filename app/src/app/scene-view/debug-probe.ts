@@ -16,6 +16,18 @@
 import * as THREE from 'three';
 import type { SceneViewRenderer } from './scene-view-renderer';
 
+/** An object's engine-space transform, as the probe reports it (world + local TRS). */
+export interface ProbeTransform {
+    position: { x: number; y: number; z: number };
+    rotation: { x: number; y: number; z: number; w: number };
+    /** The rotation as Unity's Inspector shows it, in degrees. */
+    euler: { x: number; y: number; z: number };
+    scale: { x: number; y: number; z: number };
+    localPosition: { x: number; y: number; z: number };
+    localRotation: { x: number; y: number; z: number; w: number };
+    localScale: { x: number; y: number; z: number };
+}
+
 /** The probe's shape, as installed on `window`. */
 export interface WetsProbe {
     /** The editor camera pose in engine space. */
@@ -37,14 +49,8 @@ export interface WetsProbe {
     handlePoint(axis: 'x' | 'y' | 'z' | 'X' | 'Y' | 'Z', t: number): { x: number; y: number } | null;
     /** The handle axes under the pointer right now, or null (D-6's tool checks). */
     hoverAxis(): string | null;
-    /** A selected object's engine-space transform, by name (D-6's assertions). */
-    transformOf(name: string): {
-        position: { x: number; y: number; z: number };
-        rotation: { x: number; y: number; z: number; w: number };
-        /** The rotation as Unity's Inspector shows it, in degrees. */
-        euler: { x: number; y: number; z: number };
-        scale: { x: number; y: number; z: number };
-    } | null;
+    /** An object's engine-space transform (world + local TRS), by name over the whole scene (D-6's assertions). */
+    transformOf(name: string): ProbeTransform | null;
     /** RGBA of the composed frame at a client pixel (null if off-canvas). */
     pixel(x: number, y: number): [number, number, number, number] | null;
     /** Client size of the drawing surface. */
@@ -63,6 +69,29 @@ export interface WetsProbe {
     gizmoCounts(): Record<string, number>;
     /** How far one object's gizmo of a kind reaches, in engine units. */
     gizmoExtent(name: string, kind: string): number | null;
+    /**
+     * Every gizmo record of a kind for the named object, searched over the whole
+     * scene (not only the selection). Engine space: bbox centre/half of the
+     * vertices actually drawn, plus each circle's centre, unit normal, radius.
+     * `kind` is a stable component type name ("PointLight") or the gizmo kind
+     * ("pointLight"); omitted returns every kind the object draws. Each
+     * returned record's `kind` carries the stable component type name.
+     */
+    gizmoInfo(name: string, kind?: string): {
+        kind: string; extent: number;
+        center: { x: number; y: number; z: number };
+        half: { x: number; y: number; z: number };
+        circles: { center: { x: number; y: number; z: number }; normal: { x: number; y: number; z: number }; radius: number }[];
+        selected: boolean;
+    }[];
+    /** How many billboard icons per stable component type are placed and visible (whole scene). */
+    iconCounts(): Record<string, number>;
+    /**
+     * Toggles one component's enabled flag (the serializer does not persist it,
+     * so the tests need a write path). `typeName` is the stable registry name;
+     * `index` picks among that object's components of the type, in add order.
+     */
+    setComponentEnabled(goName: string, typeName: string, index: number, enabled: boolean): boolean;
     /** The Gizmos menu's switches, as the menu left them. */
     gizmoSettings(): { enabled: boolean; camera: boolean; lights: boolean; colliders: boolean; audio: boolean; iconSize: number };
     /**
@@ -130,6 +159,19 @@ export function installProbe(
         /** The component gizmos over the selection (D-11). */
         gizmoCounts?: () => Record<string, number>;
         gizmoExtent?: (name: string, kind: string) => number | null;
+        /** One object's gizmo records of a kind, whole scene, engine space. */
+        gizmoInfo?: (name: string, kind?: string) => {
+            kind: string; extent: number;
+            center: { x: number; y: number; z: number };
+            half: { x: number; y: number; z: number };
+            circles: { center: { x: number; y: number; z: number }; normal: { x: number; y: number; z: number }; radius: number }[];
+            selected: boolean;
+        }[];
+        iconCounts?: () => Record<string, number>;
+        /** An object's world + local TRS by name, over the whole scene. */
+        transformOf?: (name: string) => ProbeTransform | null;
+        /** Toggles one component's enabled flag by stable type name + add-order index. */
+        setComponentEnabled?: (goName: string, typeName: string, index: number, enabled: boolean) => boolean;
         gizmoSettings?: () => { enabled: boolean; camera: boolean; lights: boolean; colliders: boolean; audio: boolean; iconSize: number };
         /** The handle's position and axis directions in engine space (D-6). */
         handlePoint?: (axis: 'X' | 'Y' | 'Z', t: number) => { x: number; y: number; z: number } | null;
@@ -177,24 +219,13 @@ export function installProbe(
         objectScreenRect: (name) => deps.objectScreenRect?.(name) ?? null,
         gizmoCounts: () => deps.gizmoCounts?.() ?? {},
         gizmoExtent: (name, kind) => deps.gizmoExtent?.(name, kind) ?? null,
+        gizmoInfo: (name, kind) => deps.gizmoInfo?.(name, kind) ?? [],
+        iconCounts: () => deps.iconCounts?.() ?? {},
+        setComponentEnabled: (goName, typeName, index, enabled) =>
+            deps.setComponentEnabled?.(goName, typeName, index, enabled) ?? false,
         gizmoSettings: () => deps.gizmoSettings?.() ?? { enabled: true, camera: true, lights: true, colliders: true, audio: true, iconSize: 1 },
         pixelStats: (rect) => renderer.pixelStats(rect),
-        transformOf: (name) => {
-            for (const go of deps.selection.selectedSet()) {
-                if (go.name !== name) continue;
-                const t = go.transform;
-                const p = t.position;
-                const q = t.rotation;
-                const s = t.localScale;
-                return {
-                    position: { x: p.x, y: p.y, z: p.z },
-                    rotation: { x: q.x, y: q.y, z: q.z, w: q.w },
-                    euler: (() => { const e = t.eulerAngles; return { x: e.x, y: e.y, z: e.z }; })(),
-                    scale: { x: s.x, y: s.y, z: s.z },
-                };
-            }
-            return null;
-        },
+        transformOf: (name) => deps.transformOf?.(name) ?? null,
         size: () => {
             const canvas = deps.canvas();
             return { width: canvas?.clientWidth ?? 0, height: canvas?.clientHeight ?? 0 };
