@@ -87,6 +87,15 @@ async function siblingPage(page, folderName) {
 /** Log capture, the folder-picker stand-in, and the preferences/knobs seeded before the editor starts. */
 async function instrument(page, folderName, settings, autosaveMs) {
     lastPage = page;
+    // The page pulls its fonts from Google; a network blip there fails the load
+    // and pollutes "no page errors". The suite runs against the local server
+    // only, so the font hosts answer with empty CSS once per context (an abort
+    // would itself log a resource error).
+    const ctx = page.context();
+    if (!ctx.__fontsBlocked) {
+        ctx.__fontsBlocked = true;
+        await ctx.route(/fonts\.(googleapis|gstatic)\.com/, r => r.fulfill({ status: 200, contentType: "text/css", body: "" }));
+    }
     page.logs = [];
     page.nativeDialogs = 0;
     page.beforeUnloads = 0;
@@ -214,10 +223,13 @@ const menu = async (page, bar, item) => {
 // "No errors" ignores the two things that are not the app's: a 404 for an asset the
 // static server does not carry, and the GL driver's performance note about the
 // readPixels the probe's pixelStats/pixel reads deliberately perform (D-9/D-13).
+// Only the *performance* note is excused, never the whole `GL Driver Message`
+// prefix: the driver reports real Error-severity GL faults under it too, and
+// dropping the prefix let a broken Scene view pass the suite (B1r3).
 const noErrors = page => page.logs.filter(l =>
     !l.includes("404")
-    && !l.includes("GL Driver Message")
-    && !l.includes("GPU stall")
+    && !(l.includes("GL Driver Message") && l.includes("Performance"))
+    && !l.includes("GPU stall due to ReadPixels")
 ).length === 0;
 
 /** From the start screen: open the (empty) folder the picker returns and accept the set-up. */
@@ -527,6 +539,10 @@ scenario("3d objects: the six primitives, undo, persistence, and the gizmo on to
     const saved = JSON.parse(await readDisk(page, "PrimitivesDemo", "assets/scenes/main.scene.json"));
     check("reopen: all six are in the scene", KINDS.every(k => saved.roots.some(r => r.name === k)), saved.roots.map(r => r.name).join(", "));
     check("the file stays format version 1", saved.version === 1, String(saved.version));
+    // DW-1.3 strengthened (B1r): the exact D-3 kind/args and collider type per
+    // primitive, not "some string kind and some collider".
+    const ARGS = { Cube: [1], Sphere: [0.5, 32], Capsule: [0.5, 2, 32], Cylinder: [0.5, 2, 32], Plane: [10, 10, 1, 1], Quad: [1, 1] };
+    const COLLIDER = { Cube: "BoxCollider", Sphere: "SphereCollider", Capsule: "CapsuleCollider", Cylinder: "CapsuleCollider" };
     for (const kind of KINDS.slice(0, 4)) {
         const root = saved.roots.find(r => r.name === kind);
         const mesh = root.components.find(c => c.type === "MeshFilter");
@@ -534,10 +550,16 @@ scenario("3d objects: the six primitives, undo, persistence, and the gizmo on to
         check(`${kind}: a PrimitiveMesh with its kind`, mesh?.fields.sharedMesh?.$type === "PrimitiveMesh" && typeof mesh.fields.sharedMesh.kind === "string", JSON.stringify(mesh?.fields.sharedMesh));
         check(`${kind}: an inlined material`, typeof mat?.fields.sharedMaterial === "object", JSON.stringify(mat?.fields.sharedMaterial));
         check(`${kind}: Unity's collider`, root.components.some(c => /Collider/.test(c.type)), root.components.map(c => c.type).join(", "));
+        check(`${kind}: the D-3 mesh kind and args`, mesh?.fields.sharedMesh?.kind === kind && JSON.stringify(mesh.fields.sharedMesh.args) === JSON.stringify(ARGS[kind]), JSON.stringify(mesh?.fields.sharedMesh));
+        check(`${kind}: Unity's exact collider type`, root.components.filter(c => /Collider/.test(c.type)).map(c => c.type).join() === COLLIDER[kind], root.components.map(c => c.type).join(", "));
     }
     for (const kind of KINDS.slice(4)) {
         const root = saved.roots.find(r => r.name === kind);
+        const mesh = root.components.find(c => c.type === "MeshFilter");
+        const mat = root.components.find(c => c.type === "MeshRenderer");
         check(`${kind}: no collider (Unity's MeshCollider is a recorded deviation)`, !root.components.some(c => /Collider/.test(c.type)), root.components.map(c => c.type).join(", "));
+        check(`${kind}: the D-3 mesh kind and args`, mesh?.fields.sharedMesh?.kind === kind && JSON.stringify(mesh.fields.sharedMesh.args) === JSON.stringify(ARGS[kind]), JSON.stringify(mesh?.fields.sharedMesh));
+        check(`${kind}: an inlined material`, typeof mat?.fields.sharedMaterial === "object", JSON.stringify(mat?.fields.sharedMaterial));
     }
 
     // DW-1.4: the gizmo's red X arrow lands over the cube (D-2's on-top layer).
@@ -606,8 +628,14 @@ scenario("recovery: unsaved work survives a crash; giving it up is remembered", 
     // as above: this is where the race first showed, about one full run in eight.
     await page.locator("canvas").click({ position: { x: 300, y: 300 } });
     await page.keyboard.press("Alt+Shift+N");
-    await page.waitForTimeout(1000);
-    check("a copy exists again", (await autosave()) !== null);
+    // The copy lands on the next autosave tick plus its write; under load that
+    // can take longer than a fixed sleep. Poll, then assert the same thing.
+    let copyAgain = null;
+    for (let i = 0; i < 50 && copyAgain === null; i++) {
+        await page.waitForTimeout(300);
+        copyAgain = await autosave();
+    }
+    check("a copy exists again", copyAgain !== null);
     await slowAutosave(page, 500);
     await page.waitForTimeout(700);
     await menu(page, "File", "Close Project");
@@ -921,9 +949,14 @@ scenario("new project wizard: collects, validates, creates; cancelling writes no
     // The chosen location already holds a non-empty folder of that name.
     await seed(page, "WizParent", { "Будова атома/old.txt": "x" });
     await page.getByText("Choose a folder…").click();
-    await page.waitForTimeout(200);
     await page.locator(".dlg-btn.primary").click();
-    await page.waitForTimeout(300);
+    // The refusal is asynchronous (it stats the picked folder), and late in a
+    // full run — every earlier scenario's page is still open — that lands well
+    // after the fixed 300 ms this used to wait. Wait for the error instead.
+    for (let i = 0; i < 50; i++) {
+        if ((await page.locator(".wiz-error").count()) > 0) break;
+        await page.waitForTimeout(100);
+    }
     await shot(page, "e2e-wizard-3");
     check("a taken name is refused with a reason", (await page.locator(".wiz-error").innerText()).includes("already exists"));
     check("and the wizard stays open", (await page.locator(".wiz-steps").innerText()).includes("Step 3 of 3"));
@@ -1712,6 +1745,69 @@ scenario("transform handles: snapping, global vs local, multi-select, the tools 
             (await page.locator(".vp-overlay-tl .chip .v").first().innerText()) === label,
             await page.locator(".vp-overlay-tl .chip .v").first().innerText());
     }
+
+    // ── B1r2: a single object's Scale handle seats on its own axes in Global ──
+    // The scenario ends in Centre mode; Centre also moves the position on a
+    // scale drag, so go back to Pivot first.
+    await page.locator(".vp-subtoolbar .chip", { hasText: "Center" }).click();
+    await page.waitForTimeout(250);
+    await create("Cube");
+    await rename("Seat");
+    await page.locator(".insp-body .field").nth(1).locator("input").nth(1).fill("45");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    // An unrotated twin at the same spot: its scale X is world X whatever the
+    // fix, so it is the reference direction. Both readings go through the
+    // uppercase (handle) path from the same origin, so pre-fix the two client
+    // directions coincide exactly.
+    await create("Cube");
+    await rename("Ref");
+    await page.keyboard.press("r");
+    await page.waitForTimeout(300);
+    const normDir = (a, b) => {
+        if (!a || !b) return null;
+        const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+        return len > 1e-6 ? { x: dx / len, y: dy / len } : null;
+    };
+    const axisDir = () => page.evaluate(() => {
+        const p = window.__wetsProbe;
+        return [p.handlePoint("X", 0), p.handlePoint("X", 1)];
+    });
+    const refDir = normDir(...(await axisDir()));
+    await page.locator("app-hierarchy li", { hasText: "Seat" }).first().click();
+    // The re-seat happens in the frame loop after the selection revision moves;
+    // under load a fixed sleep can read the proxy before it is re-seated on Seat.
+    let seatDir = null;
+    for (let i = 0; i < 120 && (!seatDir || !refDir || seatDir.x * refDir.x + seatDir.y * refDir.y >= 0.985); i++) {
+        await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+        seatDir = normDir(...(await axisDir()));
+    }
+    const seatDot = seatDir && refDir ? seatDir.x * refDir.x + seatDir.y * refDir.y : null;
+    check("the Scale handle's X axis follows the cube's own rotation, not world X",
+        seatDot !== null && seatDot < 0.985, JSON.stringify({ seatDir, refDir }));
+    // Drag along the handle's own client direction. The write-back is a
+    // per-component ratio in either space, so the scale VALUES alone cannot tell
+    // pre-fix from post-fix; the seat orientation (seatDot above) is the
+    // discriminator, and it is required here too. Pre-fix seatDot ≈ 1 → fails.
+    const dragDir = seatDir;
+    const seatBefore = await tf("Seat");
+    const scaleHandle = await findHandle("scale", "X");
+    if (scaleHandle && dragDir) {
+        await drag(scaleHandle, dragDir.x * 60, dragDir.y * 60);
+    }
+    const seatAfter = await tf("Seat");
+    const d = seatAfter.localScale, b = seatBefore.localScale;
+    check("a scale drag along the seated axis changes only localScale.x and leaves the pose alone",
+        seatDot !== null && seatDot < 0.985 && !!scaleHandle && !!dragDir
+        && Math.abs(d.x - b.x) > 1e-3 && near(d.y, b.y, 1e-3) && near(d.z, b.z, 1e-3)
+        && near(seatAfter.localPosition.x, seatBefore.localPosition.x, 1e-3)
+        && near(seatAfter.localPosition.y, seatBefore.localPosition.y, 1e-3)
+        && near(seatAfter.localPosition.z, seatBefore.localPosition.z, 1e-3)
+        && near(seatAfter.localRotation.x, seatBefore.localRotation.x, 1e-3)
+        && near(seatAfter.localRotation.y, seatBefore.localRotation.y, 1e-3)
+        && near(seatAfter.localRotation.z, seatBefore.localRotation.z, 1e-3)
+        && near(seatAfter.localRotation.w, seatBefore.localRotation.w, 1e-3),
+        JSON.stringify({ scaleHandle, dragDir, before: b, after: d }));
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
@@ -2015,6 +2111,11 @@ scenario("component gizmos: lights, camera and colliders, switched per type (B1.
     const everythingOff = await counts();
     check("the master switch hides everything", Object.keys(everythingOff).length === 0,
         JSON.stringify(everythingOff));
+    // The Point Light and its range edit came after the last save: leave the
+    // scene dirty and a slow run's autosave writes a copy, whose recovery
+    // dialog then blocks every click after the reopen. Save it away first.
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(500);
     await page.reload({ waitUntil: "load" });
     await page.locator(".recent").first().click();
     await page.locator(".work").waitFor({ state: "attached", timeout: 90000 });
@@ -2045,6 +2146,255 @@ scenario("component gizmos: lights, camera and colliders, switched per type (B1.
     await page.keyboard.press("Escape");
     await page.waitForTimeout(500);
     await shot(page, "b1-gizmos-off");
+
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1r — DW-1.2: creation from the Hierarchy "+" and an object's context menu.
+scenario("create placement: Hierarchy + makes a root at the pivot, the context menu a child at local zero (B1r DW-1.2)", async () => {
+    const page = await newPage("CreateDemo", { probe: true });
+    await openEmptyProject(page);
+
+    const tf = (name) => page.evaluate(n => window.__wetsProbe.transformOf(n), name);
+    const pivot = () => page.evaluate(() => window.__wetsProbe.pivot());
+    const near3 = (v, e, tol = 1e-2) => Math.abs(v.x - e.x) < tol && Math.abs(v.y - e.y) < tol && Math.abs(v.z - e.z) < tol;
+    const row = (name) => page.locator("app-hierarchy li", { hasText: name }).first();
+    /** Inline rename (F2) of the selected row; avoids duplicate-name shadowing. */
+    const rename = async (name) => {
+        await page.keyboard.press("F2");
+        const input = page.locator("app-hierarchy input.rename-input");
+        await input.fill(name);
+        await input.press("Enter");
+        await page.waitForTimeout(300);
+    };
+    /** The Hierarchy "+" opens the shared create menu; it always makes a ROOT. */
+    const createFromPlus = async (item, sub) => {
+        await page.locator("app-hierarchy .create-btn").click();
+        await page.waitForTimeout(200);
+        if (sub) {
+            await page.locator(".ctx-item", { hasText: sub }).first().hover();
+            await page.waitForTimeout(200);
+        }
+        await page.locator(".ctx-item", { hasText: item }).last().click();
+        await page.waitForTimeout(300);
+    };
+
+    // ── Hierarchy "+" ──
+    const origin = await pivot();
+    await createFromPlus("Create Empty");
+    await rename("PlusRoot");
+    const plusT = await tf("PlusRoot");
+    check("Hierarchy + Create Empty lands at the pivot", near3(plusT.localPosition, origin), JSON.stringify(plusT.localPosition));
+    check("and is a root row (padding-left 22px)", (await row("PlusRoot").evaluate(el => el.style.paddingLeft)) === "22px", await row("PlusRoot").evaluate(el => el.style.paddingLeft));
+    check("and is selected", (await page.evaluate(() => window.__wetsProbe.selection())).join() === "PlusRoot", JSON.stringify(await page.evaluate(() => window.__wetsProbe.selection())));
+
+    // A parent away from the origin, turned and scaled: the child must still be
+    // at LOCAL zero with identity rotation and unit scale (Unity SetParentAndAlign).
+    await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+    await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "Cube" }).last().click();
+    await page.waitForTimeout(300);
+    await rename("Holder");
+    const fillField = async (field, axis, value) => {
+        await page.locator(".insp-body .field").nth(field).locator("input").nth(axis).fill(String(value));
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(200);
+    };
+    await fillField(0, 0, 3); await fillField(0, 1, 1); await fillField(0, 2, 2);
+    await fillField(1, 1, 45);
+    await fillField(2, 0, 2); await fillField(2, 1, 2); await fillField(2, 2, 2);
+    const holder = await tf("Holder");
+    check("the parent is at (3,1,2), 45 deg about Y, scaled 2", near3(holder.position, { x: 3, y: 1, z: 2 }) && near3(holder.localScale, { x: 2, y: 2, z: 2 }), JSON.stringify(holder));
+
+    // ── The object's context menu ──
+    await row("Holder").click({ button: "right" });
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "Create Empty" }).last().click();
+    await page.waitForTimeout(300);
+    await rename("Kid");
+    const kid = await tf("Kid");
+    check("context-menu Create Empty is a child at local zero", near3(kid.localPosition, { x: 0, y: 0, z: 0 }), JSON.stringify(kid.localPosition));
+    check("the child keeps the parent's world position", near3(kid.position, holder.position), JSON.stringify(kid.position));
+    check("the child has identity local rotation", near3(kid.localRotation, { x: 0, y: 0, z: 0 }, 1e-3) && Math.abs(kid.localRotation.w - 1) < 1e-3, JSON.stringify(kid.localRotation));
+    check("the child has unit local scale", near3(kid.localScale, { x: 1, y: 1, z: 1 }), JSON.stringify(kid.localScale));
+    check("the child row sits one level deeper (padding-left 36px)", (await row("Kid").evaluate(el => el.style.paddingLeft)) === "36px", await row("Kid").evaluate(el => el.style.paddingLeft));
+
+    // A 3D Object from the same context menu gets the same alignment.
+    await row("Holder").click({ button: "right" });
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "Sphere" }).last().click();
+    await page.waitForTimeout(300);
+    const sphere = await tf("Sphere");
+    check("context-menu 3D Object is a child at local zero too", near3(sphere.localPosition, { x: 0, y: 0, z: 0 }) && near3(sphere.localScale, { x: 1, y: 1, z: 1 }), JSON.stringify(sphere.localPosition));
+
+    // With a child selected, "+" still makes a ROOT, never a sibling/child.
+    await row("Kid").click();
+    await page.waitForTimeout(200);
+    await createFromPlus("Create Empty");
+    await rename("PlusRoot2");
+    const plus2 = await tf("PlusRoot2");
+    check("with a child selected, + still creates a root at the pivot", near3(plus2.localPosition, origin), JSON.stringify(plus2.localPosition));
+    check("and that root is not indented", (await row("PlusRoot2").evaluate(el => el.style.paddingLeft)) === "22px", await row("PlusRoot2").evaluate(el => el.style.paddingLeft));
+
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1r4 — the eight review proofs: gizmo centre/axes, right objects, icons.
+scenario("component gizmos: the review proofs (B1r4)", async () => {
+    const page = await newPage("GizmoProof", { probe: true });
+
+    // Seeded through the scene file: exact poses, collider fields and one
+    // inactive parent without clicking through the Inspector for each.
+    const H = Math.SQRT1_2; // cos/sin 45 deg
+    const go = (name, extra) => ({
+        name, active: true,
+        transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+        components: [], children: [], ...extra,
+    });
+    const at = (x, y, z) => ({ x, y, z });
+    const scene = {
+        name: "Seeded", version: 1,
+        roots: [
+            go("PL", { transform: { position: at(5, 2, -3), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "PointLight", fields: { range: 10 } }] }),
+            // minDistance 0 keeps exactly ONE circle (the max one); 500 is the default max.
+            go("Audio", { transform: { position: at(-4, 1, 6), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "AudioSource", fields: { minDistance: 0, maxDistance: 500 } }] }),
+            go("Cap", { transform: { position: at(0, 3, 0), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "CapsuleCollider", fields: {} }] }),
+            go("Cap2", { transform: { position: at(0, 3, 0), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(2, 2, 2) }, components: [{ type: "CapsuleCollider", fields: {} }] }),
+            go("Spot", { transform: { position: at(2, 4, 1), rotation: { x: H, y: 0, z: 0, w: H }, scale: at(1, 1, 1) }, components: [{ type: "SpotLight", fields: { range: 10, spotAngle: 60 } }] }),
+            go("BoxRot", { transform: { position: at(1, 0, 0), rotation: { x: 0, y: 0, z: H, w: H }, scale: at(2, 2, 2) }, components: [{ type: "BoxCollider", fields: { center: at(0, 1, 0) } }] }),
+            go("Twin", { components: [
+                { type: "BoxCollider", fields: { size: at(1, 1, 1) } },
+                { type: "BoxCollider", fields: { size: at(3, 3, 3) } },
+            ] }),
+            go("HiddenParent", { active: false, children: [
+                go("HiddenLight", { components: [{ type: "PointLight", fields: { range: 5 } }] }),
+            ] }),
+            go("Unsel", { components: [{ type: "PointLight", fields: { range: 5 } }] }),
+        ],
+    };
+    await seed(page, "GizmoProof", {
+        "scenario.meta.json": JSON.stringify({ id: "gizmoproof", name: "GizmoProof", version: "1.0.0" }),
+        "assets/scenes/main.scene.json": JSON.stringify(scene),
+    });
+    await page.getByText("Open folder…").click();
+    await page.locator(".work").waitFor();
+    // Wait for the scene to reach the tree before reading it (the FmtOpen lesson:
+    // under load the scene's arrival lags the workspace's).
+    for (let i = 0; i < 50; i++) {
+        if ((await page.locator("app-hierarchy").innerText()).includes("BoxRot")) break;
+        await page.waitForTimeout(100);
+    }
+
+    // Rotate a vector by a quaternion (the engine's rotation convention), so
+    // expectations are derived, never sign-guessed.
+    const rotate = (v, q) => {
+        const tx = 2 * (q.y * v.z - q.z * v.y), ty = 2 * (q.z * v.x - q.x * v.z), tz = 2 * (q.x * v.y - q.y * v.x);
+        return {
+            x: v.x + q.w * tx + q.y * tz - q.z * ty,
+            y: v.y + q.w * ty + q.z * tx - q.x * tz,
+            z: v.z + q.w * tz + q.x * ty - q.y * tx,
+        };
+    };
+    const add = (a, b, k = 1) => ({ x: a.x + b.x * k, y: a.y + b.y * k, z: a.z + b.z * k });
+    const near3 = (v, e, tol = 1e-2) => !!v && Math.abs(v.x - e.x) < tol && Math.abs(v.y - e.y) < tol && Math.abs(v.z - e.z) < tol;
+    const nearR = (r, e) => Math.abs(r - e) < Math.max(1e-2, Math.abs(e) * 1e-2);
+    const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+    const info = (name, kind) => page.evaluate(([n, k]) => window.__wetsProbe.gizmoInfo(n, k), [name, kind]);
+    const icons = () => page.evaluate(() => window.__wetsProbe.iconCounts());
+
+    // Nothing selected: the proofs must hold for unselected objects too.
+    await page.locator("app-hierarchy li.scene-root").click();
+    await page.waitForTimeout(300);
+
+    // 1 — point light off the origin: three circles on the object, radius = range.
+    const pl = await info("PL", "PointLight");
+    const plRec = pl[0];
+    check("point light: one record with three circles", pl.length === 1 && plRec?.circles.length === 3, JSON.stringify(pl));
+    check("point light: circles centred on the object, radius = range",
+        !!plRec && plRec.circles.every(c => near3(c.center, { x: 5, y: 2, z: -3 }) && nearR(c.radius, 10)), JSON.stringify(plRec?.circles));
+    const plDistinct = !!plRec && plRec.circles.length === 3
+        && Math.abs(dot(plRec.circles[0].normal, plRec.circles[1].normal)) < 0.1
+        && Math.abs(dot(plRec.circles[0].normal, plRec.circles[2].normal)) < 0.1
+        && Math.abs(dot(plRec.circles[1].normal, plRec.circles[2].normal)) < 0.1;
+    check("point light: three distinct planes", plDistinct, JSON.stringify(plRec?.circles.map(c => c.normal)));
+
+    // 2 — AudioSource off the origin: one XY circle (minDistance 0), radius = maxDistance.
+    const au = await info("Audio", "AudioSource");
+    check("audio: one circle centred on the object with radius = maxDistance",
+        au.length === 1 && au[0].circles.length === 1
+        && near3(au[0].circles[0].center, { x: -4, y: 1, z: 6 }) && nearR(au[0].circles[0].radius, 500), JSON.stringify(au));
+    check("audio: the circle lies in the XY plane", !!au[0] && near3(au[0].circles[0].normal, { x: 0, y: 0, z: 1 }), JSON.stringify(au[0]?.circles[0]?.normal));
+
+    // 3 — capsule twins: the scaled one is twice the unscaled one, same centre.
+    const cap = await info("Cap", "CapsuleCollider");
+    const cap2 = await info("Cap2", "CapsuleCollider");
+    check("capsule: one record each, centred on the object",
+        cap.length === 1 && cap2.length === 1 && near3(cap[0]?.center, { x: 0, y: 3, z: 0 }) && near3(cap2[0]?.center, { x: 0, y: 3, z: 0 }),
+        JSON.stringify([cap[0]?.center, cap2[0]?.center]));
+    check("capsule: scaling 2 doubles the half-height",
+        !!cap[0] && !!cap2[0] && cap[0].half.y > 0 && nearR(cap2[0].half.y, cap[0].half.y * 2),
+        JSON.stringify([cap[0]?.half, cap2[0]?.half]));
+
+    // 4 — spot rotated 90 deg about X points down: end circle on the rotated forward.
+    const spotT = await page.evaluate(() => window.__wetsProbe.transformOf("Spot"));
+    const fwd = rotate({ x: 0, y: 0, z: 1 }, spotT.rotation);
+    check("the seeded spot points down", near3(fwd, { x: 0, y: -1, z: 0 }), JSON.stringify(fwd));
+    const sp = await info("Spot", "SpotLight");
+    const spC = sp[0]?.circles[0];
+    check("spot: end circle centre = position + range * forward",
+        sp.length === 1 && !!spC && near3(spC.center, add(spotT.position, fwd, 10)), JSON.stringify(spC?.center));
+    check("spot: end circle normal parallel to forward", !!spC && Math.abs(Math.abs(dot(spC.normal, fwd)) - 1) < 1e-2, JSON.stringify(spC?.normal));
+    check("spot: end circle radius = range * tan(spotAngle/2)", !!spC && nearR(spC.radius, 10 * Math.tan(Math.PI / 6)), JSON.stringify(spC?.radius));
+
+    // 5 — BoxCollider local centre scaled then rotated: pos + rotate((0,2,0)).
+    const boxT = await page.evaluate(() => window.__wetsProbe.transformOf("BoxRot"));
+    const bx = await info("BoxRot", "BoxCollider");
+    check("box: local centre scaled and rotated into place",
+        bx.length === 1 && near3(bx[0]?.center, add(boxT.position, rotate({ x: 0, y: 2, z: 0 }, boxT.rotation))), JSON.stringify(bx[0]?.center));
+    check("box: half-extents follow the scale", bx.length === 1 && near3(bx[0]?.half, { x: 1, y: 1, z: 1 }), JSON.stringify(bx[0]?.half));
+
+    // 6 — two colliders of one type: two wireframes; disable the first, one stays.
+    const twins = await info("Twin", "BoxCollider");
+    const halves = twins.map(r => r.half.x).sort((a, b) => a - b);
+    check("two BoxColliders draw two distinct wireframes", twins.length === 2 && nearR(halves[0], 0.5) && nearR(halves[1], 1.5), JSON.stringify(halves));
+    const disabled = await page.evaluate(() => window.__wetsProbe.setComponentEnabled("Twin", "BoxCollider", 0, false));
+    // At least two frames so the controller rebuilds before the read-back.
+    await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+    await page.waitForTimeout(200);
+    const twinsAfter = await info("Twin", "BoxCollider");
+    check("disabling the first leaves the second",
+        disabled && twinsAfter.length === 1 && nearR(twinsAfter[0]?.half.x, 1.5), JSON.stringify(twinsAfter.map(r => r.half)));
+
+    // 7 — inactive parent: no gizmo, no icon for the child.
+    const hidden = await info("HiddenLight", "PointLight");
+    const hiddenIcons = await icons();
+    const hiddenTf = await page.evaluate(() => window.__wetsProbe.transformOf("HiddenLight"));
+    check("an inactive parent's light draws no gizmo", hidden.length === 0, JSON.stringify(hidden));
+    check("an inactive parent's light has no icon",
+        !!hiddenTf && (hiddenIcons.PointLight ?? 0) === 2, JSON.stringify(hiddenIcons));
+
+    // 8 — an unselected light still has an icon (production bundle, registry names),
+    // and its Drawn record flips `selected` with the selection.
+    check("an unselected light has an icon", (await icons()).PointLight >= 2, JSON.stringify(await icons()));
+    check("an unselected light's record is not selected", (await info("Unsel", "PointLight"))[0]?.selected === false, JSON.stringify(await info("Unsel", "PointLight")));
+    await page.locator("app-hierarchy li", { hasText: "Unsel" }).first().click();
+    // The selected flag is written by the gizmo rebuild one or two frames after
+    // the selection effect runs; under load a fixed sleep can read too early.
+    const selSettled = async (want) => {
+        for (let i = 0; i < 120; i++) {
+            if ((await info("Unsel", "PointLight"))[0]?.selected === want) return true;
+            await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+        }
+        return false;
+    };
+    await selSettled(true);
+    check("selecting it marks the record selected", (await info("Unsel", "PointLight"))[0]?.selected === true, JSON.stringify(await info("Unsel", "PointLight")));
+    await page.locator("app-hierarchy li.scene-root").click();
+    await selSettled(false);
+    check("deselecting clears the record's selected flag", (await info("Unsel", "PointLight"))[0]?.selected === false, JSON.stringify(await info("Unsel", "PointLight")));
 
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
