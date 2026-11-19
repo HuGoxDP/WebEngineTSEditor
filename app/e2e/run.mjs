@@ -200,6 +200,22 @@ const slowLibraryWrite = (page, fileName, ms) => page.evaluate(([name, delay]) =
     };
 }, [fileName, ms]);
 
+/**
+ * Makes the next write of one file throw once — a disk failure mid-add. The
+ * file handle is already created by then, exactly as a real failure leaves it
+ * (C4r5). Test instrumentation only.
+ */
+const failNextWrite = (page, fileName) => page.evaluate(name => {
+    const create = FileSystemFileHandle.prototype.createWritable;
+    FileSystemFileHandle.prototype.createWritable = async function (...args) {
+        if (this.name === name && !window.__libWriteFailed) {
+            window.__libWriteFailed = true;
+            throw new Error("e2e: disk full");
+        }
+        return create.apply(this, args);
+    };
+}, fileName);
+
 /** Copies a folder from the page's "disk" to a real directory, so other tools can be pointed at it. */
 async function exportFolder(page, folder, sub, targetDir) {
     const files = await page.evaluate(async ([name, path]) => {
@@ -721,6 +737,123 @@ scenario("library: deleting the target mid-add aborts cleanly, first undo restor
         saved.roots.length === 1 && saved.roots[0].name === "Spinner" && saved.roots[0].components.length === 0,
         JSON.stringify(saved.roots).slice(0, 240));
     check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4r5, blocker 2a: a stale library file whose class never registered (here a
+// zero-byte leftover) must not hide the entry — the Library still offers it,
+// and adding heals the file. A healthy installed file is never overwritten.
+scenario("library: a stale empty file stays offered and the add heals it (C4r5)", async () => {
+    const page = await newPage("LibraryStale", { probe: true });
+    const customRotator = `import { ScriptableBehaviour, Serializable, SerializedField } from "WebEngineTS";
+// user-edited: keep me
+@Serializable({ typeName: "Rotator" })
+export default class Rotator extends ScriptableBehaviour {
+    @SerializedField() public speed = 45;
+}
+`;
+    await seed(page, "LibraryStale", {
+        "scripts/library/LookAtCamera.ts": "",
+        "scripts/library/Rotator.ts": customRotator,
+    });
+    await openLibraryProject(page, "LibraryStale");
+
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill("lookat");
+    await page.waitForTimeout(300);
+    const items = await page.locator(".add-list li").allInnerTexts();
+    check("the stale entry is still offered", items.filter(t => t.trim() === "LookAtCamera").length === 1, items.join(","));
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await page.waitForFunction(
+        () => document.querySelector(".insp-body")?.innerText?.includes("LookAtCamera") ?? false,
+        null, { timeout: 30000 },
+    );
+    await page.waitForTimeout(300);
+    const healed = await readDisk(page, "LibraryStale", "scripts/library/LookAtCamera.ts");
+    check("the add heals the empty file", healed !== null && healed.includes('typeName: "LookAtCamera"'), String(healed).slice(0, 120));
+    check("the object is still selected", (await page.evaluate(() => window.__wetsProbe.transformOf("Spinner"))) !== null);
+
+    // The author's own Rotator attaches through Scripts and is never rewritten.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill("rotator");
+    await page.waitForTimeout(300);
+    const rotItems = await page.locator(".add-list li").allInnerTexts();
+    check("the healthy installed file is offered once, from Scripts",
+        rotItems.filter(t => t.trim() === "Rotator").length === 1, rotItems.join(","));
+    await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+    await page.waitForFunction(
+        () => document.querySelector(".insp-body")?.innerText?.includes("Rotator") ?? false,
+        null, { timeout: 30000 },
+    );
+    const kept = await readDisk(page, "LibraryStale", "scripts/library/Rotator.ts");
+    check("the author's non-empty library file is never overwritten", kept === customRotator, String(kept).slice(0, 160));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4r5, blocker 2b: a write that fails mid-add leaves a zero-byte file behind
+// (the handle is created before the writable). The catch must remove that
+// partial — it was created by this add and is empty — keep the error dialog,
+// and the next add must succeed.
+scenario("library: a failed write removes its own partial file, the retry heals (C4r5)", async () => {
+    const page = await newPage("LibraryFailed", { probe: true });
+    await openLibraryProject(page, "LibraryFailed");
+    await failNextWrite(page, "LookAtCamera.ts");
+
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await dialogTitle(page).waitFor({ timeout: 15000 });
+    check("the failure is shown in the error dialog",
+        (await dialogTitle(page).innerText()) === "Something went wrong"
+        && (await page.locator(".dlg-msg").last().innerText()).includes("disk full"),
+        await page.locator(".dlg-msg").last().innerText());
+    await dialogButton(page, "OK").click();
+    await page.waitForTimeout(300);
+
+    const state = await diskState(page, "LibraryFailed");
+    check("the partial file this add created is removed", !state.includes("scripts/library/LookAtCamera.ts"), state.join(","));
+
+    // The entry is offered again and the retry (the write no longer fails) heals.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill("lookat");
+    await page.waitForTimeout(300);
+    const items = await page.locator(".add-list li").allInnerTexts();
+    check("the entry is offered again after the failure", items.filter(t => t.trim() === "LookAtCamera").length === 1, items.join(","));
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await page.waitForFunction(
+        () => document.querySelector(".insp-body")?.innerText?.includes("LookAtCamera") ?? false,
+        null, { timeout: 30000 },
+    );
+    const healed = await readDisk(page, "LibraryFailed", "scripts/library/LookAtCamera.ts");
+    check("the retry writes the source and attaches", healed !== null && healed.includes('typeName: "LookAtCamera"'), String(healed).slice(0, 120));
+    // The one expected failure log is the dialog's own console.error; nothing else.
+    const expected = page.logs.filter(l => l.includes("e2e: disk full"));
+    const unexpected = page.logs.filter(l => !l.includes("e2e: disk full") && !l.includes("404") && !l.includes("GL Driver Message") && !l.includes("GPU stall"));
+    check("the failure is logged exactly once, nothing else errors",
+        expected.length === 1 && unexpected.length === 0, page.logs.join(" | "));
+});
+
+// C4r5, blocker 2b guard: the catch must never delete a file the add did not
+// create — the author's own non-empty script survives a failed write.
+scenario("library: a failed write never deletes the author's existing file (C4r5)", async () => {
+    const page = await newPage("LibraryOwned", { probe: true });
+    const owned = `// the author's own draft — not a behaviour yet\nexport const draft = true;\n`;
+    await seed(page, "LibraryOwned", { "scripts/library/LookAtCamera.ts": owned });
+    await openLibraryProject(page, "LibraryOwned");
+    await failNextWrite(page, "LookAtCamera.ts");
+
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill("lookat");
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await dialogTitle(page).waitFor({ timeout: 15000 });
+    await dialogButton(page, "OK").click();
+    await page.waitForTimeout(300);
+    const kept = await readDisk(page, "LibraryOwned", "scripts/library/LookAtCamera.ts");
+    check("the author's existing file survives the failed write", kept === owned, String(kept));
 });
 
 // C4r4, F1+F2: every form of the engine import resolves. The clause-level

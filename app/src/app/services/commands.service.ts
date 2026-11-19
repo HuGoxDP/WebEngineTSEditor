@@ -205,7 +205,22 @@ export class CommandsService {
         const targetName = target.name;
         this.run(async () => {
             if (!this._library.isInstalled(entry)) {
-                await this._project.write(LibraryService.pathOf(entry.name), entry.source);
+                const path = LibraryService.pathOf(entry.name);
+                const existed = this._project.exists(path);
+                try {
+                    await this._project.write(path, entry.source);
+                } catch (err) {
+                    // The write creates the file handle before the writable, so
+                    // a failure can leave a zero-byte partial behind. Remove it
+                    // only when this add created it and it is empty — never a
+                    // file the author already had (C4 review).
+                    if (!existed) {
+                        try {
+                            if ((await this._project.readFile(path)).size === 0) await this._project.removeQuietly(path);
+                        } catch { /* already gone */ }
+                    }
+                    throw err;
+                }
                 await this._code.reloadScripts();
             }
             const ctor = this._library.ctorOf(entry.name);

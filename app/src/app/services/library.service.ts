@@ -45,10 +45,12 @@ export class LibraryService {
     /** Where adding copies the source: a permanent project file, D5. */
     public static pathOf(name: string): string { return `scripts/library/${name}.ts`; }
 
-    /** Installed = the file is on disk; a registered class alone is not enough
-     *  (the previous session's registry can outlive the project). */
+    /** Installed = the file is on disk AND its class is registered. A registered
+     *  class alone is not enough (the previous session's registry can outlive
+     *  the project); neither is a stale or empty file whose class never loaded —
+     *  that entry stays offered so the next add heals the file (C4 review). */
     public isInstalled(entry: LibraryEntry): boolean {
-        return this._project.exists(LibraryService.pathOf(entry.name));
+        return this._project.exists(LibraryService.pathOf(entry.name)) && this.ctorOf(entry.name) !== null;
     }
 
     /** The entries to offer in the Library section, matching the filter text.
