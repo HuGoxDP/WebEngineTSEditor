@@ -110,11 +110,20 @@ export class ScriptRuntimeService {
         for (const file of files) {
             // A file listed and then gone (the whole project cleared under the
             // editor's feet, which the app supports) is a file the project no
-            // longer has, not an error to shout about.
+            // longer has, not an error to shout about. Any *other* read failure
+            // is a problem the author must see: reported with a jump, like a
+            // compile diagnostic, and the file is left out of this pass.
             let text: string;
             try {
                 text = await this._project.readText(file);
-            } catch {
+            } catch (err) {
+                if ((err as DOMException)?.name !== 'NotFoundError') {
+                    this._console.push({
+                        level: 'error',
+                        message: `[Script] ${file} could not be read: ${String(err)}`,
+                        jump: { path: file, line: 1 },
+                    });
+                }
                 continue;
             }
             const key = file.replace(/\.tsx?$/, '.js');

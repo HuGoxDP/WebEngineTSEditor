@@ -216,6 +216,20 @@ const failNextWrite = (page, fileName) => page.evaluate(name => {
     };
 }, fileName);
 
+/**
+ * Makes every read of one file throw NotAllowedError — a read failure that is
+ * not a vanished file (a permission problem, a locked handle). The seam is
+ * getFile, which readText goes through; listing still works (C4r2).
+ * Test instrumentation only.
+ */
+const failReads = (page, fileName) => page.evaluate(name => {
+    const get = FileSystemFileHandle.prototype.getFile;
+    FileSystemFileHandle.prototype.getFile = function (...args) {
+        if (this.name === name) throw new DOMException("e2e: read refused", "NotAllowedError");
+        return get.apply(this, args);
+    };
+}, fileName);
+
 /** Copies a folder from the page's "disk" to a real directory, so other tools can be pointed at it. */
 async function exportFolder(page, folder, sub, targetDir) {
     const files = await page.evaluate(async ([name, path]) => {
@@ -1366,6 +1380,75 @@ scenario("saving over an outside-changed script asks before it overwrites", asyn
   check("the mark is cleared", (await page.locator(".dot.unsaved").count()) === 0);
   check("no native dialogs were used", page.nativeDialogs === 0);
   check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4r2: a script read that fails is only silent when the file is gone. The
+// whole project cleared under the editor is the supported case; any other
+// failure is a problem the author must see in the Console.
+scenario("a script file that vanished mid-reload is skipped silently", async () => {
+  const page = await newPage("OutsideVanish");
+  await seed(page, "OutsideVanish", {
+    "scenario.meta.json": JSON.stringify({ id: "outside-vanish", name: "OutsideVanish", version: 1 }),
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "assets/scenes/main.scene.json": sceneWith("Seeded"),
+  });
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  await page.waitForTimeout(600);
+
+  // Listed, then gone before the read: the file disappears under the reload.
+  const get = await page.evaluateHandle(() => FileSystemFileHandle.prototype.getFile);
+  await page.evaluate(orig => {
+    FileSystemFileHandle.prototype.getFile = function (...args) {
+      if (this.name === "Scenario.ts") throw new DOMException("gone", "NotFoundError");
+      return orig.apply(this, args);
+    };
+  }, get);
+  // A real outside change to another script drives the focus reload; the
+  // vanished one must not cost a Console row or break the reload.
+  await seed(page, "OutsideVanish", { "scripts/Other.ts": "export const other = 1;\n" });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(1500);
+  await page.evaluate(orig => { FileSystemFileHandle.prototype.getFile = orig; }, get);
+
+  await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+  await page.waitForTimeout(400);
+  const consoleText = await page.locator(".cons-list").innerText();
+  check("no read error reached the Console", !consoleText.includes("Scenario.ts"), consoleText.slice(0, 240));
+  check("the editor is still usable", await page.locator(".work").isVisible());
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  check("an object can still be created", (await page.locator("app-hierarchy li", { hasText: "GameObject" }).count()) > 0);
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("a script read failure other than a vanished file reaches the Console", async () => {
+  const page = await newPage("OutsideReadFail");
+  await seed(page, "OutsideReadFail", {
+    "scenario.meta.json": JSON.stringify({ id: "outside-readfail", name: "OutsideReadFail", version: 1 }),
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "assets/scenes/main.scene.json": sceneWith("Seeded"),
+  });
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  await page.waitForTimeout(600);
+
+  await failReads(page, "Scenario.ts");
+  await seed(page, "OutsideReadFail", { "scripts/Other.ts": "export const other = 1;\n" });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(1500);
+
+  await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+  await page.waitForTimeout(400);
+  const consoleText = await page.locator(".cons-list").innerText();
+  check("the failure reached the Console as an error",
+    (await page.locator(".log.error .msg", { hasText: "Scenario.ts" }).count()) > 0, consoleText.slice(0, 240));
+  check("the row names the read, not a compile", consoleText.includes("could not be read"), consoleText.slice(0, 240));
+  check("the row is a jump to the file", (await page.locator(".log .src.jump").count()) > 0);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+  check("no native dialogs were used", page.nativeDialogs === 0);
 });
 
 scenario("start screen: no workspace without a project; open, close, recent, forget", async () => {
