@@ -179,6 +179,27 @@ const slowAutosave = (page, ms) => page.evaluate(delay => {
     window.__slowAutosave = delay;
 }, ms);
 
+/**
+ * Holds one library file's write open `ms` longer before it closes, and raises
+ * `window.__libWriteClosing` when that close starts — so a scenario can act
+ * while the add is still in flight (C4r5). Test instrumentation only.
+ */
+const slowLibraryWrite = (page, fileName, ms) => page.evaluate(([name, delay]) => {
+    const create = FileSystemFileHandle.prototype.createWritable;
+    FileSystemFileHandle.prototype.createWritable = async function (...args) {
+        const writable = await create.apply(this, args);
+        if (this.name === name) {
+            const close = writable.close.bind(writable);
+            writable.close = async () => {
+                window.__libWriteClosing = true;
+                await new Promise(r => setTimeout(r, delay));
+                return close();
+            };
+        }
+        return writable;
+    };
+}, [fileName, ms]);
+
 /** Copies a folder from the page's "disk" to a real directory, so other tools can be pointed at it. */
 async function exportFolder(page, folder, sub, targetDir) {
     const files = await page.evaluate(async ([name, path]) => {
@@ -649,6 +670,57 @@ scenario("library: second and third adds keep working, nothing offered twice (DW
     check("a second Mover attaches from Scripts", movers === 2, String(movers));
     check("no page errors, no duplicate-registration advisory", noErrors(page), page.logs.join(" | "));
     await shot(page, "e2e-library-repeat");
+});
+
+// C4r5, blocker 1: an add whose target is deleted while the library file is
+// still being written must abort — no attach to the destroyed object, no
+// history entry, no selection change — and the written file stays.
+scenario("library: deleting the target mid-add aborts cleanly, first undo restores it (C4r5)", async () => {
+    const page = await newPage("LibraryMidflight", { probe: true });
+    await openLibraryProject(page, "LibraryMidflight");
+    await slowLibraryWrite(page, "LookAtCamera.ts", 1500);
+
+    // Start the add, then delete the target while the file write is in flight.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await page.waitForFunction(() => window.__libWriteClosing === true, null, { timeout: 15000 });
+    await page.keyboard.press("Delete");
+    await page.waitForFunction(
+        () => !(document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false),
+        null, { timeout: 5000 },
+    );
+
+    // Let the write land and the reload/rebuild/attach attempt run its course.
+    await page.waitForFunction(() => window.__wetsProbe.scriptClass("LookAtCamera") !== null, null, { timeout: 30000 });
+    await page.waitForTimeout(1000);
+
+    const src = await readDisk(page, "LibraryMidflight", "scripts/library/LookAtCamera.ts");
+    check("the written library file stays", src !== null && src.includes('typeName: "LookAtCamera"'), String(src).slice(0, 120));
+    const tree = await page.locator("app-hierarchy li .label").allInnerTexts();
+    check("no ghost object in the hierarchy", !tree.includes("Spinner"), tree.join(","));
+    const sel = await page.evaluate(() => window.__wetsProbe.selection());
+    check("the destroyed object is not selected", sel.length === 0, JSON.stringify(sel));
+    const comps = await page.locator(".insp-body .comp", { hasText: "LookAtCamera" }).count();
+    check("no inspector component for the destroyed object", comps === 0, String(comps));
+
+    // The delete must be the FIRST undo step: no 'Add LookAtCamera' on top of it.
+    await page.keyboard.press("Control+z");
+    await page.waitForFunction(
+        () => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false,
+        null, { timeout: 5000 },
+    );
+    check("Ctrl+Z restores the deleted object as the first undo step", true);
+
+    await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+    await page.waitForTimeout(300);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(800);
+    const saved = JSON.parse(await readDisk(page, "LibraryMidflight", "assets/scenes/main.scene.json"));
+    check("the saved scene is clean: Spinner back, no LookAtCamera",
+        saved.roots.length === 1 && saved.roots[0].name === "Spinner" && saved.roots[0].components.length === 0,
+        JSON.stringify(saved.roots).slice(0, 240));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
 // C4r4, F1+F2: every form of the engine import resolves. The clause-level

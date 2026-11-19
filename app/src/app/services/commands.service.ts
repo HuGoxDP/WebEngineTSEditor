@@ -194,8 +194,10 @@ export class CommandsService {
      * copied into `scripts/library/<Name>.ts` — a permanent project file — then
      * the script runtime reloads, which rebuilds the scene and clears the
      * selection when the class is new. The target is therefore re-found by name
-     * after the reload; the attach itself is one undoable scene step (the
-     * written file is not undone).
+     * after the reload; if it no longer exists (deleted while the write was in
+     * flight) the add aborts — nothing attached, no history entry, no selection
+     * change. The attach itself is one undoable scene step (the written file is
+     * not undone).
      */
     public addLibrary(entry: LibraryEntry): void {
         const target = this._selection.selected();
@@ -211,7 +213,8 @@ export class CommandsService {
                 await this.fail(this._i18n.t('insp.libraryFailed', { name: entry.name }));
                 return;
             }
-            const go = SceneManager.activeScene.findGameObject(targetName) ?? target;
+            const go = SceneManager.activeScene.findGameObject(targetName);
+            if (!go) return;
             this._history.record(`Add ${entry.name}`, () => {
                 go.addComponent(ctor as any);
                 this._selection.select(go);
