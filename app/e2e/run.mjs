@@ -1224,6 +1224,150 @@ scenario("a script file opens in the Code tab, edits, and saves", async () => {
   await shot(page, "e2e-code-tab");
 });
 
+// C4 phase 5: outside edits to scripts are seen on window focus — recompiled
+// quietly when the buffer is clean, asked about when it is dirty, and a save
+// over an outside-changed file asks before it overwrites. Same OPFS-write +
+// focus pattern as the scene's "changes made outside" scenario.
+scenario("an outside edit to a script recompiles on focus", async () => {
+  const page = await newPage("OutsideScript", { probe: true });
+  await seed(page, "OutsideScript", {
+    "scenario.meta.json": JSON.stringify({ id: "outside-script", name: "OutsideScript", version: 1 }),
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Rotator.ts": ROTATOR,
+    "assets/scenes/main.scene.json": sceneWith("Seeded"),
+  });
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  await page.waitForFunction(() => window.__wetsProbe.scriptClass("Rotator") !== null, null, { timeout: 30000 });
+  const token = await page.evaluate(() => window.__wetsProbe.scriptClass("Rotator").token);
+
+  // Changed on the "disk", the Code tab never opened it.
+  await seed(page, "OutsideScript", { "scripts/components/Rotator.ts": ROTATOR.replace("public speed = 1;", "public speed = 7;") });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  const swapped = await page.waitForFunction(old => window.__wetsProbe.scriptClass("Rotator")?.token !== old, token, { timeout: 30000 })
+    .then(() => true, () => false);
+  check("the outside edit recompiles the script", swapped);
+  check("no dialog was needed", (await page.locator(".dlg").count()) === 0);
+  // A fresh object of the class sees the disk's new default.
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().click();
+  await page.waitForTimeout(300);
+  await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+  await page.waitForTimeout(500);
+  await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+  await page.waitForTimeout(600);
+  const added = await page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  check("a new object gets the outside edit's default", added.includes("7"), JSON.stringify(added));
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  // The swap advisory is what a reload looks like from the engine's side —
+  // `register` refuses the second class and the editor answers with
+  // `TypeRegistry.replace`, exactly as in the save-and-swap scenario.
+  const swapError = "[TypeRegistry] Type name \"Rotator\" is already registered to a different class";
+  check("nothing but the swap advisory in the console",
+    page.logs.filter(l => !l.includes("404") && !l.includes(swapError)).length === 0,
+    page.logs.join(" | "));
+});
+
+scenario("an outside edit to an open dirty script asks; keep mine and reload both respected", async () => {
+  const page = await newPage("OutsideDirty");
+  await openEmptyProject(page);
+  await page.waitForTimeout(600);
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(600);
+  await page.locator(".proj .asset", { hasText: "Scenario.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  const original = await readDisk(page, "OutsideDirty", "scripts/Scenario.ts");
+  check("the Code tab is clean after opening", (await page.locator(".dot.unsaved").count()) === 0);
+
+  // Mine: an unsaved edit appended at the file's end (Monaco opens the cursor
+  // at 1:1, and the buffer read below looks at the end of the file).
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+End");
+  await page.keyboard.type("\n// mine\n");
+  await page.waitForTimeout(400);
+  check("the buffer is dirty", (await page.locator(".dot.unsaved").count()) > 0);
+
+  // Theirs: the file changes on disk underneath.
+  const diskText = original + "\n// from outside\n";
+  await seed(page, "OutsideDirty", { "scripts/Scenario.ts": diskText });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(800);
+  check("changed in both places, it asks", (await dialogTitle(page).innerText()) === "Scenario.ts changed on disk");
+  await dialogButton(page, "Keep mine").click();
+  await page.waitForTimeout(500);
+  // Monaco renders only the lines in view, and setValue scrolls back to the
+  // top — so go to the file's end first (where every marker here sits), then
+  // read. The view-lines carry non-breaking spaces and sit in DOM order, not
+  // line order; normalise both.
+  const buffer = async () => {
+    await page.locator(".monaco-editor textarea").focus();
+    await page.keyboard.press("Control+End");
+    await page.waitForTimeout(200);
+    return page.evaluate(() => [...document.querySelectorAll(".view-lines .view-line")]
+      .map(e => ({ top: e.offsetTop, text: e.textContent }))
+      .sort((a, b) => a.top - b.top).map(l => l.text).join("\n").replace(/\u00a0/g, " "));
+  };
+  check("keep mine keeps my buffer", (await buffer()).includes("// mine"));
+  check("and the disk still holds the outside edit", (await readDisk(page, "OutsideDirty", "scripts/Scenario.ts")) === diskText);
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(800);
+  check("the same change is not asked about again", (await page.locator(".dlg").count()) === 0);
+  check("the buffer is still mine and still dirty", (await buffer()).includes("// mine") && (await page.locator(".dot.unsaved").count()) > 0);
+
+  // A second outside change asks again; this time the disk version is taken.
+  const diskText2 = original + "\n// from outside again\n";
+  await seed(page, "OutsideDirty", { "scripts/Scenario.ts": diskText2 });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(800);
+  check("a new outside change asks again", (await page.locator(".dlg").count()) === 1);
+  await dialogButton(page, "Reload from disk").click();
+  await page.waitForTimeout(800);
+  check("reload takes the disk text into the buffer", (await buffer()).includes("// from outside again") && !(await buffer()).includes("// mine"));
+  check("the reloaded buffer is not marked unsaved", (await page.locator(".dot.unsaved").count()) === 0);
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("saving over an outside-changed script asks before it overwrites", async () => {
+  const page = await newPage("OutsideSave");
+  await openEmptyProject(page);
+  await page.waitForTimeout(600);
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(600);
+  await page.locator(".proj .asset", { hasText: "Scenario.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  const original = await readDisk(page, "OutsideSave", "scripts/Scenario.ts");
+
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.type("\n// my save\n");
+  await page.waitForTimeout(400);
+  const diskText = original + "\n// from outside\n";
+  await seed(page, "OutsideSave", { "scripts/Scenario.ts": diskText });
+
+  // Ctrl+S is Monaco's own command, wired to the same save the button uses.
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(800);
+  check("saving over an outside change asks", (await dialogTitle(page).innerText()) === "Replace the changed file?");
+  await dialogButton(page, "Cancel").click();
+  await page.waitForTimeout(500);
+  check("cancel leaves the disk untouched", (await readDisk(page, "OutsideSave", "scripts/Scenario.ts")) === diskText);
+  check("and the buffer stays dirty", (await page.locator(".dot.unsaved").count()) > 0);
+
+  // Confirming replaces — with a say, never silently.
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(800);
+  check("it asks again while the file is still changed outside", (await page.locator(".dlg").count()) === 1);
+  await dialogButton(page, "Replace").click();
+  await page.waitForTimeout(800);
+  const saved = await readDisk(page, "OutsideSave", "scripts/Scenario.ts");
+  check("confirming writes my buffer", saved.includes("// my save") && !saved.includes("// from outside"), saved.slice(-120));
+  check("the mark is cleared", (await page.locator(".dot.unsaved").count()) === 0);
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
 scenario("start screen: no workspace without a project; open, close, recent, forget", async () => {
     const page = await newPage("LifeDemo");
     check("no workspace before a project", (await page.locator(".work").count()) === 0);

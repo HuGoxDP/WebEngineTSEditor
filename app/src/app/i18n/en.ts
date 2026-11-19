@@ -112,6 +112,9 @@ export const en = {
     'code.emptyHint': 'Double-click a .ts or .js file in the Project panel to edit it here.',
     'code.save': 'Save',
     'code.unsaved': 'This file has unsaved changes',
+    'code.changedMessage': 'The script file was changed outside the editor, and you have unsaved changes here. Reload to take the version from disk, or keep yours.',
+    'code.overwriteTitle': 'Replace the changed file?',
+    'code.overwriteMessage': '{path} was changed outside the editor since you opened it. Saving will replace that version.',
 
     // ── viewport ────────────────────────────────────────────────────
     'vp.pivot': 'Pivot',

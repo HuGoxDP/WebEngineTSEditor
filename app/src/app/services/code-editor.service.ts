@@ -1,4 +1,6 @@
 import { Injectable, computed, signal } from '@angular/core';
+import { DialogService } from '../dialogs/dialog.service';
+import { I18nService } from '../i18n/i18n.service';
 import { ProjectService } from './project.service';
 import { ScriptRuntimeService } from './script-runtime.service';
 
@@ -40,10 +42,30 @@ export class CodeEditorService {
     /** What the Code tab shows when no file is open. */
     public readonly empty = computed(() => this.file() === null);
 
+    /**
+     * Each script file's `lastModified` as this editor last read or wrote it —
+     * the outside-edit baseline (the scene's is `DocumentService`'s stamp).
+     * Seeded for every script when a project settles, so a file never opened
+     * here is watched too. A file deleted outside loses its entry; the next
+     * settle or reload picks up whatever replaced it.
+     */
+    private readonly _stamps = new Map<string, number>();
+
+    /**
+     * Bumped when the open file's buffer was replaced from disk, so the panel
+     * re-reads it even though its path did not change (the workspace tracks
+     * the path, not the text).
+     */
+    public readonly diskReload = signal(0);
+
     public constructor(
         private readonly _project: ProjectService,
         private readonly _runtime: ScriptRuntimeService,
-    ) {}
+        private readonly _dialog: DialogService,
+        private readonly _i18n: I18nService,
+    ) {
+        window.addEventListener('focus', () => void this.checkOutsideEdits());
+    }
 
     /** Reads `path` into the Code tab. A read failure is reported, not swallowed. */
     public async open(path: string): Promise<boolean> {
@@ -59,6 +81,7 @@ export class CodeEditorService {
         this.file.set({ path, name: path.slice(path.lastIndexOf('/') + 1), language: languageOf(path) });
         this._dirty.set(false);
         this._revision.update(n => n + 1);
+        await this._stamp(path);
         return true;
     }
 
@@ -66,10 +89,14 @@ export class CodeEditorService {
      * Writes the buffer back through the project store, clears the mark, and
      * hands the saved file to the script runtime — a save is the moment the
      * project's classes change, which is what Unity's "reload on save" means.
+     *
+     * A file changed outside since the last read is never overwritten without
+     * a say: the same question the focus check asks, here before the write.
      */
     public async save(text: string): Promise<boolean> {
         const file = this.file();
         if (!file) return false;
+        if (await this._changedOnDisk(file.path) && !await this._askReplace(file)) return false;
         try {
             await this._project.write(file.path, text);
         } catch (err) {
@@ -78,13 +105,20 @@ export class CodeEditorService {
         }
         this._dirty.set(false);
         this._revision.update(n => n + 1);
+        await this._stamp(file.path);
         await this._reload();
         return true;
     }
 
-    /** Compiles, links and loads the project's scripts (the runtime's entry). */
+    /**
+     * Compiles, links and loads the project's scripts (the runtime's entry).
+     * The runtime has just read every script, so this is also the moment the
+     * outside-edit baseline is (re-)seeded for files never opened here.
+     */
     public async reloadScripts(): Promise<string[]> {
-        return await this._reload();
+        const notes = await this._reload();
+        for (const path of await this._runtime.scriptFiles()) await this._stamp(path);
+        return notes;
     }
 
     private async _reload(): Promise<string[]> {
@@ -129,5 +163,92 @@ export class CodeEditorService {
         if (this.file()?.path !== path) await this.open(path);
         this.jumpTo.set({ path, line });
         this.showRequest.update(n => n + 1);
+    }
+
+    // ── Changes made outside the editor ──────────────────────────────
+
+    private _checking = false;
+
+    /**
+     * When the window regains focus, looks for changes made to the project's
+     * scripts outside the editor — the scene's question is `CommandsService`'s.
+     * A clean buffer reloads quietly; a dirty one is asked, and "keep mine"
+     * takes the disk stamp so the same change is not asked about again. Any
+     * change costs one reload: the runtime re-reads every script itself.
+     */
+    public async checkOutsideEdits(): Promise<void> {
+        if (!this._project.isOpen() || this._checking || this._dialog.isOpen()) return;
+        this._checking = true;
+        try {
+            const changed: string[] = [];
+            const gone: string[] = [];
+            for (const path of await this._runtime.scriptFiles()) {
+                if (await this._changedOnDisk(path)) changed.push(path);
+            }
+            // A script deleted outside loses its stamp too; its class must not
+            // stay linked against a file the project no longer has.
+            for (const path of [...this._stamps.keys()]) {
+                if (changed.includes(path)) continue;
+                if (await this._project.modifiedAt(path).catch(() => null) === null) gone.push(path);
+            }
+            for (const path of gone) this._stamps.delete(path);
+            const open = this.file();
+            if (open && changed.includes(open.path)) {
+                if (this._dirty()) {
+                    const reload = await this._dialog.confirm({
+                        title: this._i18n.t('disk.changedTitle', { name: open.name }),
+                        message: this._i18n.t('code.changedMessage'),
+                        confirmLabel: this._i18n.t('disk.reload'),
+                        cancelLabel: this._i18n.t('disk.keepMine'),
+                        danger: true,
+                    });
+                    if (!reload) {
+                        await this._stamp(open.path);   // seen and kept: stop asking
+                    } else {
+                        await this._stamp(open.path);
+                        this._dirty.set(false);
+                        this.diskReload.update(n => n + 1);   // the panel re-reads the model
+                    }
+                } else {
+                    await this._stamp(open.path);
+                    this.diskReload.update(n => n + 1);
+                }
+            }
+            if (changed.length > 0 || gone.length > 0) await this.reloadScripts();
+        } catch (err) {
+            console.warn('[Script] Could not check the scripts for outside changes', err);
+        } finally {
+            this._checking = false;
+        }
+    }
+
+    /** Records the file's disk time as the baseline — what a read or write saw. */
+    private async _stamp(path: string): Promise<void> {
+        const at = await this._project.modifiedAt(path).catch(() => null);
+        if (at === null) this._stamps.delete(path);
+        else this._stamps.set(path, at);
+    }
+
+    /** Whether the file changed on disk since this editor last read or wrote it. */
+    private async _changedOnDisk(path: string): Promise<boolean> {
+        const stamp = this._stamps.get(path);
+        if (stamp === undefined) return false;
+        const now = await this._project.modifiedAt(path).catch(() => null);
+        return now !== null && now !== stamp;
+    }
+
+    /**
+     * Save's question when the file changed outside: replace it, or leave it.
+     * Refused, the save is aborted — the buffer stays dirty and the disk file
+     * is what the outside edit made it.
+     */
+    private async _askReplace(file: CodeFile): Promise<boolean> {
+        return this._dialog.confirm({
+            title: this._i18n.t('code.overwriteTitle'),
+            message: this._i18n.t('code.overwriteMessage', { path: file.path }),
+            confirmLabel: this._i18n.t('scene.replace'),
+            cancelLabel: this._i18n.t('dialog.cancel'),
+            danger: true,
+        });
     }
 }

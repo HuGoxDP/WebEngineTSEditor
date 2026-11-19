@@ -103,7 +103,7 @@ export class ScriptRuntimeService {
      */
     public async reload(): Promise<string[]> {
         const notes: string[] = [];
-        const files = await this._scriptFiles();
+        const files = await this.scriptFiles();
         const compiled = new Map<string, string>();
         const fresh = new Map<string, string>();
         const present = new Set<string>();
@@ -282,7 +282,7 @@ export class ScriptRuntimeService {
     }
 
     /** Every `.ts`/`.js` under `scripts/`, project-relative and sorted. */
-    private async _scriptFiles(): Promise<string[]> {
+    public async scriptFiles(): Promise<string[]> {
         const out: string[] = [];
         const walk = async (path: string): Promise<void> => {
             let entries;

@@ -5,6 +5,7 @@ import {
     OnDestroy,
     ViewChild,
     ElementRef,
+    effect,
     inject,
     signal,
 } from '@angular/core';
@@ -83,7 +84,19 @@ export class CodeComponent implements AfterViewInit, OnDestroy {
     private _editor: Editor | null = null;
     private readonly _ready = signal(false);
 
-    public constructor() {}
+    public constructor() {
+        // The focus check replaced the open buffer from disk: re-read the model
+        // even though the path did not change. `_sync`'s setValue fires the
+        // content listener, which would mark the fresh disk text "unsaved" —
+        // stand the listener down for the swap, as during the first sync.
+        effect(() => {
+            this.code.diskReload();
+            const file = this.code.file();
+            if (!file || !this._editor) return;
+            this._ready.set(false);
+            void this._sync(file);
+        });
+    }
 
     public async ngAfterViewInit(): Promise<void> {
         const host = this._host?.nativeElement;
@@ -170,8 +183,12 @@ export class CodeComponent implements AfterViewInit, OnDestroy {
         } catch {
             return;
         }
-        const model = monaco.editor.getModels().find(m => m.uri.path === file.path)
-            ?? monaco.editor.createModel(text, file.language, monaco.Uri.parse(`file:///${file.path}`));
+        // The URI's path carries the leading slash `Uri.parse("file:///…")`
+        // adds; the project path does not. Compare the whole URI, or the
+        // second sync of one file creates a duplicate model and Monaco throws.
+        const uri = monaco.Uri.parse(`file:///${file.path}`);
+        const model = monaco.editor.getModels().find(m => m.uri.toString() === uri.toString())
+            ?? monaco.editor.createModel(text, file.language, uri);
         if (model.getValue() !== text) model.setValue(text);
         this._editor.setModel(model);
         this._ready.set(true);
