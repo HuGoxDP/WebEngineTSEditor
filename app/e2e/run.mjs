@@ -500,6 +500,157 @@ scenario("a component whose class is gone says Missing script and keeps its data
   await shot(page, "e2e-missing-script");
 });
 
+// C4 phase 4 (D5): the library. "Add component → Library" offers ten shipped
+// behaviours; adding one copies its source into scripts/library/<Name>.ts — a
+// permanent project file — reloads the script runtime, and attaches the class
+// to the selection, which survives the scene rebuild the reload performs.
+const LIBRARY_NAMES = [
+    "Rotator", "Mover", "Clickable", "ToggleVisibility", "ShowTextOnClick",
+    "QuizQuestion", "Timer", "FollowPath", "LookAtCamera", "PlayAnimation",
+];
+
+/** Seeds a project with one bare object and opens it; returns the page. */
+async function openLibraryProject(page, folder) {
+    await seed(page, folder, {
+        "scenario.meta.json": JSON.stringify({ id: folder.toLowerCase(), name: folder, version: "1.0.0" }, null, 2) + "\n",
+        "scripts/Scenario.ts": SCENARIO_ENTRY,
+        "assets/scenes/main.scene.json": sceneWith("Spinner"),
+    });
+    await page.getByText("Open folder…").click();
+    await page.waitForFunction(
+        () => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false,
+        null, { timeout: 30000 },
+    );
+    await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+    await page.waitForTimeout(400);
+}
+
+/** Opens the add menu, clicks a Library entry, waits for the attach to land. */
+async function addFromLibrary(page, name) {
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: name }).first().click();
+    await page.waitForFunction(
+        n => document.querySelector(".insp-body")?.innerText?.includes(n) ?? false,
+        name, { timeout: 30000 },
+    );
+    await page.waitForTimeout(300);
+}
+
+scenario("library: add Rotator, edit its speed, and the object rotates in play (DW-4.1)", async () => {
+    const page = await newPage("LibraryParent", { probe: true });
+    await openLibraryProject(page, "LibraryParent");
+
+    // The Library section offers all ten, once each, under its own header.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    const menuText = await page.locator(".add-list").innerText();
+    check("the Library section is there", /library/i.test(menuText), menuText.slice(0, 200));
+    const offered = await page.locator(".add-list li").allInnerTexts();
+    check("all ten behaviours are offered",
+        LIBRARY_NAMES.every(n => offered.filter(t => t.trim() === n).length === 1), offered.join(","));
+    await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+    await page.waitForFunction(
+        () => document.querySelector(".insp-body")?.innerText?.includes("Rotator") ?? false,
+        null, { timeout: 30000 },
+    );
+    await page.waitForTimeout(300);
+
+    // The source landed as a permanent project file, and the selection survived
+    // the rebuild the reload performed (the probe only reads selected objects).
+    const source = await readDisk(page, "LibraryParent", "scripts/library/Rotator.ts");
+    check("the source was copied to scripts/library/Rotator.ts",
+        source !== null && source.includes('@Serializable({ typeName: "Rotator" })') && source.includes("public speed = 90"),
+        String(source).slice(0, 200));
+    check("the object is still selected after the reload",
+        (await page.evaluate(() => window.__wetsProbe.transformOf("Spinner"))) !== null);
+
+    // speed is inspector-editable: change it, and it persists through a save.
+    const speedInput = page.locator(".insp-body .comp", { hasText: "Rotator" }).first()
+        .locator(".field", { hasText: "speed" }).locator("input").first();
+    check("speed shows the shipped default", (await speedInput.inputValue()) === "90", await speedInput.inputValue());
+    await speedInput.fill("180");
+    await speedInput.blur();
+    await page.waitForTimeout(300);
+    check("speed is editable", (await speedInput.inputValue()) === "180", await speedInput.inputValue());
+
+    // Play: the object really rotates, at the edited speed. Stop restores.
+    const eulerBefore = await page.evaluate(() => window.__wetsProbe.transformOf("Spinner").euler);
+    await page.locator(".tb-btn[title='Play']").click();
+    await page.waitForFunction(
+        () => Math.abs(window.__wetsProbe.transformOf("Spinner")?.euler.y ?? 0) > 5,
+        null, { timeout: 10000 },
+    );
+    const eulerDuring = await page.evaluate(() => window.__wetsProbe.transformOf("Spinner").euler);
+    check("the object rotates in play", Math.abs(eulerDuring.y - eulerBefore.y) > 5,
+        JSON.stringify({ before: eulerBefore, during: eulerDuring }));
+    await page.locator(".tb-btn[title='Stop']").click();
+    await page.waitForTimeout(500);
+    // Stop clears the selection and restores the snapshot: re-select to read.
+    await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+    await page.waitForTimeout(300);
+    const eulerAfter = await page.evaluate(() => window.__wetsProbe.transformOf("Spinner")?.euler ?? null);
+    check("stop restores the pre-play pose", eulerAfter !== null && Math.abs(eulerAfter.y) < 0.01,
+        JSON.stringify(eulerAfter));
+
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(800);
+    const saved = JSON.parse(await readDisk(page, "LibraryParent", "assets/scenes/main.scene.json"));
+    const comp = saved.roots[0].components.find(c => c.type === "Rotator");
+    check("the saved scene holds Rotator with the edited speed", comp && comp.fields.speed === 180,
+        JSON.stringify(saved.roots[0].components));
+    await shot(page, "e2e-library-rotator");
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("library: second and third adds keep working, nothing offered twice (DW-4.3)", async () => {
+    const page = await newPage("LibraryAgain", { probe: true });
+    await openLibraryProject(page, "LibraryAgain");
+
+    for (const name of ["Rotator", "Mover", "Timer"]) {
+        await addFromLibrary(page, name);
+        const source = await readDisk(page, "LibraryAgain", `scripts/library/${name}.ts`);
+        check(`${name}: the source is on disk`, source !== null && source.includes(`typeName: "${name}"`), String(source).slice(0, 120));
+        check(`${name}: attached to the still-selected object`,
+            (await page.evaluate(() => window.__wetsProbe.transformOf("Spinner"))) !== null);
+    }
+    const body = await page.locator(".insp-body").innerText();
+    check("all three components are on the object",
+        ["Rotator", "Mover", "Timer"].every(n => body.includes(n)), body.slice(0, 300));
+
+    // Installed entries leave the Library section and appear once, in Scripts.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    let items = await page.locator(".add-list li").allInnerTexts();
+    for (const name of ["Rotator", "Mover", "Timer"]) {
+        check(`${name} is offered exactly once now`, items.filter(t => t.trim() === name).length === 1, items.join(","));
+    }
+    const libHead = items.findIndex(t => t.trim().toUpperCase() === "LIBRARY");
+    check("the Library section offers only the seven left",
+        LIBRARY_NAMES.filter(n => !["Rotator", "Mover", "Timer"].includes(n)).every(n => items.includes(n))
+        && libHead >= 0 && !items.slice(libHead + 1).some(t => ["Rotator", "Mover", "Timer"].includes(t.trim())),
+        items.join(","));
+    // The filter narrows both sections without duplicating an entry.
+    await page.locator(".add-menu input").fill("rot");
+    await page.waitForTimeout(300);
+    items = await page.locator(".add-list li").allInnerTexts();
+    check("filtering shows Rotator once, from Scripts", items.filter(t => t.trim() === "Rotator").length === 1, items.join(","));
+    await page.locator(".add-menu .cancel").click();
+
+    // An installed behaviour attaches again through Scripts — no reload, no
+    // second registration, and the console stays quiet throughout.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill(""); // cancel kept the filter
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: "Mover" }).first().click();
+    await page.waitForTimeout(600);
+    const movers = await page.locator(".insp-body .comp", { hasText: "Mover" }).count();
+    check("a second Mover attaches from Scripts", movers === 2, String(movers));
+    check("no page errors, no duplicate-registration advisory", noErrors(page), page.logs.join(" | "));
+    await shot(page, "e2e-library-repeat");
+});
+
 // C4r4, F1+F2: every form of the engine import resolves. The clause-level
 // rewrite this replaces spanned statements — a sibling import first, or a
 // comment mentioning the word `import`, turned the engine's import into
@@ -1473,6 +1624,21 @@ scenario("new project wizard: collects, validates, creates; cancelling writes no
     check("the scene was written with both objects", scene.roots.length === 2 && scene.version === 1, JSON.stringify(scene.roots.map(r => r.name)));
     const cam = scene.roots.find(r => r.components.some(c => c.type === "Camera"));
     check("the camera looks at the scene from the back", cam && cam.transform.position.z === -10, JSON.stringify(cam?.transform.position));
+
+    // DW-4.2: the exported project carries a library behaviour too, so the
+    // ScenarioCreator build check compiles scripts/library/ as well. Attach to
+    // the existing Camera — no new object, the two-object scene stays two.
+    await page.locator("app-hierarchy li", { hasText: "Camera" }).first().click();
+    await page.waitForTimeout(300);
+    await addFromLibrary(page, "Rotator");
+    check("the wizard project holds the library source",
+        (await readDisk(page, "WizParent", "Atom/scripts/library/Rotator.ts")) !== null);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(800);
+    const withLibrary = JSON.parse(await readDisk(page, "WizParent", "Atom/assets/scenes/main.scene.json"));
+    check("the saved wizard scene keeps two objects, one with Rotator",
+        withLibrary.roots.length === 2 && withLibrary.roots.some(r => r.components.some(c => c.type === "Rotator")),
+        JSON.stringify(withLibrary.roots.map(r => [r.name, r.components.map(c => c.type)])));
 
     await exportFolder(page, "WizParent", "Atom", resolve(SHOTS, "wizard-project"));
     check("no native dialogs were used", page.nativeDialogs === 0);

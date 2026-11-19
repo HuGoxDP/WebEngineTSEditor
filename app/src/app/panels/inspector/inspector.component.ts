@@ -18,6 +18,8 @@ import { SelectionService } from '../../services/selection.service';
 import { SceneService } from '../../services/scene.service';
 import { ComponentRegistryService } from '../../services/component-registry.service';
 import { HistoryService } from '../../services/history.service';
+import { CommandsService } from '../../services/commands.service';
+import { LibraryService, type LibraryEntry } from '../../services/library.service';
 import { ComponentSectionComponent } from './component-section.component';
 import { IconComponent } from '../../icon.component';
 import { I18nService } from '../../i18n/i18n.service';
@@ -175,7 +177,15 @@ interface EulerDeg { x: number; y: number; z: number; }
                                         [title]="isHeld(c) ? ('insp.held' | t) : ''"
                                         (click)="onAddComponent(c)">{{ c.name }}</li>
                                 }
-                                @if (filteredComponents().length === 0) {
+                                @if (libraryOffered().length > 0) {
+                                    <li class="lib-head"
+                                        style="cursor: default; color: var(--fg-3); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; border-top: 1px solid var(--line);">
+                                        {{ 'insp.library' | t }}</li>
+                                    @for (entry of libraryOffered(); track entry.name) {
+                                        <li (click)="onAddLibrary(entry)">{{ entry.name }}</li>
+                                    }
+                                }
+                                @if (filteredComponents().length === 0 && libraryOffered().length === 0) {
                                     <li class="empty-hint">{{ 'insp.noMatch' | t }}</li>
                                 }
                             </ul>
@@ -299,13 +309,20 @@ export class InspectorComponent {
 
     private readonly _componentRegistry = inject(ComponentRegistryService);
     private readonly _history = inject(HistoryService);
+    private readonly _library = inject(LibraryService);
+    private readonly _commands = inject(CommandsService);
 
     public readonly addOpen = signal(false);
     public readonly addFilter = signal('');
 
+    /** Library behaviours not installed yet — the Library section (C4.4). */
+    public readonly libraryOffered = computed(() => this._library.offered(this.addFilter()));
+
     public readonly filteredComponents = computed(() => {
         const q = this.addFilter().toLowerCase().trim();
-        const all = this._componentRegistry.all();
+        // What the Library section offers is not offered twice under Scripts.
+        const inLibrary = this._library.offeredNames(this.addFilter());
+        const all = this._componentRegistry.all().filter(c => !inLibrary.has(c.name));
         if (!q) return all;
         return all.filter(c => c.name.toLowerCase().includes(q));
     });
@@ -341,6 +358,13 @@ export class InspectorComponent {
         });
         this.addOpen.set(false);
         this.addFilter.set('');
+    }
+
+    /** Add from the Library: copy the source in, reload, attach (async). */
+    public onAddLibrary(entry: LibraryEntry): void {
+        this.addOpen.set(false);
+        this.addFilter.set('');
+        this._commands.addLibrary(entry);
     }
 
     // ── Quaternion ↔ Euler (YXZ order, degrees) ──────────────────

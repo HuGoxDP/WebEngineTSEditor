@@ -280,6 +280,44 @@ import { TPipe } from '../../i18n/t.pipe';
                                 </div>
                             }
 
+                            <!-- Array of Vector3 (e.g. FollowPath waypoints) -->
+                            @else if (isVector3Array(field)) {
+                                <div style="display: flex; flex-direction: column; gap: 4px;">
+                                    @for (v of arrayOf(field); track $index; let i = $index) {
+                                        <div class="vec n3" style="align-items: center;">
+                                            <span style="color: var(--fg-3); font-size: 10px; min-width: 14px;">{{ i }}</span>
+                                            <span class="axis x">X</span>
+                                            <div class="wrap">
+                                                <input class="in num" type="number" step="0.1"
+                                                    [ngModel]="v.x"
+                                                    (ngModelChange)="setArrayVec(field, i, 'x', $event)">
+                                            </div>
+                                            <span class="axis y">Y</span>
+                                            <div class="wrap">
+                                                <input class="in num" type="number" step="0.1"
+                                                    [ngModel]="v.y"
+                                                    (ngModelChange)="setArrayVec(field, i, 'y', $event)">
+                                            </div>
+                                            <span class="axis z">Z</span>
+                                            <div class="wrap">
+                                                <input class="in num" type="number" step="0.1"
+                                                    [ngModel]="v.z"
+                                                    (ngModelChange)="setArrayVec(field, i, 'z', $event)">
+                                            </div>
+                                            <button class="ref-btn" [title]="'comp.removeWaypoint' | t"
+                                                (click)="removeArrayItem(field, i)">
+                                                <wets-icon name="cross"></wets-icon>
+                                            </button>
+                                        </div>
+                                    }
+                                    <button class="ref-btn" style="align-self: flex-start;"
+                                        [title]="'comp.addWaypoint' | t"
+                                        (click)="addArrayItem(field)">
+                                        <wets-icon name="plus"></wets-icon>
+                                    </button>
+                                </div>
+                            }
+
                             <!-- Unknown type → read-only JSON preview -->
                             @else {
                                 <span class="in" style="opacity: 0.6; font-family: monospace; font-size: 10px;">
@@ -429,6 +467,11 @@ export class ComponentSectionComponent {
         if (f.type !== undefined) return false;
         return typeof this.raw(f) === 'boolean';
     }
+    /** Arrays of Vector3 get an editable list (FollowPath waypoints); other
+     *  arrays keep the read-only JSON preview. */
+    public isVector3Array(f: FieldMeta): boolean {
+        return f.type === FieldType.Array && f.elementType === FieldType.Vector3;
+    }
 
     // ── Getters ──────────────────────────────────────────────────────
 
@@ -440,6 +483,7 @@ export class ComponentSectionComponent {
     public vec3Of(f: FieldMeta): Vector3 { return this.raw(f) as Vector3 ?? new Vector3(); }
     public vec4Of(f: FieldMeta): Vector4 { return this.raw(f) as Vector4 ?? new Vector4(0, 0, 0, 0); }
     public colorOf(f: FieldMeta): Color { return this.raw(f) as Color ?? new Color(); }
+    public arrayOf(f: FieldMeta): Vector3[] { return (this.raw(f) as Vector3[]) ?? []; }
 
     public colorHex(f: FieldMeta): string {
         const c = this.colorOf(f);
@@ -468,6 +512,23 @@ export class ComponentSectionComponent {
     public setNumber(f: FieldMeta, v: number): void { this.setRaw(f, Number(v)); }
     public setString(f: FieldMeta, v: string): void { this.setRaw(f, v); }
     public setBoolean(f: FieldMeta, v: boolean): void { this.setRaw(f, v); }
+
+    public setArrayVec(f: FieldMeta, index: number, axis: 'x' | 'y' | 'z', value: number): void {
+        const next = this.arrayOf(f).map((v, i) => i === index
+            ? new Vector3(axis === 'x' ? value : v.x, axis === 'y' ? value : v.y, axis === 'z' ? value : v.z)
+            : v);
+        this.setRaw(f, next);
+    }
+
+    public addArrayItem(f: FieldMeta): void {
+        const list = this.arrayOf(f);
+        const last = list[list.length - 1];
+        this.setRaw(f, [...list, last ? last.clone() : new Vector3()]);
+    }
+
+    public removeArrayItem(f: FieldMeta, index: number): void {
+        this.setRaw(f, this.arrayOf(f).filter((_, i) => i !== index));
+    }
 
     public setVec(f: FieldMeta, axis: 'x' | 'y' | 'z' | 'w', value: number): void {
         const t = f.type;

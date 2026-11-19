@@ -9,6 +9,7 @@ import {
     MeshFilter,
     MeshRenderer,
     Quaternion,
+    SceneManager,
     SceneSerializer,
     SphereCollider,
     StandardMaterial,
@@ -18,6 +19,7 @@ import {
 } from 'WebEngineTS';
 import { SceneService } from './scene.service';
 import { SelectionService } from './selection.service';
+import { LibraryService, type LibraryEntry } from './library.service';
 import { HistoryService } from './history.service';
 import { ClipboardService } from './clipboard.service';
 import { ComponentRegistryService } from './component-registry.service';
@@ -107,6 +109,7 @@ export class CommandsService {
     private readonly _dialog = inject(DialogService);
     private readonly _i18n = inject(I18nService);
     private readonly _doc = inject(DocumentService);
+    private readonly _library = inject(LibraryService);
 
     constructor() {
         window.addEventListener('focus', () => void this._checkDisk());
@@ -183,6 +186,36 @@ export class CommandsService {
         this._history.record(`Add ${name}`, () => {
             target.addComponent(ctor as any);
             this._selection.notifyChanged();
+        });
+    }
+
+    /**
+     * Add a library behaviour to the selection (C4 phase 4, D5). The source is
+     * copied into `scripts/library/<Name>.ts` — a permanent project file — then
+     * the script runtime reloads, which rebuilds the scene and clears the
+     * selection when the class is new. The target is therefore re-found by name
+     * after the reload; the attach itself is one undoable scene step (the
+     * written file is not undone).
+     */
+    public addLibrary(entry: LibraryEntry): void {
+        const target = this._selection.selected();
+        if (!target) return;
+        const targetName = target.name;
+        this.run(async () => {
+            if (!this._library.isInstalled(entry)) {
+                await this._project.write(LibraryService.pathOf(entry.name), entry.source);
+                await this._code.reloadScripts();
+            }
+            const ctor = this._library.ctorOf(entry.name);
+            if (!ctor) {
+                await this.fail(this._i18n.t('insp.libraryFailed', { name: entry.name }));
+                return;
+            }
+            const go = SceneManager.activeScene.findGameObject(targetName) ?? target;
+            this._history.record(`Add ${entry.name}`, () => {
+                go.addComponent(ctor as any);
+                this._selection.select(go);
+            });
         });
     }
 

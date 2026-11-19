@@ -189,8 +189,12 @@ export const en = {
     'insp.searchComponents': 'Search components...',
     'insp.noMatch': 'No components match.',
     'insp.held': 'This object already has one — an object holds only one.',
+    'insp.library': 'Library',
+    'insp.libraryFailed': 'The library behaviour "{name}" did not load — check the Console for the script error.',
 
     'comp.reset': 'Reset',
+    'comp.addWaypoint': 'Add waypoint',
+    'comp.removeWaypoint': 'Remove waypoint',
     'comp.missingTag': 'Missing script',
     'comp.missingHint': 'The class this scene was saved with is not loaded — its script is missing or does not compile.',
     'comp.missingBody': 'The saved data is kept exactly as it was. Fix or add the script and it becomes a component again.',

@@ -398,6 +398,7 @@ export class ProjectService {
         }
         await this._store!.mkdir('assets/scenes');
         await this._store!.mkdir('scripts/components');
+        await this._store!.mkdir('scripts/library');
         await this._scan();
     }
 
