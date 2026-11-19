@@ -230,6 +230,25 @@ const failReads = (page, fileName) => page.evaluate(name => {
     };
 }, fileName);
 
+/**
+ * Holds the first read of the project's entry script until released, so the
+ * script-load step of an open can be acted inside deterministically (C4).
+ * The seam is getFile, which the runtime's readText goes through. Test
+ * instrumentation only.
+ */
+const holdScriptRead = page => page.evaluate(() => {
+    const get = FileSystemFileHandle.prototype.getFile;
+    FileSystemFileHandle.prototype.getFile = function (...args) {
+        if (this.name === "Scenario.ts" && !window.__scriptReadHeld) {
+            window.__scriptReadHeld = true;
+            return new Promise(resolve => {
+                window.__releaseScriptRead = () => resolve(get.apply(this, args));
+            });
+        }
+        return get.apply(this, args);
+    };
+});
+
 /** Copies a folder from the page's "disk" to a real directory, so other tools can be pointed at it. */
 async function exportFolder(page, folder, sub, targetDir) {
     const files = await page.evaluate(async ([name, path]) => {
@@ -2363,6 +2382,34 @@ scenario("dialogs: Esc cancels, Enter confirms, shortcuts stand down", async () 
     check("an empty name cannot be confirmed", await page.locator(".dlg-btn.primary").isDisabled());
     await page.keyboard.press("Escape");
     check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+});
+
+// C4: opening a project runs its script load and then resets the scene to load
+// the saved one. The workspace must not appear — and its shortcuts must not be
+// live — until that is done, or an edit made in the gap is wiped by the reset.
+// The entry script's read is held so the gap is wide and deterministic.
+scenario("an open settles its scene before the workspace accepts edits (C4)", async () => {
+    const page = await newPage("SettleDemo");
+    await holdScriptRead(page);
+    await page.getByText("Open folder…").click();
+    await dialogButton(page, "Set up").click();
+    for (let i = 0; i < 50 && !(await page.evaluate(() => window.__scriptReadHeld === true)); i++) await page.waitForTimeout(100);
+    check("the open reaches its script load", await page.evaluate(() => window.__scriptReadHeld === true));
+    check("while it settles, no workspace is shown", (await page.locator(".work").count()) === 0);
+    await page.keyboard.press("Alt+Shift+N");
+    await page.evaluate(() => window.__releaseScriptRead?.());
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(400);
+    check("the workspace opens clean", (await page.locator("app-hierarchy").innerText()).includes("Default Scene"));
+    check("no edit was lost to the settle", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+    check("no phantom object from the gap", (await page.locator("app-hierarchy").innerText()).match(/GameObject/g) === null);
+    // Now that it is open, the shortcut works.
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(300);
+    check("once open, the shortcut creates", (await page.locator("app-hierarchy").innerText()).includes("GameObject"));
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
 /**

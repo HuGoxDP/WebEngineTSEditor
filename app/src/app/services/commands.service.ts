@@ -471,6 +471,10 @@ export class CommandsService {
      *
      * If another tab already has the project open, this one lets go of it —
      * two tabs on one folder overwrite each other's saves.
+     *
+     * The project is marked open only at the end, once the scene is in place:
+     * the workspace (and its shortcuts) must not exist while the scene is still
+     * being reset and loaded, or an edit made in that gap would be wiped.
      */
     private async _settle(): Promise<void> {
         if (!await this._doc.acquireLock(this._project.projectId())) {
@@ -488,6 +492,7 @@ export class CommandsService {
         this._resetScene();
         await this._loadDefaultScene();
         await this._offerRecovery();
+        this._project.status.set('open');
     }
 
     /** An empty scene, with nothing selected and nothing to undo — and nothing unsaved. */

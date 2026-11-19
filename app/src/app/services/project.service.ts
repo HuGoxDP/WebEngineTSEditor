@@ -187,12 +187,12 @@ export class ProjectService {
      *
      * @param layout - when given, the scenario layout is written into the folder
      *   first. The project only counts as open — and the workspace only appears —
-     *   once that is done, so nothing ever shows a project that is half set up.
+     *   once the caller has settled it (scripts loaded, scene in place), so
+     *   nothing ever shows a project that is half set up.
      */
     public async adopt(handle: ProjectFolderHandle, layout?: ProjectMeta): Promise<void> {
         await this._adopt(new FileSystemAccessStore(handle));
         if (layout) await this.initializeLayout(layout);
-        this.status.set('open');
         this.projectId.set(await this._remember(handle, 'disk'));
     }
 
@@ -209,7 +209,6 @@ export class ProjectService {
         await store.keepAcrossRestarts();
         await this._adopt(store, layout.name);
         await this.initializeLayout(layout);
-        this.status.set('open');
         this.projectId.set(await this._rememberOpfs(store));
     }
 
@@ -236,7 +235,6 @@ export class ProjectService {
             if (!(await OpfsStore.exists(recent.id))) return 'missing';
             const store = await OpfsStore.create(recent.id);
             await this._adopt(store, recent.name);
-            this.status.set('open');
             this.projectId.set(recent.id);
             return 'ok';
         }
