@@ -410,6 +410,107 @@ scenario("a component script loads, attaches to its object, and swaps on save", 
   await shot(page, "e2e-script-runtime");
 });
 
+// C4 DW-2.3: a scene saved with a scripted component reloads into the same
+// class after a full editor reload. Nothing about the script runtime is cached
+// across sessions: the page starts empty, the scripts are compiled and linked
+// again (fresh blob URLs), and the saved field value comes back with them.
+scenario("a saved scripted component survives a full editor reload (DW-2.3)", async () => {
+  const page = await newPage("ReloadParent");
+  await seed(page, "ReloadParent", {
+    "scenario.meta.json": JSON.stringify({ id: "reload-parent", name: "ReloadParent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Rotator.ts": ROTATOR,
+    "assets/scenes/main.scene.json": JSON.stringify({
+      name: "Main", version: 1,
+      roots: [{
+        name: "Spinner", active: true,
+        transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+        components: [{ type: "Rotator", fields: { speed: 3 } }],
+        children: [],
+      }],
+    }),
+  });
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(() => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false, null, { timeout: 30000 });
+
+  // Set a saved field value through the inspector and save the scene.
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(400);
+  const speedInput = page.locator(".insp-body .comp", { hasText: "Rotator" }).first()
+    .locator(".field", { hasText: "speed" }).locator("input").first();
+  await speedInput.fill("6");
+  await speedInput.blur();
+  await page.waitForTimeout(300);
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(800);
+  const savedScene = JSON.parse(await readDisk(page, "ReloadParent", "assets/scenes/main.scene.json"));
+  const savedComp = savedScene.roots[0].components.find(c => c.type === "Rotator");
+  check("the scene was saved with the class name and the edited field",
+    savedComp && savedComp.fields.speed === 6, JSON.stringify(savedScene.roots[0].components));
+
+  // A full reload: OPFS keeps the files, the page keeps nothing else. A saved
+  // scene leaves quietly — no "leave this page?" prompt.
+  const askedBefore = page.beforeUnloads;
+  await page.reload({ waitUntil: "load" });
+  check("a saved scene lets the reload go quietly", page.beforeUnloads === askedBefore);
+  await page.locator(".recent").first().click();
+  await page.waitForFunction(() => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false, null, { timeout: 30000 });
+
+  // The component is the real class again, not a Missing script placeholder,
+  // and the value the author saved is what the inspector shows.
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(500);
+  const body = () => page.locator(".insp-body").innerText();
+  check("after the reload the component is the real class", (await body()).includes("Rotator"), (await body()).slice(0, 160));
+  check("and not a Missing script placeholder", !(await body()).includes("Missing script"), (await body()).slice(0, 160));
+  const fieldValues = () => page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  check("the saved field value survived the reload", (await fieldValues()).includes("6"), JSON.stringify(await fieldValues()));
+
+  // The runtime was built fresh: edit the script, save, and the swap still
+  // works — which it could not if a stale blob URL or class had been cached.
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: "Rotator.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(text => navigator.clipboard.writeText(text), ROTATOR.replace("public speed = 1;", "public speed = 5;"));
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(700);
+  await page.locator(".pane-btn.primary").click();
+  await page.waitForTimeout(2500);
+  check("the edited script is on disk after the reload",
+    (await readDisk(page, "ReloadParent", "scripts/components/Rotator.ts")).includes("public speed = 5;"));
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().click();
+  await page.waitForTimeout(300);
+  await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+  await page.waitForTimeout(500);
+  await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+  await page.waitForTimeout(600);
+  check("a new object gets the freshly compiled class's new default",
+    (await fieldValues()).includes("5"), JSON.stringify(await fieldValues()));
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(400);
+  check("the saved object kept its saved value through the swap",
+    (await fieldValues()).includes("6"), JSON.stringify(await fieldValues()));
+
+  // One swap advisory is the engine's side of a reload swap (as in the phase-2
+  // scenario); the fresh compile after the page reload must add nothing.
+  const swapError = "[TypeRegistry] Type name \"Rotator\" is already registered to a different class";
+  check("nothing but the swap advisory in the console",
+    page.logs.filter(l => !l.includes("404") && !l.includes(swapError)).length === 0,
+    page.logs.join(" | "));
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  await shot(page, "e2e-script-reload");
+});
+
 // C4 phase 3: a script that does not compile never breaks the scene, says so in
 // the Console with the line, and its class stays loaded; a component whose class
 // is missing says that, with the data it kept.
