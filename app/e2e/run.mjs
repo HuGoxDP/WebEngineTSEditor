@@ -1451,6 +1451,29 @@ scenario("a script read failure other than a vanished file reaches the Console",
   check("no native dialogs were used", page.nativeDialogs === 0);
 });
 
+// C4r1: the engine the page runs is the installed tarball's — not a committed
+// copy that release:local never refreshes. BuildInfo.builtAt is stamped into
+// the dist at engine build time, so equality with node_modules' copy proves
+// the identity of what actually executes.
+scenario("the running engine is the installed tarball (BuildInfo)", async () => {
+  const dist = readFileSync(resolve(HERE, "../node_modules/webenginets/dist/WebEngineTS.esm.js"), "utf8");
+  const builtAt = dist.match(/_BUILT_AT = "([^"]+)"/)?.[1];
+  const version = dist.match(/const _VERSION = "([^"]+)"/)?.[1];
+  check("the installed engine is a stamped build", !!builtAt && !!version, `builtAt=${builtAt} version=${version}`);
+
+  const page = await newPage("BuildIdentity");
+  await openEmptyProject(page);
+  const running = await page.evaluate(() => {
+    const b = globalThis.__wetsEngine?.BuildInfo;
+    return b ? { builtAt: b.builtAt, version: b.version, isBuild: b.isBuild } : null;
+  });
+  check("the page publishes its engine's BuildInfo", running !== null);
+  check("the running builtAt is the installed package's", running?.builtAt === builtAt, `${running?.builtAt} vs ${builtAt}`);
+  check("the running version is the installed package's", running?.version === version, `${running?.version} vs ${version}`);
+  check("the running engine is a build, not sources", running?.isBuild === true);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
 scenario("start screen: no workspace without a project; open, close, recent, forget", async () => {
     const page = await newPage("LifeDemo");
     check("no workspace before a project", (await page.locator(".work").count()) === 0);
