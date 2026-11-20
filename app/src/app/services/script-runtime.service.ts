@@ -102,6 +102,39 @@ export class ScriptRuntimeService {
      * because one broken script must not cost the whole project its classes.
      */
     public async reload(): Promise<string[]> {
+        // One pass at a time (C4 review R4): two concurrent passes revoke each
+        // other's Blob URLs mid-import, so a module that was linked fine fails
+        // to import. A caller that arrives mid-flight shares the running pass;
+        // if anything asked for a reload while it ran, one trailing pass reads
+        // whatever those callers wrote — no more than one, however many asked.
+        if (this._reloading) {
+            this._rerun = true;
+            return this._reloading;
+        }
+        this._rerun = true;   // the first pass is the trailing pass of nothing
+        const pass = (async () => {
+            let notes: string[] = [];
+            try {
+                while (this._rerun) {
+                    this._rerun = false;
+                    notes = await this._reloadPass();
+                }
+            } finally {
+                this._reloading = null;
+            }
+            return notes;
+        })();
+        this._reloading = pass;
+        return pass;
+    }
+
+    /** The pass in flight, shared by every caller that arrives while it runs. */
+    private _reloading: Promise<string[]> | null = null;
+
+    /** Set when a reload is asked for mid-flight: one more pass, then stop. */
+    private _rerun = false;
+
+    private async _reloadPass(): Promise<string[]> {
         const notes: string[] = [];
         const files = await this.scriptFiles();
         const compiled = new Map<string, string>();

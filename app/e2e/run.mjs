@@ -249,6 +249,34 @@ const holdScriptRead = page => page.evaluate(() => {
     };
 });
 
+/**
+ * Holds the first read of one file after its write closes — the stamp read a
+ * save does between its write and its reload — so a second save can be pressed
+ * inside that window deterministically (C4 review R4). The seam is getFile,
+ * which modifiedAt goes through. Test instrumentation only.
+ */
+const holdStampRead = (page, fileName) => page.evaluate(name => {
+    const create = FileSystemFileHandle.prototype.createWritable;
+    FileSystemFileHandle.prototype.createWritable = async function (...args) {
+        const writable = await create.apply(this, args);
+        if (this.name === name) {
+            const close = writable.close.bind(writable);
+            writable.close = async () => { const r = await close(); window.__stampWriteDone = true; return r; };
+        }
+        return writable;
+    };
+    const get = FileSystemFileHandle.prototype.getFile;
+    FileSystemFileHandle.prototype.getFile = function (...args) {
+        if (this.name === name && window.__stampWriteDone && !window.__stampReadHeld) {
+            window.__stampReadHeld = true;
+            return new Promise(resolve => {
+                window.__releaseStampRead = () => resolve(get.apply(this, args));
+            });
+        }
+        return get.apply(this, args);
+    };
+}, fileName);
+
 /** Copies a folder from the page's "disk" to a real directory, so other tools can be pointed at it. */
 async function exportFolder(page, folder, sub, targetDir) {
     const files = await page.evaluate(async ([name, path]) => {
@@ -1399,6 +1427,103 @@ scenario("saving over an outside-changed script asks before it overwrites", asyn
   check("the mark is cleared", (await page.locator(".dot.unsaved").count()) === 0);
   check("no native dialogs were used", page.nativeDialogs === 0);
   check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4 review R4: two rapid saves of one dirty script must coalesce. The second
+// press lands inside the first save's write→stamp window (held there by the
+// seam), where an unguarded save sees the editor's own just-written file as an
+// outside change and asks to replace it — and two unguarded reloads revoke each
+// other's Blob URLs mid-import. One save, one reload, newest code registered.
+scenario("a double save coalesces: one reload, no spurious import error, no self-overwrite ask (C4 review R4)", async () => {
+  const page = await newPage("DoubleSave", { probe: true });
+  await seed(page, "DoubleSave", {
+    "scenario.meta.json": JSON.stringify({ id: "double-save", name: "DoubleSave", version: 1 }),
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Rotator.ts": ROTATOR,
+    "assets/scenes/main.scene.json": sceneWith("Seeded"),
+  });
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  await page.waitForFunction(() => window.__wetsProbe.scriptClass("Rotator") !== null, null, { timeout: 30000 });
+  const token = await page.evaluate(() => window.__wetsProbe.scriptClass("Rotator").token);
+
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: "Rotator.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+
+  // Pasted, not typed: Monaco's auto-closing brackets rewrite a typed source.
+  const context = page.context();
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(text => navigator.clipboard.writeText(text), ROTATOR.replace("public speed = 1;", "public speed = 5;"));
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(700);
+  check("the buffer is dirty before the double save", (await page.locator(".dot.unsaved").count()) > 0);
+
+  // Hold the first save between its write and its stamp read, then press save
+  // again inside that window — the race, made deterministic.
+  await holdStampRead(page, "Rotator.ts");
+  await page.keyboard.press("Control+s");
+  await page.waitForFunction(() => window.__stampReadHeld === true, null, { timeout: 15000 });
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(800);
+  const asks = await page.locator(".dlg").count();
+  check("the second save does not ask to replace the editor's own write",
+    asks === 0, asks ? await dialogTitle(page).innerText() : "");
+  // Unfixed: the ask is up; answer it so the rest of the race plays out and is
+  // recorded too. Fixed: nothing to answer.
+  if (asks) await dialogButton(page, "Replace").click();
+  await page.evaluate(() => window.__releaseStampRead());
+  const swapped = await page.waitForFunction(old => window.__wetsProbe.scriptClass("Rotator")?.token !== old, token, { timeout: 30000 })
+    .then(() => true, () => false);
+  check("the class is swapped to the newest code", swapped);
+  await page.waitForTimeout(1500);
+  check("the mark is cleared", (await page.locator(".dot.unsaved").count()) === 0);
+  check("the disk holds the newest code",
+    (await readDisk(page, "DoubleSave", "scripts/components/Rotator.ts")).includes("public speed = 5;"));
+
+  // A fresh object of the class sees the new default — what is registered is
+  // the newest class, not a stale or half-imported module. The shortcut guard
+  // stands down inside a TEXTAREA, and Monaco's is one — blur it explicitly so
+  // the canvas click's focus is what the keydown sees.
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().waitFor({ timeout: 10000 });
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().click();
+  await page.waitForTimeout(300);
+  await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+  await page.waitForTimeout(500);
+  await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+  await page.waitForTimeout(600);
+  const added = await page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  check("a new object gets the newest default", added.includes("5"), JSON.stringify(added));
+
+  // The runtime's load summary is an info row; identical repeats collapse into
+  // a ×n counter, so count the counter too. Open loaded once; the double save
+  // must add exactly one more, with no import-failure note.
+  await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+  await page.waitForTimeout(400);
+  // The swap advisory is the engine's own note about the intended replacement
+  // (the same one the other reload scenarios filter); an import failure is not.
+  const swapError = "[TypeRegistry] Type name \"Rotator\" is already registered to a different class";
+  const errRows = (await page.locator(".cons-list .log.error").allInnerTexts()).filter(t => !t.includes(swapError));
+  check("no Console error row", errRows.length === 0, errRows.join(" | "));
+  const loads = await page.evaluate(() => [...document.querySelectorAll(".cons-list .log.info")]
+    .filter(e => (e.querySelector(".msg")?.textContent ?? "").includes("module(s) loaded"))
+    .map(e => ({ text: e.querySelector(".msg").textContent, n: Number((e.querySelector(".rep")?.textContent ?? "×1").slice(1)) })));
+  const reloads = loads.reduce((n, l) => n + l.n, 0);
+  check("one reload for the double save (the open's plus one)", reloads === 2, JSON.stringify(loads));
+  check("no spurious import-failure note", loads.every(l => l.text.includes("notes: none")), JSON.stringify(loads));
+  check("nothing but the swap advisory in the console",
+    page.logs.filter(l => !l.includes("404") && !l.includes(swapError)).length === 0,
+    page.logs.join(" | "));
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  await shot(page, "e2e-double-save");
 });
 
 // C4r2: a script read that fails is only silent when the file is gone. The

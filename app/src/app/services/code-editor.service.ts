@@ -95,20 +95,32 @@ export class CodeEditorService {
      */
     public async save(text: string): Promise<boolean> {
         const file = this.file();
-        if (!file) return false;
-        if (await this._changedOnDisk(file.path) && !await this._askReplace(file)) return false;
+        // A second press while a save is in flight is the same save: the first
+        // has the buffer, and letting the second run would see the first's own
+        // write as an outside change (C4 review R4). The buffer stays dirty if
+        // it moved again, so nothing typed is lost by the skip.
+        if (!file || this._saving) return false;
+        this._saving = true;
         try {
-            await this._project.write(file.path, text);
-        } catch (err) {
-            console.error(`[Script] Could not save ${file.path}: ${String(err)}`);
-            return false;
+            if (await this._changedOnDisk(file.path) && !await this._askReplace(file)) return false;
+            try {
+                await this._project.write(file.path, text);
+            } catch (err) {
+                console.error(`[Script] Could not save ${file.path}: ${String(err)}`);
+                return false;
+            }
+            this._dirty.set(false);
+            this._revision.update(n => n + 1);
+            await this._stamp(file.path);
+            await this._reload();
+            return true;
+        } finally {
+            this._saving = false;
         }
-        this._dirty.set(false);
-        this._revision.update(n => n + 1);
-        await this._stamp(file.path);
-        await this._reload();
-        return true;
     }
+
+    /** Whether a save is in flight — its own write is not an outside change. */
+    private _saving = false;
 
     /**
      * Compiles, links and loads the project's scripts (the runtime's entry).
@@ -177,7 +189,7 @@ export class CodeEditorService {
      * change costs one reload: the runtime re-reads every script itself.
      */
     public async checkOutsideEdits(): Promise<void> {
-        if (!this._project.isOpen() || this._checking || this._dialog.isOpen()) return;
+        if (!this._project.isOpen() || this._checking || this._saving || this._dialog.isOpen()) return;
         this._checking = true;
         try {
             const changed: string[] = [];
