@@ -322,7 +322,7 @@ const scenario = (name, fn) => scenarios.push([name, fn]);
 // C4 phase 2: the script runtime. A project whose saved scene names a component
 // script opens with that component attached: the scripts are compiled and linked
 // before the scene is read, exactly as a reload on the platform runs them. The
-// engine is resolved through the app's import map, so the script and the editor
+// engine is resolved through the runtime's Blob-URL shim, so the script and the editor
 // share one TypeRegistry — a class a script exports reaches the scene the editor
 // deserializes.
 const ROTATOR = `import { ScriptableBehaviour, Serializable, SerializedField, Time } from "WebEngineTS";
