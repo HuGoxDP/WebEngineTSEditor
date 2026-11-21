@@ -68,6 +68,8 @@ const PATHS: Record<string, string> = {
     'magnet':    '<path d="M5 4h4v8a3 3 0 0 0 6 0V4h4v8a7 7 0 0 1-14 0V4z M5 4v3h4 M19 4v3h-4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
     'eye':       '<path d="M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.6"/>',
     'shaded':    '<circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M12 3a9 9 0 0 1 0 18z" fill="currentColor"/>',
+    'wireframe': '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z M4 7.5L12 12l8-4.5 M12 12v9 M12 3v9 M4 16.5l8-4.5 8 4.5" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>',
+    'grid':      '<path d="M3 3h18v18H3V3z M9 3v18 M15 3v18 M3 9h18 M3 15h18" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>',
     'audio-fx':  '<path d="M3 9v6h4l5 4V5L7 9H3z M16 9c2 1 2 5 0 6 M19 7c4 2 4 8 0 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
     'gizmo':     '<path d="M12 3v18M3 12h18M5 5l14 14M19 5L5 19" fill="none" stroke="currentColor" stroke-width="1.4"/>',
 

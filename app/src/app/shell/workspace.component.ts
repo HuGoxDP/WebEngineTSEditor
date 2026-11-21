@@ -105,10 +105,28 @@ import { StatusbarComponent } from './statusbar.component';
                                 <span>{{ settings.gridSnap() > 0 ? settings.gridSnap() : '–' }}</span>
                             </button>
                             <div class="vp-sep"></div>
-                            <button class="chip active" [title]="'vp.shaded' | t">
+                            <!-- Draw mode (D-8): shaded or wireframe, view state only -->
+                            <button class="chip"
+                                [class.active]="viewport.drawMode() === 'shaded'"
+                                (click)="viewport.setDrawMode('shaded')" [title]="'vp.shaded' | t">
                                 <wets-icon name="shaded"></wets-icon>
                             </button>
-                            <button class="chip" [title]="'vp.lighting' | t"><wets-icon name="light"></wets-icon></button>
+                            <button class="chip"
+                                [class.active]="viewport.drawMode() === 'wireframe'"
+                                (click)="viewport.setDrawMode('wireframe')" [title]="'vp.wireframe' | t">
+                                <wets-icon name="wireframe"></wets-icon>
+                            </button>
+                            <!-- Lighting (D-7): on = the scene's own lights, off = a view-only headlight -->
+                            <button class="chip"
+                                [class.active]="viewport.sceneLighting()"
+                                (click)="viewport.toggleLighting()" [title]="'vp.lighting' | t">
+                                <wets-icon name="light"></wets-icon>
+                            </button>
+                            <button class="chip"
+                                [class.active]="viewport.gridVisible()"
+                                (click)="viewport.toggleGrid()" [title]="'vp.grid' | t">
+                                <wets-icon name="grid"></wets-icon>
+                            </button>
                             <button class="chip" [title]="'vp.audio' | t"><wets-icon name="audio-fx"></wets-icon></button>
                             <button class="chip" [title]="'vp.effects' | t"><wets-icon name="cog"></wets-icon></button>
                             <!-- Gizmos menu (D-11): per-type switches, the master one and the icon size -->
@@ -167,6 +185,12 @@ import { StatusbarComponent } from './statusbar.component';
 
                         <div class="vp-canvas">
                             <canvas #viewportCanvas></canvas>
+
+                            <!-- D-7: lighting is on but nothing lights the scene — say so,
+                                 because the platform will show the same dark picture. -->
+                            @if (viewport.noLightHint()) {
+                            <div class="vp-nolight-hint">{{ 'vp.noLight' | t }}</div>
+                            }
 
                             <!-- Floating vertical tool palette (Unity-style). Q view, W/E/R the
                                  three handle sets, Y all of them; Rect is stage 18. -->

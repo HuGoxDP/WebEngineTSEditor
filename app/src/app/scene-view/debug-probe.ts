@@ -101,6 +101,20 @@ export interface WetsProbe {
     pixelStats(rect: { left: number; top: number; right: number; bottom: number }): {
         total: number; orange: number; green: number; white: number;
     };
+    /** Whether Scene-view lighting is on (B1 phase 7; D-7). */
+    lightingOn(): boolean;
+    /** The engine scene's draw mode: 'shaded' or 'wireframe' (D-8). */
+    drawMode(): string;
+    /** Whether the grid overlay is drawn. */
+    gridVisible(): boolean;
+    /** The grid's actual line spacing in world units (size / divisions). */
+    gridStep(): number;
+    /**
+     * The engine three scene after a normal frame (DW-7.2's proof that the
+     * lighting override leaves nothing behind): direct child count and every
+     * light's `visible` flag, over the whole graph.
+     */
+    threeInfo(): { children: number; lightsVisible: boolean[] };
 }
 
 declare global {
@@ -175,6 +189,15 @@ export function installProbe(
         gizmoSettings?: () => { enabled: boolean; camera: boolean; lights: boolean; colliders: boolean; audio: boolean; iconSize: number };
         /** The handle's position and axis directions in engine space (D-6). */
         handlePoint?: (axis: 'X' | 'Y' | 'Z', t: number) => { x: number; y: number; z: number } | null;
+        /** Scene-view lighting state (B1 phase 7; D-7). */
+        lightingOn?: () => boolean;
+        /** The engine scene's draw mode (D-8). */
+        drawMode?: () => string;
+        /** The grid overlay's visibility and actual line spacing. */
+        gridVisible?: () => boolean;
+        gridStep?: () => number;
+        /** The engine three scene as a normal frame leaves it (DW-7.2). */
+        threeInfo?: () => { children: number; lightsVisible: boolean[] };
     },
 ): void {
     const probe: WetsProbe = {
@@ -244,6 +267,11 @@ export function installProbe(
             return handler ? handler(x, y) : false;
         },
         pixel: (x, y) => renderer.readPixel(x, y),
+        lightingOn: () => deps.lightingOn?.() ?? true,
+        drawMode: () => deps.drawMode?.() ?? 'shaded',
+        gridVisible: () => deps.gridVisible?.() ?? true,
+        gridStep: () => deps.gridStep?.() ?? 1,
+        threeInfo: () => deps.threeInfo?.() ?? { children: 0, lightsVisible: [] },
     };
     window.__wetsProbe = probe;
 }

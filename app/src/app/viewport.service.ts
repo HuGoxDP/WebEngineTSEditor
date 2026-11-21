@@ -1,4 +1,4 @@
-import { EffectRef, Injectable, Injector, NgZone, effect, inject, signal } from '@angular/core';
+import { EffectRef, Injectable, Injector, NgZone, computed, effect, inject, signal } from '@angular/core';
 import * as THREE from 'three';
 import { SceneViewController } from './scene-view/scene-view-controller';
 import { OrientationGizmo } from './scene-view/orientation-gizmo';
@@ -15,11 +15,15 @@ import { SceneService } from './services/scene.service';
 import { SelectionService } from './services/selection.service';
 import { SettingsService } from './services/settings.service';
 import { SceneViewRenderer } from './scene-view/scene-view-renderer';
+import { engineDirToThree, enginePointToThree } from './scene-view/space';
 import { installProbe, probeEnabled, type ProbeTransform } from './scene-view/debug-probe';
 
 /** The Scene view's tools: Q view, W/E/R the three handle modes, Y all of them. */
 export type { Tool, PivotMode, HandleSpace } from './scene-view/transform-handles';
 import type { Tool } from './scene-view/transform-handles';
+
+/** The grid's extent in world units (fixed; the step setting changes the cell count). */
+const GRID_SIZE = 50;
 
 /**
  * The Scene view, as the rest of the editor sees it (B1 phase 1).
@@ -40,6 +44,13 @@ export class ViewportService {
     private _handles: TransformHandles | null = null;
     private _selectionEffect: EffectRef | null = null;
     private _snapEffect: EffectRef | null = null;
+    private _gridEffect: EffectRef | null = null;
+    /** The Scene view's grid (D-2 step 3); rebuilt when the step setting changes. */
+    private _grid: THREE.GridHelper | null = null;
+    /** The grid's cell count, kept for the step read-back (GridHelper geometry carries none). */
+    private _gridDivisions = 50;
+    /** The grid's axis lines (D-8): red X, blue Z toward engine +Z. Follows the grid's recentre. */
+    private _gridAxes: THREE.LineSegments | null = null;
     private _outline: SelectionOutline | null = null;
     private _picker: ScenePicker | null = null;
     private _componentGizmos: ComponentGizmos | null = null;
@@ -80,6 +91,149 @@ export class ViewportService {
      * centre click, D-5). Set only on a change — the cube draws every frame.
      */
     public readonly orthographic = signal(false);
+
+    /**
+     * Scene-view lighting (B1 phase 7; D-7). ON is the default for every scene:
+     * the editor shows what the platform shows, so a scene without a light reads
+     * dark rather than being secretly lit. OFF is a view aid — a headlight for
+     * this render only, never written into the scene, undo or storage.
+     */
+    public readonly sceneLighting = signal(true);
+
+    /** How the engine scene is drawn: shaded materials or one wireframe override (D-8). */
+    public readonly drawMode = signal<'shaded' | 'wireframe'>('shaded');
+
+    /** Whether the grid overlay is drawn (D-2 step 3). View state, like lighting. */
+    public readonly gridVisible = signal(true);
+
+    /**
+     * Whether the scene has any active light — an enabled light component on an
+     * active object. Reactive on scene revision and selection notify, so adding
+     * or enabling a light clears the hint without a frame's delay.
+     */
+    public readonly hasSceneLight = computed(() => {
+        this._sceneService.revision();
+        this._selection.revision();
+        return this._countActiveLights() > 0;
+    });
+
+    /** The no-light hint: only while lighting is ON and nothing lights the scene. */
+    public readonly noLightHint = computed(() => this.sceneLighting() && !this.hasSceneLight());
+
+    public toggleLighting(): void {
+        this.sceneLighting.update(on => !on);
+        this._renderer.lightingOff = !this.sceneLighting();
+    }
+
+    public setDrawMode(mode: 'shaded' | 'wireframe'): void {
+        this.drawMode.set(mode);
+        this._renderer.drawMode = mode;
+    }
+
+    public toggleGrid(): void {
+        this.gridVisible.update(on => !on);
+        if (this._grid) this._grid.visible = this.gridVisible();
+        if (this._gridAxes) this._gridAxes.visible = this.gridVisible();
+    }
+
+    /** The grid's actual line spacing, in world units (the probe's read-back). */
+    public get gridStep(): number {
+        // GridHelper draws `_gridDivisions` cells across GRID_SIZE; spacing is size / divisions.
+        return GRID_SIZE / this._gridDivisions;
+    }
+
+    /**
+     * Rebuilds the grid for a step setting: the extent stays GRID_SIZE, the cell
+     * count follows the step (at least one cell). The old helper leaves the
+     * layer and is disposed — a rebuild per Preferences change, not per frame.
+     */
+    private _rebuildGrid(step: number): void {
+        const divisions = Math.max(1, Math.round(GRID_SIZE / step));
+        if (this._grid && divisions === this._gridDivisions) return;
+        if (this._grid) {
+            this._renderer.removeOverlayLayer(this._grid);
+            this._grid.dispose();
+        }
+        this._gridDivisions = divisions;
+        this._grid = new THREE.GridHelper(GRID_SIZE, divisions, 0x555555, 0x333333);
+        this._grid.visible = this.gridVisible();
+        this._renderer.addOverlayLayer('grid', this._grid);
+        if (!this._gridAxes) {
+            // Axis lines across the grid's extent, built in engine space and
+            // converted only through space.ts (D-1). A hair above the grid so
+            // the coplanar lines do not z-fight.
+            const half = GRID_SIZE / 2;
+            const y = 0.01;
+            const pts = [
+                enginePointToThree({ x: -half, y, z: 0 }), enginePointToThree({ x: half, y, z: 0 }),
+                enginePointToThree({ x: 0, y, z: -half }), enginePointToThree({ x: 0, y, z: half }),
+            ];
+            // Sanity: engine +Z must map to three −Z (the blue line's far end).
+            if (engineDirToThree({ x: 0, y: 0, z: 1 }).z >= 0) throw new Error('space.ts: engine +Z must map to three −Z');
+            const geo = new THREE.BufferGeometry().setFromPoints(pts);
+            const colors = new Float32Array([
+                0.9, 0.25, 0.25, 0.9, 0.25, 0.25,   // red X
+                0.3, 0.45, 0.95, 0.3, 0.45, 0.95,   // blue Z (toward engine +Z)
+            ]);
+            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            this._gridAxes = new THREE.LineSegments(geo,
+                new THREE.LineBasicMaterial({ vertexColors: true }));
+            this._gridAxes.visible = this.gridVisible();
+            this._renderer.addOverlayLayer('grid', this._gridAxes);
+        }
+    }
+
+    /**
+     * Recentres the grid (and its axis lines) on the pivot's XZ, snapped to
+     * 10 steps so the lines never visibly crawl (D-8). Runs per frame —
+     * `_rebuildGrid` early-returns when the step is unchanged, so position
+     * cannot live there.
+     */
+    private _recentreGrid(): void {
+        if (!this._grid) return;
+        const snap = 10 * this.gridStep;
+        const p = this.pivot;
+        const x = Math.round(p.x / snap) * snap;
+        const z = Math.round(p.z / snap) * snap;
+        const at = enginePointToThree({ x, y: 0, z });
+        this._grid.position.copy(at);
+        this._gridAxes?.position.copy(at);
+    }
+
+    /**
+     * Active lights in the whole scene: an enabled light component on an object
+     * active in the hierarchy (the icon pass's rules). A disabled component or
+     * an inactive object lights nothing, so it does not count for the hint.
+     */
+    private _countActiveLights(): number {
+        let count = 0;
+        for (const go of this._sceneObjects()) {
+            if (!go.activeInHierarchy) continue;
+            const components = (go as unknown as { _components: unknown[] })._components;
+            for (let i = 0; i < components.length; i++) {
+                const component = components[i];
+                if ((component as { isActiveAndEnabled?: boolean }).isActiveAndEnabled === false) continue;
+                const typeName = TypeRegistry.getTypeName(component as object);
+                if (typeName === 'DirectionalLight' || typeName === 'PointLight'
+                    || typeName === 'SpotLight' || typeName === 'AmbientLight') count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * The engine three scene as a normal frame leaves it (the probe's DW-7.2
+     * proof): direct child count — no headlight leftovers — and every light's
+     * `visible`, found through the whole graph.
+     */
+    public threeInfo(): { children: number; lightsVisible: boolean[] } {
+        const scene = SceneManager.activeScene._internalThreeScene;
+        const lightsVisible: boolean[] = [];
+        scene.traverse(o => {
+            if ((o as THREE.Light).isLight) lightsVisible.push(o.visible);
+        });
+        return { children: scene.children.length, lightsVisible };
+    }
 
     constructor(
         private readonly _zone: NgZone,
@@ -128,8 +282,11 @@ export class ViewportService {
         this._syncGizmoSelection();
 
         // ── Grid: depth-tested against the engine scene (D-2 step 3) ──
-        const grid = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
-        this._renderer.addOverlayLayer('grid', grid);
+        // The step comes from Preferences (gridSize); the effect rebuilds the
+        // helper when it changes and applies the visibility chip's state.
+        this._gridEffect = effect(() => {
+            this._rebuildGrid(this._settings.gridSize());
+        }, { injector: this._injector });
 
         // ── Orientation cube (B1 phase 3) ──
         const orientation = new OrientationGizmo(this._renderer);
@@ -206,6 +363,11 @@ export class ViewportService {
                 setComponentEnabled: (goName, typeName, index, enabled) =>
                     this.setComponentEnabled(goName, typeName, index, enabled),
                 gizmoSettings: () => this.gizmoSettings(),
+                lightingOn: () => this.sceneLighting(),
+                drawMode: () => this.drawMode(),
+                gridVisible: () => this.gridVisible(),
+                gridStep: () => this.gridStep,
+                threeInfo: () => this.threeInfo(),
             });
         }
     }
@@ -234,6 +396,19 @@ export class ViewportService {
         this._selectionEffect = null;
         this._snapEffect?.destroy();
         this._snapEffect = null;
+        this._gridEffect?.destroy();
+        this._gridEffect = null;
+        if (this._grid) {
+            this._renderer.removeOverlayLayer(this._grid);
+            this._grid.dispose();
+            this._grid = null;
+        }
+        if (this._gridAxes) {
+            this._renderer.removeOverlayLayer(this._gridAxes);
+            this._gridAxes.geometry.dispose();
+            (this._gridAxes.material as THREE.Material).dispose();
+            this._gridAxes = null;
+        }
         this._outline?.dispose();
         this._outline = null;
         this._picker = null;
@@ -367,6 +542,9 @@ export class ViewportService {
     private _tick(): void {
         // Flush dirty engine transforms before we render the engine scene.
         Transform._syncAllDirty();
+
+        // The grid follows the pivot, snapped to 10 steps (D-8).
+        this._recentreGrid();
 
         // The handles must not outlive their objects: undo, loading and closing a
         // project rebuild the scene, and the proxy can carry a stale pose for a
