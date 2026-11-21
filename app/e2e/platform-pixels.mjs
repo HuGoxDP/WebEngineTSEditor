@@ -128,8 +128,12 @@ function findBrowser() {
 }
 
 // The window is the render surface: Application._resize() sizes the backend to
-// window.innerWidth/innerHeight, so --window-size=640,480 plus pixelRatio=1 in
-// the harness makes the drawing buffer exactly 640x480 and (x, y) buffer coords.
+// window.innerWidth/innerHeight, so the harness needs innerWidth/innerHeight to
+// be exactly 640x480 (pixelRatio=1 makes the buffer match, and (x, y) buffer
+// coords). --window-size sets the OUTER window: on Windows headless Chrome the
+// frame eats 16px of width and 151px of height (measured: --window-size=640,480
+// → inner 624x329, so the default probe pixel 320,240 lands below the scene and
+// reads background). Request the outer size that leaves a 640x480 inner box.
 const HARNESS = `<!doctype html>
 <meta charset="utf-8">
 <title>platform pixel check</title>
@@ -250,7 +254,9 @@ async function main() {
     const flags = [
         "--enable-unsafe-swiftshader",
         "--use-angle=swiftshader",
-        "--window-size=640,480",
+        // Outer size compensated for the headless window frame (see above):
+        // inner box comes out 640x480, the size the pixel coords assume.
+        "--window-size=656,631",
         "--no-first-run", "--no-default-browser-check",
         "--disable-extensions", "--disable-background-networking",
         `--user-data-dir=${profile}`,
