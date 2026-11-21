@@ -1477,6 +1477,11 @@ scenario("a double save coalesces: one reload, no spurious import error, no self
   // Unfixed: the ask is up; answer it so the rest of the race plays out and is
   // recorded too. Fixed: nothing to answer.
   if (asks) await dialogButton(page, "Replace").click();
+  // G2: a focus event inside the same window must stand down too — the focus
+  // check would read the save's own write as an outside change and ask.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(300);
+  check("a focus check mid-save does not ask either", (await page.locator(".dlg").count()) === 0);
   await page.evaluate(() => window.__releaseStampRead());
   const swapped = await page.waitForFunction(old => window.__wetsProbe.scriptClass("Rotator")?.token !== old, token, { timeout: 30000 })
     .then(() => true, () => false);
@@ -2533,6 +2538,84 @@ scenario("an open settles its scene before the workspace accepts edits (C4)", as
     await page.keyboard.press("Alt+Shift+N");
     await page.waitForTimeout(300);
     check("once open, the shortcut creates", (await page.locator("app-hierarchy").innerText()).includes("GameObject"));
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4 review R4-G3: the settle guard must hold for a project SWITCH too, not
+// only for an open from the start screen. On 2400f86 status never leaves
+// 'open' during _enter, so the workspace, its menus and its shortcuts stay
+// live through the new project's script load — an Alt+Shift+N in that gap
+// creates an object the scene reset then wipes, and Open Project is still
+// clickable mid-settle. Failing-first by construction: with the workspace
+// still mounted, the ".work"/menubar checks below see it, and the keypress
+// leaves a GameObject in the hierarchy that the fixed code never creates.
+// The entry script's read is held (armed AFTER the first project is open, so
+// the hold catches the switch's load, not the first open's).
+scenario("a project switch settles before the workspace accepts edits (C4 review R4-G3)", async () => {
+    const page = await newPage("SwitchFrom");
+    // The first project carries a script the second does not: its outside-edit
+    // stamp must not survive the switch, or the next focus check reads the old
+    // project's file as "deleted outside" and reloads for nothing.
+    await seed(page, "SwitchFrom", {
+        "scenario.meta.json": JSON.stringify({ id: "switch-from", name: "SwitchFrom", version: 1 }),
+        "scripts/Scenario.ts": SCENARIO_ENTRY,
+        "scripts/components/Extra.ts": "export {};\n",
+        "assets/scenes/main.scene.json": sceneWith("FromAnchor"),
+    });
+    await seed(page, "SwitchTo", {
+        "scenario.meta.json": JSON.stringify({ id: "switch-to", name: "SwitchTo", version: 1 }),
+        "scripts/Scenario.ts": SCENARIO_ENTRY,
+        "assets/scenes/main.scene.json": sceneWith("ToAnchor"),
+    });
+    await page.getByText("Open folder…").click();
+    await page.locator(".work").waitFor({ timeout: 30000 });
+    for (let i = 0; i < 50 && !(await page.locator("app-hierarchy").innerText()).includes("FromAnchor"); i++) await page.waitForTimeout(100);
+    check("the first project is open and settled", (await page.locator("app-hierarchy").innerText()).includes("FromAnchor"));
+
+    // Switch through the menu, the way an author does. The second project's
+    // entry-script read is held, so the settle gap is wide and deterministic.
+    await holdScriptRead(page);
+    await pick(page, "SwitchTo");
+    await menu(page, "File", "Open Project");
+    for (let i = 0; i < 50 && !(await page.evaluate(() => window.__scriptReadHeld === true)); i++) await page.waitForTimeout(100);
+    check("the switch reaches its script load", await page.evaluate(() => window.__scriptReadHeld === true));
+    await page.waitForTimeout(250);
+    check("while the switch settles, no workspace is shown", (await page.locator(".work").count()) === 0);
+    check("and no menu offers Open Project mid-settle", (await page.locator(".menubar-item").count()) === 0);
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(300);
+    check("the create shortcut is inert in the gap",
+        (await page.locator("app-hierarchy li", { hasText: "GameObject" }).count()) === 0);
+    await page.evaluate(() => window.__releaseScriptRead?.());
+    await page.locator(".work").waitFor({ timeout: 30000 });
+    for (let i = 0; i < 50 && !(await page.locator("app-hierarchy").innerText()).includes("ToAnchor"); i++) await page.waitForTimeout(100);
+    check("the second project opens clean", (await page.locator("app-hierarchy").innerText()).includes("ToAnchor"));
+    check("the project tag names the new project", (await page.locator(".project-tag").innerText()).includes("SwitchTo"));
+    check("no phantom object from the gap", (await page.locator("app-hierarchy").innerText()).match(/GameObject/g) === null);
+    check("no edit was lost to the settle", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+
+    // The previous project's stamps are gone: a focus check finds nothing
+    // changed and nothing deleted, so it must not reload. Two loads in the
+    // Console — the first open's and the switch's — and no third.
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(800);
+    await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+    await page.waitForTimeout(400);
+    const loads = await page.evaluate(() => [...document.querySelectorAll(".cons-list .log.info")]
+        .filter(e => (e.querySelector(".msg")?.textContent ?? "").includes("module(s) loaded"))
+        .map(e => ({ text: e.querySelector(".msg").textContent, n: Number((e.querySelector(".rep")?.textContent ?? "×1").slice(1)) })));
+    const reloads = loads.reduce((n, l) => n + l.n, 0);
+    check("a focus check after the switch does not reload the old project's scripts", reloads === 2, JSON.stringify(loads));
+    check("no Console error row", (await page.locator(".cons-list .log.error").count()) === 0);
+
+    // Now that it is open, the shortcut works — and what it creates stays:
+    // nothing after the settle resets the scene again.
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(400);
+    check("once open, the shortcut creates and the object stays",
+        (await page.locator("app-hierarchy").innerText()).includes("GameObject"));
     check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });

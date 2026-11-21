@@ -361,6 +361,9 @@ export class CommandsService {
                 await this._enter(folder, result.meta);
             } else {
                 // The browser's own store: no folder to make, no permission to ask.
+                // The same settle guard as _enter: from an open workspace, the
+                // switch stands the workspace down until the scene is in place.
+                this._project.status.set('closed');
                 await this._project.createInBrowser(result.meta);
                 await this._settle();
             }
@@ -460,6 +463,11 @@ export class CommandsService {
      *   the instruction to lay out the scenario files before the project opens.
      */
     private async _enter(handle: ProjectFolderHandle, layout?: ProjectMeta): Promise<void> {
+        // A switch settles like an open from the start screen: the workspace —
+        // and its menus and shortcuts — stands down until _settle is done, or
+        // an edit made while the new project's scripts load is wiped by the
+        // scene reset that follows (C4 review R4-G3).
+        this._project.status.set('closed');
         this._resetScene();
         await this._project.adopt(handle, layout);
         await this._settle();

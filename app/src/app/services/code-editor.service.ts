@@ -98,8 +98,11 @@ export class CodeEditorService {
         // A second press while a save is in flight is the same save: the first
         // has the buffer, and letting the second run would see the first's own
         // write as an outside change (C4 review R4). The buffer stays dirty if
-        // it moved again, so nothing typed is lost by the skip.
-        if (!file || this._saving) return false;
+        // it moved again, so nothing typed is lost by the skip. A focus check
+        // already in flight is the same window from the other side: its
+        // per-file reads could see this save's write before the stamp update,
+        // so the save stands down until the check is done (C4 review R4-G3).
+        if (!file || this._saving || this._checking) return false;
         this._saving = true;
         try {
             if (await this._changedOnDisk(file.path) && !await this._askReplace(file)) return false;
@@ -129,6 +132,10 @@ export class CodeEditorService {
      */
     public async reloadScripts(): Promise<string[]> {
         const notes = await this._reload();
+        // The baseline is this project's: a switch must not keep the previous
+        // project's stamps, whose same-named paths would read as outside edits
+        // (C4 review R4-G3). Every current script is re-seeded just below.
+        this._stamps.clear();
         for (const path of await this._runtime.scriptFiles()) await this._stamp(path);
         return notes;
     }
