@@ -358,6 +358,7 @@ export class ViewportService {
                 gizmoCounts: () => this.gizmoCounts,
                 gizmoExtent: (name, kind) => this.gizmoExtent(name, kind),
                 gizmoInfo: (name, kind) => this.gizmoInfo(name, kind),
+                gizmoBufferStats: kind => this.gizmoBufferStats(kind),
                 iconCounts: () => this.iconCounts,
                 transformOf: name => this.transformOf(name),
                 setComponentEnabled: (goName, typeName, index, enabled) =>
@@ -416,6 +417,9 @@ export class ViewportService {
         this._componentGizmos = null;
         this._icons?.dispose();
         this._icons = null;
+        // The detached view must not keep the closed scene reachable (B1r5 #5).
+        this._sceneWalk.length = 0;
+        this._gizmoSelected.clear();
         this._rectEl?.remove();
         this._rectEl = null;
         this._renderer.detach();
@@ -789,6 +793,13 @@ export class ViewportService {
         saveGizmoSettings(next);
         this._componentGizmos?.setSettings(next);
         this._icons?.setVisibleIf(next.enabled);
+        // With gizmos off nothing walks the scene per frame, so the walk list
+        // must not pin the last scene's objects across an undo reload or a
+        // Close Project (B1r5 finding 5).
+        if (!next.enabled) {
+            this._sceneWalk.length = 0;
+            this._gizmoSelected.clear();
+        }
     }
 
     public setIconSize(size: number): void {
@@ -809,6 +820,14 @@ export class ViewportService {
             }
         }
         return out;
+    }
+
+    /** The actual flushed line buffer of a kind: draw count, capacity, last vertex (B1r5 #6). */
+    public gizmoBufferStats(kind: GizmoKind | string): { drawn: number; capacity: number; last: { x: number; y: number; z: number } } | null {
+        const gizmos = this._componentGizmos;
+        if (!gizmos) return null;
+        const resolved = kindOfType(kind) ?? (kind as GizmoKind);
+        return gizmos.bufferStats(resolved);
     }
 
     /** How far one object's gizmo of a kind reaches, in engine units (the selection, as the existing e2e asserts). */

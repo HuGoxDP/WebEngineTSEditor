@@ -2401,6 +2401,18 @@ scenario("component gizmos: the review proofs (B1r4)", async () => {
                 go("HiddenLight", { components: [{ type: "PointLight", fields: { range: 5 } }] }),
             ] }),
             go("Unsel", { components: [{ type: "PointLight", fields: { range: 5 } }] }),
+            // B1r5 #3: circle normals must be MEASURED from the drawn basis —
+            // a sphere's three great circles and a turned sun's end disc prove it.
+            go("Sph", { transform: { position: at(6, 1, 2), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "SphereCollider", fields: { radius: 2 } }] }),
+            go("Sun", { transform: { position: at(-2, 5, -5), rotation: { x: H, y: 0, z: 0, w: H }, scale: at(1, 1, 1) }, components: [{ type: "DirectionalLight", fields: {} }] }),
+            // B1r5 #4: a tall capsule reads as a capsule — side lines join the caps.
+            go("CapTall", { transform: { position: at(8, 2, -2), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "CapsuleCollider", fields: { radius: 0.5, height: 4 } }] }),
+            // B1r5 #6 (B1r4 #9): 60 spheres × 3 circles × 24 segments × 2 verts
+            // = 8640 vertices — past the 8192 pool, which must grow, not truncate.
+            ...Array.from({ length: 60 }, (_, i) => go(`Bulk${i}`, {
+                transform: { position: at(20 + i * 2, 0, 20), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) },
+                components: [{ type: "SphereCollider", fields: { radius: 1 } }],
+            })),
         ],
     };
     await seed(page, "GizmoProof", {
@@ -2523,6 +2535,89 @@ scenario("component gizmos: the review proofs (B1r4)", async () => {
     await page.locator("app-hierarchy li.scene-root").click();
     await selSettled(false);
     check("deselecting clears the record's selected flag", (await info("Unsel", "PointLight"))[0]?.selected === false, JSON.stringify(await info("Unsel", "PointLight")));
+
+    // 9 — B1r5 #3: the sphere's three circles lie in three MEASURED planes.
+    // A basis bug (the old _circlePoint('yz') returning XZ) collapses two
+    // normals onto one plane; with the normal recorded from u × v of the
+    // actual vertex basis, the pairwise dot check catches it.
+    const sph = await info("Sph", "SphereCollider");
+    const sphC = sph[0]?.circles ?? [];
+    const sphDistinct = sphC.length === 3
+        && Math.abs(dot(sphC[0].normal, sphC[1].normal)) < 0.1
+        && Math.abs(dot(sphC[0].normal, sphC[2].normal)) < 0.1
+        && Math.abs(dot(sphC[1].normal, sphC[2].normal)) < 0.1;
+    check("sphere: three circles in three distinct measured planes", sph.length === 1 && sphDistinct,
+        JSON.stringify(sphC.map(c => c.normal)));
+    check("sphere: circles centred on the object with radius = radius field",
+        sphC.length === 3 && sphC.every(c => near3(c.center, { x: 6, y: 1, z: 2 }) && nearR(c.radius, 2)),
+        JSON.stringify(sphC));
+
+    // 10 — B1r5 #3: the sun turned X90 points down; its end disc's measured
+    // normal must be parallel to the ROTATED forward, not a world-fixed axis.
+    const sunT = await page.evaluate(() => window.__wetsProbe.transformOf("Sun"));
+    const sunFwd = rotate({ x: 0, y: 0, z: 1 }, sunT.rotation);
+    const sun = await info("Sun", "DirectionalLight");
+    const sunC = sun[0]?.circles[0];
+    check("sun: end disc centre = position + 1.5 * rotated forward",
+        sun.length === 1 && !!sunC && near3(sunC.center, add(sunT.position, sunFwd, 1.5)), JSON.stringify(sunC?.center));
+    check("sun: end disc normal parallel to the rotated forward (measured)",
+        !!sunC && Math.abs(Math.abs(dot(sunC.normal, sunFwd)) - 1) < 1e-2,
+        JSON.stringify({ normal: sunC?.normal, fwd: sunFwd }));
+
+    // 11 — B1r5 #4: the tall capsule: half.y = height/2 = 2, and the side
+    // lines put vertices at local (±r, 0, 0) — the mid-height waist a
+    // figure-8 of cap circles never reaches. half.x = r proves the sides
+    // exist (the caps' circles alone would too, so also check the extent
+    // covers the waist through half.y while half.x stays r).
+    const tall = await info("CapTall", "CapsuleCollider");
+    check("tall capsule: one record, half-height = height/2",
+        tall.length === 1 && nearR(tall[0]?.half.y, 2), JSON.stringify(tall[0]?.half));
+    check("tall capsule: half.x = radius (the side lines at ±r)",
+        tall.length === 1 && nearR(tall[0]?.half.x, 0.5) && nearR(tall[0]?.half.z, 0.5),
+        JSON.stringify(tall[0]?.half));
+    // The waist proof: the cap circles span ±(h) ± r in Y only around the cap
+    // centres; the side lines are the only geometry at local y = 0, x = ±r.
+    // The record's six circles (3 per cap) must all sit at the cap centres,
+    // and each cap must carry all three measured planes {X, Y, Z}: the old
+    // figure-8 drew TWO circles per cap (normals Y and Z only) plus diameters,
+    // so the count and the per-cap normal set both fail on the old shape.
+    const capCircles = tall[0]?.circles ?? [];
+    const topCap = { x: 8, y: 2 + 1.5, z: -2 }, botCap = { x: 8, y: 2 - 1.5, z: -2 };
+    const capNormals = (cap) => capCircles.filter(c => near3(c.center, cap)).map(c => c.normal);
+    const hasPlane = (ns, axis) => ns.some(n => Math.abs(Math.abs(dot(n, axis)) - 1) < 0.1);
+    const planesXYZ = (ns) => ns.length === 3
+        && hasPlane(ns, { x: 1, y: 0, z: 0 }) && hasPlane(ns, { x: 0, y: 1, z: 0 }) && hasPlane(ns, { x: 0, y: 0, z: 1 });
+    check("tall capsule: six circles, all at the two cap centres (no waist rings)",
+        capCircles.length === 6 && capCircles.every(c => near3(c.center, topCap) || near3(c.center, botCap)),
+        JSON.stringify(capCircles.map(c => c.center)));
+    check("tall capsule: each cap carries the X, Y and Z planes (ring + two arcs)",
+        planesXYZ(capNormals(topCap)) && planesXYZ(capNormals(botCap)),
+        JSON.stringify({ top: capNormals(topCap), bot: capNormals(botCap) }));
+
+    // 12 — B1r5 #6 (B1r4 #9): 60 spheres = 8640 vertices > the 8192 pool.
+    // Every record must still be drawn (the pool grows); truncation drops
+    // the tail records' vertices and the last spheres read empty. The records
+    // are built BEFORE the flush, so the buffer itself is read back too: its
+    // draw count must cover the whole kind (8784 with Sph) and its last vertex
+    // must be Bulk59's.
+    const bulkFirst = await info("Bulk0", "SphereCollider");
+    const bulkLast = await info("Bulk59", "SphereCollider");
+    check("past 8192 vertices: the first sphere still draws three circles",
+        bulkFirst.length === 1 && bulkFirst[0].circles.length === 3 && nearR(bulkFirst[0].extent, 1),
+        JSON.stringify(bulkFirst.map(r => r.circles.length)));
+    check("past 8192 vertices: the LAST sphere draws too (the pool grew, no truncation)",
+        bulkLast.length === 1 && bulkLast[0].circles.length === 3 && nearR(bulkLast[0].extent, 1)
+        && near3(bulkLast[0].center, { x: 20 + 59 * 2, y: 0, z: 20 }),
+        JSON.stringify(bulkLast));
+    // Each circle closes at its first vertex c + u·r. The kind's pool also
+    // holds Sph (3 circles × 48 verts), so 61 spheres flush 61 × 144 = 8784
+    // vertices. Bulk59 is the last root; its third circle (u = local Y) ends
+    // at (138,1,20). A truncated buffer stops at 8192, mid-Bulk56.
+    const buf = await page.evaluate(() => window.__wetsProbe.gizmoBufferStats("SphereCollider"));
+    check("past 8192 vertices: the buffer draws all 8784 and ends on Bulk59's last circle",
+        !!buf && buf.drawn === 8784 && buf.capacity >= 8784
+        && near3(buf.last, { x: 138, y: 1, z: 20 }),
+        JSON.stringify(buf));
 
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });

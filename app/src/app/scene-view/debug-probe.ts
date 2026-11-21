@@ -84,6 +84,13 @@ export interface WetsProbe {
         circles: { center: { x: number; y: number; z: number }; normal: { x: number; y: number; z: number }; radius: number }[];
         selected: boolean;
     }[];
+    /**
+     * A kind's ACTUAL flushed line buffer (engine space, z un-flipped): the
+     * draw-range vertex count, the attribute capacity and the last vertex.
+     * Records are built before the flush, so only this read-back can prove the
+     * pool grew past 8192 instead of truncating the tail (B1r5 #6 / B1r4 #9).
+     */
+    gizmoBufferStats(kind: string): { drawn: number; capacity: number; last: { x: number; y: number; z: number } } | null;
     /** How many billboard icons per stable component type are placed and visible (whole scene). */
     iconCounts(): Record<string, number>;
     /**
@@ -182,6 +189,8 @@ export function installProbe(
             selected: boolean;
         }[];
         iconCounts?: () => Record<string, number>;
+        /** A kind's actual flushed line buffer: draw count, capacity, last vertex (B1r5 #6). */
+        gizmoBufferStats?: (kind: string) => { drawn: number; capacity: number; last: { x: number; y: number; z: number } } | null;
         /** An object's world + local TRS by name, over the whole scene. */
         transformOf?: (name: string) => ProbeTransform | null;
         /** Toggles one component's enabled flag by stable type name + add-order index. */
@@ -243,6 +252,7 @@ export function installProbe(
         gizmoCounts: () => deps.gizmoCounts?.() ?? {},
         gizmoExtent: (name, kind) => deps.gizmoExtent?.(name, kind) ?? null,
         gizmoInfo: (name, kind) => deps.gizmoInfo?.(name, kind) ?? [],
+        gizmoBufferStats: kind => deps.gizmoBufferStats?.(kind) ?? null,
         iconCounts: () => deps.iconCounts?.() ?? {},
         setComponentEnabled: (goName, typeName, index, enabled) =>
             deps.setComponentEnabled?.(goName, typeName, index, enabled) ?? false,

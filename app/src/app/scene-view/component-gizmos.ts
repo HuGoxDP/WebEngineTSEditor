@@ -213,6 +213,24 @@ export class ComponentGizmos {
     /** What one object's components drew, for the probe (whole scene, not only the selection). */
     public drawnFor(object: THREE.Object3D): readonly Drawn[] { return this._drawn.get(object) ?? NO_DRAWN; }
 
+    /**
+     * The ACTUAL line buffer a kind flushed into — draw-range vertex count,
+     * attribute capacity and the last vertex (engine space, z un-flipped). The
+     * records are built before `_flush`, so a record read-back cannot see a
+     * truncated buffer; this can (B1r5 #6 / B1r4 #9: past 8192 vertices the pool
+     * must grow, not drop the tail).
+     */
+    public bufferStats(kind: GizmoKind): { drawn: number; capacity: number; last: Vec3 } | null {
+        const lines = this._lines.get(kind);
+        if (!lines) return null;
+        const attr = lines.geometry.getAttribute('position') as THREE.BufferAttribute;
+        const count = lines.geometry.drawRange.count;
+        const drawn = count === Infinity ? attr.count : count;
+        const a = attr.array as Float32Array;
+        const i = Math.max(0, drawn - 1) * 3;
+        return { drawn, capacity: attr.count, last: { x: a[i] ?? 0, y: a[i + 1] ?? 0, z: -(a[i + 2] ?? 0) } };
+    }
+
     public dispose(): void {
         for (const lines of [...this._lines.values(), ...this._selLines.values()]) {
             this._renderer.removeOverlayLayer(lines);
@@ -222,6 +240,16 @@ export class ComponentGizmos {
         this._lines.clear();
         this._selLines.clear();
         this._drawn.clear();
+        // Nothing disposed may keep the scene reachable: the recycled records,
+        // lists and circle records go too (B1r5 finding 5).
+        this._objects.length = 0;
+        this._records.length = 0;
+        this._recordCount = 0;
+        this._lists.length = 0;
+        this._listCount = 0;
+        this._circleRecs.length = 0;
+        this._circleCount = 0;
+        this._selected = new Set();
     }
 
     /**
@@ -238,8 +266,11 @@ export class ComponentGizmos {
             this._selPools.get(kind)!.length = 0;
         }
 
+        // Cleared before the enabled check: with gizmos off the list must not
+        // pin the last scene's GameObjects across an undo reload or a Close
+        // Project (B1r5 finding 5).
+        this._objects.length = 0;
         if (this._settings.enabled) {
-            this._objects.length = 0;
             const scene = SceneManager.activeScene as unknown as SceneInternals;
             const roots = scene._rootGameObjects;
             for (let i = 0; i < roots.length; i++) this._collect(roots[i]);
@@ -388,11 +419,12 @@ export class ComponentGizmos {
                         this._line(sx, sy, sz, sx + f.x * length, sy + f.y * length, sz + f.z * length);
                     }
                 }
-                // A small disc at the far end, perpendicular to forward.
+                // A small disc at the far end, perpendicular to forward
+                // (ax × ay = the rotated forward, measured by _circle).
                 this._circle(
                     this._pos.x + f.x * length, this._pos.y + f.y * length, this._pos.z + f.z * length,
                     this._ax.x, this._ax.y, this._ax.z, this._ay.x, this._ay.y, this._ay.z,
-                    f.x, f.y, f.z, 0.3, 16,
+                    0.3, 16,
                 );
                 return true;
             }
@@ -401,9 +433,9 @@ export class ComponentGizmos {
                 if (range <= 0) return false;
                 // Three great circles in three distinct planes, centred on the object.
                 const c = this._pos;
-                this._circle(c.x, c.y, c.z, 1, 0, 0, 0, 1, 0, 0, 0, 1, range, 24);
-                this._circle(c.x, c.y, c.z, 1, 0, 0, 0, 0, 1, 0, 1, 0, range, 24);
-                this._circle(c.x, c.y, c.z, 0, 1, 0, 0, 0, 1, 1, 0, 0, range, 24);
+                this._circle(c.x, c.y, c.z, 1, 0, 0, 0, 1, 0, range, 24);
+                this._circle(c.x, c.y, c.z, 1, 0, 0, 0, 0, 1, range, 24);
+                this._circle(c.x, c.y, c.z, 0, 1, 0, 0, 0, 1, range, 24);
                 return true;
             }
             case 'spotLight': {
@@ -425,7 +457,7 @@ export class ComponentGizmos {
                         cz + right.z * sx * radius + up.z * sy * radius);
                 }
                 // The end circle lies in the plane perpendicular to forward.
-                this._circle(cx, cy, cz, right.x, right.y, right.z, up.x, up.y, up.z, f.x, f.y, f.z, radius, 16);
+                this._circle(cx, cy, cz, right.x, right.y, right.z, up.x, up.y, up.z, radius, 16);
                 return true;
             }
             case 'boxCollider': {
@@ -456,9 +488,9 @@ export class ComponentGizmos {
                 this._local(center.x * scale.x, center.y * scale.y, center.z * scale.z, this._pa);
                 this._axes();
                 const c = this._pa;
-                this._circle(c.x, c.y, c.z, this._ax.x, this._ax.y, this._ax.z, this._ay.x, this._ay.y, this._ay.z, this._az.x, this._az.y, this._az.z, radius, 24);
-                this._circle(c.x, c.y, c.z, this._ax.x, this._ax.y, this._ax.z, this._az.x, this._az.y, this._az.z, this._ay.x, this._ay.y, this._ay.z, radius, 24);
-                this._circle(c.x, c.y, c.z, this._ay.x, this._ay.y, this._ay.z, this._az.x, this._az.y, this._az.z, this._ax.x, this._ax.y, this._ax.z, radius, 24);
+                this._circle(c.x, c.y, c.z, this._ax.x, this._ax.y, this._ax.z, this._ay.x, this._ay.y, this._ay.z, radius, 24);
+                this._circle(c.x, c.y, c.z, this._ax.x, this._ax.y, this._ax.z, this._az.x, this._az.y, this._az.z, radius, 24);
+                this._circle(c.x, c.y, c.z, this._ay.x, this._ay.y, this._ay.z, this._az.x, this._az.y, this._az.z, radius, 24);
                 return true;
             }
             case 'capsuleCollider': {
@@ -480,12 +512,26 @@ export class ComponentGizmos {
                     // Cap centres at ±(height/2 − radius) along local Y, rotated.
                     this._local(cx, cy + dir * h, cz, this._pa);
                     const c = this._pa;
-                    this._circle(c.x, c.y, c.z, this._ax.x, this._ax.y, this._ax.z, this._ay.x, this._ay.y, this._ay.z, this._az.x, this._az.y, this._az.z, sr, 12);
-                    this._circle(c.x, c.y, c.z, this._ax.x, this._ax.y, this._ax.z, this._az.x, this._az.y, this._az.z, this._ay.x, this._ay.y, this._ay.z, sr, 12);
-                    this._line(c.x - this._ax.x * sr, c.y - this._ax.y * sr, c.z - this._ax.z * sr,
-                        c.x + this._ax.x * sr, c.y + this._ax.y * sr, c.z + this._ax.z * sr);
-                    this._line(c.x - this._az.x * sr, c.y - this._az.y * sr, c.z - this._az.z * sr,
-                        c.x + this._az.x * sr, c.y + this._az.y * sr, c.z + this._az.z * sr);
+                    // Unity's capsule: a ring at each cap centre (XZ) and the
+                    // hemisphere silhouette arcs in XY and ZY — no diameters,
+                    // which read as a figure-8 instead of a capsule (B1r5 #4).
+                    this._circle(c.x, c.y, c.z, this._ax.x, this._ax.y, this._ax.z, this._az.x, this._az.y, this._az.z, sr, 12);
+                    this._circle(c.x, c.y, c.z, this._ax.x, this._ax.y, this._ax.z, this._ay.x, this._ay.y, this._ay.z, sr, 12);
+                    this._circle(c.x, c.y, c.z, this._az.x, this._az.y, this._az.z, this._ay.x, this._ay.y, this._ay.z, sr, 12);
+                }
+                // The four side lines joining the caps at ±r along local X and Z
+                // (Unity's capsule silhouette; the diameters are gone, B1r5 #4).
+                this._local(cx, cy + h, cz, this._pa);
+                const tx = this._pa.x, ty = this._pa.y, tz = this._pa.z;
+                this._local(cx, cy - h, cz, this._pa);
+                const bx = this._pa.x, by = this._pa.y, bz = this._pa.z;
+                for (let s = 0; s < 2; s++) {
+                    const side = s === 0 ? this._ax : this._az;
+                    for (let k = 0; k < 2; k++) {
+                        const sign = k === 0 ? 1 : -1;
+                        const ox = side.x * sr * sign, oy = side.y * sr * sign, oz = side.z * sr * sign;
+                        this._line(tx + ox, ty + oy, tz + oz, bx + ox, by + oy, bz + oz);
+                    }
                 }
                 return true;
             }
@@ -497,8 +543,8 @@ export class ComponentGizmos {
                 // correctly now); upgrade to three great circles if audio needs
                 // the point-light treatment.
                 const c = this._pos;
-                if (min > 0) this._circle(c.x, c.y, c.z, 1, 0, 0, 0, 1, 0, 0, 0, 1, min, 24);
-                this._circle(c.x, c.y, c.z, 1, 0, 0, 0, 1, 0, 0, 0, 1, max, 24);
+                if (min > 0) this._circle(c.x, c.y, c.z, 1, 0, 0, 0, 1, 0, min, 24);
+                this._circle(c.x, c.y, c.z, 1, 0, 0, 0, 1, 0, max, 24);
                 return true;
             }
         }
@@ -588,14 +634,17 @@ export class ComponentGizmos {
     }
 
     /**
-     * A circle in the plane spanned by the orthonormal u/v, centred at c,
-     * recorded for the probe with its unit normal n.
+     * A circle in the plane spanned by the orthonormal u/v, centred at c. The
+     * probe's normal is MEASURED — normalize(u × v), from the same basis the
+     * vertices are built from, never a caller-passed guess (B1r5 finding 3):
+     * a wrong basis then shows up in the read-back instead of hiding behind a
+     * correct-looking normal. The first vertex is c + u·r, so the sign matches
+     * the old passed-in normals (u × v) exactly.
      */
     private _circle(
         cx: number, cy: number, cz: number,
         ux: number, uy: number, uz: number,
         vx: number, vy: number, vz: number,
-        nx: number, ny: number, nz: number,
         radius: number, segments: number,
     ): void {
         const fx = cx + ux * radius, fy = cy + uy * radius, fz = cz + uz * radius;
@@ -610,6 +659,11 @@ export class ComponentGizmos {
             px = qx; py = qy; pz = qz;
         }
         this._line(px, py, pz, fx, fy, fz);
+        let nx = uy * vz - uz * vy;
+        let ny = uz * vx - ux * vz;
+        let nz = ux * vy - uy * vx;
+        const len = Math.hypot(nx, ny, nz);
+        if (len > 1e-9) { nx /= len; ny /= len; nz /= len; }
         this._addCircle(cx, cy, cz, nx, ny, nz, radius);
     }
 

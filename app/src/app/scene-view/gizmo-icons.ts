@@ -94,7 +94,10 @@ export class GizmoIcons {
     public dispose(): void {
         this._mounted = false;
         this._renderer.removeOverlayLayer(this._group);
-        for (const material of [...this._materials.values(), ...this._brightMaterials.values()]) material.map?.dispose();
+        for (const material of [...this._materials.values(), ...this._brightMaterials.values()]) {
+            material.map?.dispose();
+            material.dispose();   // the material itself, not only its texture (B1r5 #5)
+        }
         this._materials.clear();
         this._brightMaterials.clear();
         this._sprites.clear();
