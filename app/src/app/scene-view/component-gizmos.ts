@@ -337,9 +337,15 @@ export class ComponentGizmos {
             const pool = pools.get(kind)!;
             let attribute = object.geometry.getAttribute('position') as THREE.BufferAttribute;
             if (pool.length > attribute.array.length) {
-                // Next power of two that fits — no silent truncation.
+                // Next power of two that fits — no silent truncation — rounded
+                // UP to whole vertices: BufferAttribute.count = array.length / 3
+                // (three/src/core/BufferAttribute.js:86), and computeBoundingSphere
+                // loops i < count (three/src/core/BufferGeometry.js:767), so a
+                // capacity not divisible by 3 makes the last iteration read past
+                // the array end → undefined → NaN radius (raycaster-triggered).
                 let capacity = 1;
                 while (capacity < pool.length) capacity *= 2;
+                capacity = Math.ceil(capacity / 3) * 3;
                 attribute = new THREE.BufferAttribute(new Float32Array(capacity), 3);
                 object.geometry.setAttribute('position', attribute);
             }
