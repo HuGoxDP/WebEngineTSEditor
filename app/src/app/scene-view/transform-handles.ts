@@ -304,7 +304,13 @@ export class TransformHandles {
             this._proxy.position.copy(box.getCenter(new THREE.Vector3()));
         }
 
-        if (this.space === 'local') {
+        // Unity seats the scale handle at the object's own rotation for a *single*
+        // object whatever the toggle — "Allow global space scaling for multi-selection
+        // but not for a single object" (UnityCsReference BuiltinTools.cs, ScaleTool).
+        // A world-axis scale handle over a rotated object would stretch along an axis
+        // it does not show, because the write-back is `localScale` (B1r2).
+        const scaleSeat = this.mode === 'scale' && this._targets.length === 1;
+        if (this.space === 'local' || scaleSeat) {
             // Local: the handle's axes are the active object's world axes, which
             // under the mirror read as the conjugate of its engine rotation.
             this._proxy.quaternion.copy(engineQuatToThree(primary.transform.rotation));
@@ -317,6 +323,20 @@ export class TransformHandles {
 
     /** Shows the handle sets the current tool asks for, and aims them. */
     private _applyMode(): void {
+        // A single object's scale handle is seated on its own axes whatever the
+        // toggle (B1r2), so that set must also *drag* in local space.
+        const scaleSeat = this.mode === 'scale' && this._targets.length === 1;
+        // B1r5 finding 1 enabler: three's scale pickers are geometrically
+        // identical to translate's cones (TransformControls.js:1383-1408 vs
+        // :1263-1288) and its XYZ box sits inside rotate's XYZE sphere
+        // (:1337), so at equal size the scale set can NEVER win claimPointer's
+        // translate→rotate→scale order. Unity's Transform tool seats the scale
+        // cubes beyond the arrowheads; enlarge only the combined set so its
+        // boxes reach past translate's picker extent (0.6·size/4·factor) and
+        // rotate's E ring (0.85·size/4·factor). The drag ratio comes from the
+        // drag plane's intersections (:583-623), not the handle size, so this
+        // changes reachability only — every existing drag keeps its owner.
+        this._controls.scale.setSize(this.mode === 'combined' ? 2.0 : 0.8);
         for (const mode of MODES) {
             const on = this.mode === mode || this.mode === 'combined';
             this._helpers[mode].visible = on;
@@ -325,7 +345,7 @@ export class TransformHandles {
             // telling the controls that it is in Local space is what makes the
             // drag move *along* them (three takes the offset's component in the
             // object's frame rather than the world's).
-            this._controls[mode].space = this.space === 'local' ? 'local' : 'world';
+            this._controls[mode].space = this.space === 'local' || (scaleSeat && mode === 'scale') ? 'local' : 'world';
         }
     }
 
@@ -456,18 +476,41 @@ export class TransformHandles {
             y: this._proxy.scale.y / Math.max(start.scale.y, SCALE_EPS),
             z: this._proxy.scale.z / Math.max(start.scale.z, SCALE_EPS),
         };
+        // The combined tool in Global has no single-object seat (the proxy stays
+        // at identity), so three draws the scale boxes along world axes while the
+        // write-back is `localScale` — dragging a box would stretch the object
+        // along an axis the box does not show. Unity's Transform tool offers only
+        // the uniform handle for Global scale (UnityCsReference TransformHandle.cs,
+        // s_Default's scale = ScaleHandleParam.Handle.XYZ): take the component of
+        // the ratio farthest from 1 and apply it to every axis, for any selection
+        // size. Three still draws the per-axis boxes; only their effect is uniform
+        // (B1r5 finding 1; recorded in the phase-7 notes).
+        if (this.mode === 'combined' && this.space === 'world') {
+            const dx = Math.abs(ratio.x - 1), dy = Math.abs(ratio.y - 1), dz = Math.abs(ratio.z - 1);
+            const uniform = dx >= dy && dx >= dz ? ratio.x : dy >= dz ? ratio.y : ratio.z;
+            ratio.x = ratio.y = ratio.z = uniform;
+        }
         if (Math.abs(ratio.x - 1) < SCALE_EPS && Math.abs(ratio.y - 1) < SCALE_EPS && Math.abs(ratio.z - 1) < SCALE_EPS) return;
         const point = this.handlePosition;
+        // The rotation the handle was seated with, captured now — before any
+        // write-back moves a target. The ratio lives in the seated axes (the
+        // object's own for a single seat or Local, world otherwise), so a Centre
+        // drag must carry each object's offset through that frame:
+        // pivot + R·((R⁻¹·(pos − pivot)) ⊙ ratio), Unity's TransformManipulator.cs
+        // TransformData.SetScaleDelta. With R identity this is exactly the old
+        // world-axis component scaling (B1r5 finding 2).
+        const seat = this._seatRotation();
+        const seatInv = new Quaternion(seat.x, seat.y, seat.z, seat.w).invert();
         for (const t of this._dragTargets) {
             t.transform.localScale = new Vector3(t.scale.x * ratio.x, t.scale.y * ratio.y, t.scale.z * ratio.z);
             if (this.pivotMode === 'center') {
                 // Scaling about the handle also moves the objects towards or away
-                // from it, component-wise in the axes being scaled.
-                t.transform.position = new Vector3(
-                    point.x + (t.position.x - point.x) * ratio.x,
-                    point.y + (t.position.y - point.y) * ratio.y,
-                    point.z + (t.position.z - point.z) * ratio.z,
-                );
+                // from it — in the seated axes, not the world's.
+                const rel = new Vector3(t.position.x - point.x, t.position.y - point.y, t.position.z - point.z)
+                    .applyQuaternion(seatInv);
+                rel.x *= ratio.x; rel.y *= ratio.y; rel.z *= ratio.z;
+                rel.applyQuaternion(seat);
+                t.transform.position = new Vector3(point.x + rel.x, point.y + rel.y, point.z + rel.z);
             }
         }
         this._changed();
@@ -478,5 +521,19 @@ export class TransformHandles {
         // not jump when the engine object moves under it.
         this._proxy.updateMatrixWorld(true);
         this.onTargetsChanged?.();
+    }
+
+    /**
+     * The engine-space rotation the handle is seated with — the same rule as
+     * `_placeHandle`'s seat (Local space, or a single object's scale seat: the
+     * active object's own world rotation; otherwise identity). The Centre-mode
+     * scale offset is carried through this frame (B1r5 finding 2).
+     */
+    private _seatRotation(): Quaternion {
+        const scaleSeat = this.mode === 'scale' && this._targets.length === 1;
+        if ((this.space === 'local' || scaleSeat) && this._targets.length > 0) {
+            return this._targets[0].transform.rotation;
+        }
+        return new Quaternion(0, 0, 0, 1);
     }
 }

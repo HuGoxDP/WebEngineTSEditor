@@ -128,6 +128,14 @@ const SHORTCUTS: ReadonlyArray<{ label: MessageKey; keys: string }> = [
                         <p class="prefs-hint">{{ 'prefs.snapHint' | t }}</p>
 
                         <div class="prefs-row">
+                            <label for="prefs-grid-size">{{ 'prefs.gridSize' | t }}</label>
+                            <input id="prefs-grid-size" class="num" type="number" min="0.1" max="100" step="0.1"
+                                [value]="settings.gridSize()"
+                                (change)="onGridSize($any($event.target).value)">
+                        </div>
+                        <p class="prefs-hint">{{ 'prefs.gridSizeHint' | t }}</p>
+
+                        <div class="prefs-row">
                             <label for="prefs-fly">{{ 'prefs.flySpeed' | t }}</label>
                             <input id="prefs-fly" class="num" type="number" min="0.1" step="0.5"
                                 [value]="settings.flySpeed()"
@@ -256,6 +264,12 @@ export class SettingsDialogComponent {
     public onScaleSnap(raw: string): void {
         const value = Number(raw);
         if (Number.isFinite(value) && value > 0) this.settings.scaleSnap.set(value);
+    }
+
+    /** The grid step lives in 0.1–100 world units; anything else keeps the old one. */
+    public onGridSize(raw: string): void {
+        const value = Number(raw);
+        if (Number.isFinite(value) && value >= 0.1 && value <= 100) this.settings.gridSize.set(value);
     }
 
     /** The fly speed is a strictly positive rate; anything else keeps the old one. */

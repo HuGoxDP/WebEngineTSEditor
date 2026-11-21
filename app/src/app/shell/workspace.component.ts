@@ -108,19 +108,92 @@ import { StatusbarComponent } from './statusbar.component';
                                 <span>{{ settings.gridSnap() > 0 ? settings.gridSnap() : '–' }}</span>
                             </button>
                             <div class="vp-sep"></div>
-                            <button class="chip active" [title]="'vp.shaded' | t">
+                            <!-- Draw mode (D-8): shaded or wireframe, view state only -->
+                            <button class="chip"
+                                [class.active]="viewport.drawMode() === 'shaded'"
+                                (click)="viewport.setDrawMode('shaded')" [title]="'vp.shaded' | t">
                                 <wets-icon name="shaded"></wets-icon>
                             </button>
-                            <button class="chip" [title]="'vp.lighting' | t"><wets-icon name="light"></wets-icon></button>
+                            <button class="chip"
+                                [class.active]="viewport.drawMode() === 'wireframe'"
+                                (click)="viewport.setDrawMode('wireframe')" [title]="'vp.wireframe' | t">
+                                <wets-icon name="wireframe"></wets-icon>
+                            </button>
+                            <!-- Lighting (D-7): on = the scene's own lights, off = a view-only headlight -->
+                            <button class="chip"
+                                [class.active]="viewport.sceneLighting()"
+                                (click)="viewport.toggleLighting()" [title]="'vp.lighting' | t">
+                                <wets-icon name="light"></wets-icon>
+                            </button>
+                            <button class="chip"
+                                [class.active]="viewport.gridVisible()"
+                                (click)="viewport.toggleGrid()" [title]="'vp.grid' | t">
+                                <wets-icon name="grid"></wets-icon>
+                            </button>
                             <button class="chip" [title]="'vp.audio' | t"><wets-icon name="audio-fx"></wets-icon></button>
                             <button class="chip" [title]="'vp.effects' | t"><wets-icon name="cog"></wets-icon></button>
-                            <button class="chip" [title]="'vp.gizmos' | t"><wets-icon name="gizmo"></wets-icon></button>
+                            <!-- Gizmos menu (D-11): per-type switches, the master one and the icon size -->
+                            <div class="gz-menu" [class.open]="gizmosOpen()">
+                                <button class="chip"
+                                    [class.active]="viewport.gizmoSettings().enabled"
+                                    (click)="gizmosOpen.set(!gizmosOpen())" [title]="'vp.gizmos' | t">
+                                    <wets-icon name="gizmo"></wets-icon>
+                                </button>
+                                @if (gizmosOpen()) {
+                                <div class="gz-panel">
+                                    <label class="gz-row master">
+                                        <input type="checkbox" [checked]="viewport.gizmoSettings().enabled"
+                                            (change)="viewport.setGizmoSetting('enabled', $any($event.target).checked)">
+                                        <span>{{ 'gizmo.master' | t }}</span>
+                                    </label>
+                                    <div class="gz-sep"></div>
+                                    <label class="gz-row">
+                                        <input type="checkbox" [checked]="viewport.gizmoSettings().camera"
+                                            (change)="viewport.setGizmoSetting('camera', $any($event.target).checked)">
+                                        <wets-icon name="gizmo"></wets-icon>
+                                        <span>{{ 'gizmo.camera' | t }}</span>
+                                    </label>
+                                    <label class="gz-row">
+                                        <input type="checkbox" [checked]="viewport.gizmoSettings().lights"
+                                            (change)="viewport.setGizmoSetting('lights', $any($event.target).checked)">
+                                        <wets-icon name="light"></wets-icon>
+                                        <span>{{ 'gizmo.lights' | t }}</span>
+                                    </label>
+                                    <label class="gz-row">
+                                        <input type="checkbox" [checked]="viewport.gizmoSettings().colliders"
+                                            (change)="viewport.setGizmoSetting('colliders', $any($event.target).checked)">
+                                        <wets-icon name="cog"></wets-icon>
+                                        <span>{{ 'gizmo.colliders' | t }}</span>
+                                    </label>
+                                    <label class="gz-row">
+                                        <input type="checkbox" [checked]="viewport.gizmoSettings().audio"
+                                            (change)="viewport.setGizmoSetting('audio', $any($event.target).checked)">
+                                        <wets-icon name="audio-fx"></wets-icon>
+                                        <span>{{ 'gizmo.audio' | t }}</span>
+                                    </label>
+                                    <div class="gz-sep"></div>
+                                    <label class="gz-row">
+                                        <span>{{ 'gizmo.iconSize' | t }}</span>
+                                        <input class="gz-slider" type="range" min="0.5" max="3" step="0.25"
+                                            [value]="viewport.gizmoSettings().iconSize"
+                                            (input)="onIconSize($event)">
+                                        <span class="gz-val">{{ viewport.gizmoSettings().iconSize }}</span>
+                                    </label>
+                                </div>
+                                }
+                            </div>
                             <div class="vp-spacer"></div>
                             <button class="chip" [title]="'vp.visibility' | t"><wets-icon name="eye"></wets-icon></button>
                         </div>
 
                         <div class="vp-canvas">
                             <canvas #viewportCanvas></canvas>
+
+                            <!-- D-7: lighting is on but nothing lights the scene — say so,
+                                 because the platform will show the same dark picture. -->
+                            @if (viewport.noLightHint()) {
+                            <div class="vp-nolight-hint">{{ 'vp.noLight' | t }}</div>
+                            }
 
                             <!-- Floating vertical tool palette (Unity-style). Q view, W/E/R the
                                  three handle sets, Y all of them; Rect is stage 18. -->
@@ -291,6 +364,14 @@ export class WorkspaceComponent implements AfterViewInit, OnDestroy {
             return;
         }
         await this.cmd.openProjectEntry(entry);
+    }
+
+    /** Whether the Gizmos menu is open. */
+    public readonly gizmosOpen = signal(false);
+
+    /** The icon-size slider, as a number (the template has no global Number). */
+    public onIconSize(event: Event): void {
+        this.viewport.setIconSize(Number((event.target as HTMLInputElement).value));
     }
 
     /** Active splitter while dragging — drives the dragging-state highlight. */

@@ -87,6 +87,15 @@ async function siblingPage(page, folderName) {
 /** Log capture, the folder-picker stand-in, and the preferences/knobs seeded before the editor starts. */
 async function instrument(page, folderName, settings, autosaveMs) {
     lastPage = page;
+    // The page pulls its fonts from Google; a network blip there fails the load
+    // and pollutes "no page errors". The suite runs against the local server
+    // only, so the font hosts answer with empty CSS once per context (an abort
+    // would itself log a resource error).
+    const ctx = page.context();
+    if (!ctx.__fontsBlocked) {
+        ctx.__fontsBlocked = true;
+        await ctx.route(/fonts\.(googleapis|gstatic)\.com/, r => r.fulfill({ status: 200, contentType: "text/css", body: "" }));
+    }
     page.logs = [];
     page.nativeDialogs = 0;
     page.beforeUnloads = 0;
@@ -312,10 +321,13 @@ const menu = async (page, bar, item) => {
 // "No errors" ignores the two things that are not the app's: a 404 for an asset the
 // static server does not carry, and the GL driver's performance note about the
 // readPixels the probe's pixelStats/pixel reads deliberately perform (D-9/D-13).
+// Only the *performance* note is excused, never the whole `GL Driver Message`
+// prefix: the driver reports real Error-severity GL faults under it too, and
+// dropping the prefix let a broken Scene view pass the suite (B1r3).
 const noErrors = page => page.logs.filter(l =>
     !l.includes("404")
-    && !l.includes("GL Driver Message")
-    && !l.includes("GPU stall")
+    && !(l.includes("GL Driver Message") && l.includes("Performance"))
+    && !l.includes("GPU stall due to ReadPixels")
 ).length === 0;
 
 /** Writes a full project layout (files by project-relative path) the picker will hand back. */
@@ -330,7 +342,9 @@ async function seedScriptProject(page, files) {
 async function openEmptyProject(page) {
     await page.getByText("Open folder…").click();
     await dialogButton(page, "Set up").click();
-    await page.locator(".work").waitFor();
+    // Late in a full run every earlier scenario's page is still open and the
+    // software GL is slow; the same 90 s the reload waits use (B1.6).
+    await page.locator(".work").waitFor({ timeout: 90000 });
 }
 
 /** A scene file with one object, in the engine's format. */
@@ -346,6 +360,30 @@ const sceneWith = name => JSON.stringify({
 // ═══ Scenarios ═══
 const scenarios = [];
 const scenario = (name, fn) => scenarios.push([name, fn]);
+
+// B1r5 #6 (B1r3's missing proof): the filter itself, fed synthetic lines.
+// The old filter excused the whole `GL Driver Message` prefix, so an
+// Error-severity GL fault passed the suite silently; these checks fail on
+// that old filter and pin the narrow one. Pure logic — no page needed.
+scenario("harness: noErrors excuses only performance notes, never GL errors (B1r5)", async () => {
+    const withLogs = lines => ({ logs: lines });
+    check("a synthetic GL Driver Message of Error severity FAILS noErrors",
+        noErrors(withLogs(["[error] GL Driver Message (OpenGL, Error, GL_INVALID_OPERATION in glDrawElements)"])) === false);
+    check("a plain page error fails noErrors",
+        noErrors(withLogs(["[pageerror] TypeError: x is not a function"])) === false);
+    check("the performance note is still excused",
+        noErrors(withLogs(["[warning] GL Driver Message (OpenGL, Performance, GPU stall due to ReadPixels)"])) === true);
+    check("the ReadPixels stall warning alone is excused",
+        noErrors(withLogs(["[warning] GPU stall due to ReadPixels"])) === true);
+    check("an asset 404 is excused",
+        noErrors(withLogs(["[error] Failed to load resource: the server responded with a status of 404"])) === true);
+    check("an empty log passes", noErrors(withLogs([])) === true);
+    check("a real error among excused lines still fails",
+        noErrors(withLogs([
+            "[warning] GL Driver Message (OpenGL, Performance, GPU stall due to ReadPixels)",
+            "[error] GL Driver Message (OpenGL, Error, GL_OUT_OF_MEMORY)",
+        ])) === false);
+});
 
 // C4 phase 2: the script runtime. A project whose saved scene names a component
 // script opens with that component attached: the scripts are compiled and linked
@@ -1909,6 +1947,10 @@ scenario("3d objects: the six primitives, undo, persistence, and the gizmo on to
     const saved = JSON.parse(await readDisk(page, "PrimitivesDemo", "assets/scenes/main.scene.json"));
     check("reopen: all six are in the scene", KINDS.every(k => saved.roots.some(r => r.name === k)), saved.roots.map(r => r.name).join(", "));
     check("the file stays format version 1", saved.version === 1, String(saved.version));
+    // DW-1.3 strengthened (B1r): the exact D-3 kind/args and collider type per
+    // primitive, not "some string kind and some collider".
+    const ARGS = { Cube: [1], Sphere: [0.5, 32], Capsule: [0.5, 2, 32], Cylinder: [0.5, 2, 32], Plane: [10, 10, 1, 1], Quad: [1, 1] };
+    const COLLIDER = { Cube: "BoxCollider", Sphere: "SphereCollider", Capsule: "CapsuleCollider", Cylinder: "CapsuleCollider" };
     for (const kind of KINDS.slice(0, 4)) {
         const root = saved.roots.find(r => r.name === kind);
         const mesh = root.components.find(c => c.type === "MeshFilter");
@@ -1916,10 +1958,16 @@ scenario("3d objects: the six primitives, undo, persistence, and the gizmo on to
         check(`${kind}: a PrimitiveMesh with its kind`, mesh?.fields.sharedMesh?.$type === "PrimitiveMesh" && typeof mesh.fields.sharedMesh.kind === "string", JSON.stringify(mesh?.fields.sharedMesh));
         check(`${kind}: an inlined material`, typeof mat?.fields.sharedMaterial === "object", JSON.stringify(mat?.fields.sharedMaterial));
         check(`${kind}: Unity's collider`, root.components.some(c => /Collider/.test(c.type)), root.components.map(c => c.type).join(", "));
+        check(`${kind}: the D-3 mesh kind and args`, mesh?.fields.sharedMesh?.kind === kind && JSON.stringify(mesh.fields.sharedMesh.args) === JSON.stringify(ARGS[kind]), JSON.stringify(mesh?.fields.sharedMesh));
+        check(`${kind}: Unity's exact collider type`, root.components.filter(c => /Collider/.test(c.type)).map(c => c.type).join() === COLLIDER[kind], root.components.map(c => c.type).join(", "));
     }
     for (const kind of KINDS.slice(4)) {
         const root = saved.roots.find(r => r.name === kind);
+        const mesh = root.components.find(c => c.type === "MeshFilter");
+        const mat = root.components.find(c => c.type === "MeshRenderer");
         check(`${kind}: no collider (Unity's MeshCollider is a recorded deviation)`, !root.components.some(c => /Collider/.test(c.type)), root.components.map(c => c.type).join(", "));
+        check(`${kind}: the D-3 mesh kind and args`, mesh?.fields.sharedMesh?.kind === kind && JSON.stringify(mesh.fields.sharedMesh.args) === JSON.stringify(ARGS[kind]), JSON.stringify(mesh?.fields.sharedMesh));
+        check(`${kind}: an inlined material`, typeof mat?.fields.sharedMaterial === "object", JSON.stringify(mat?.fields.sharedMaterial));
     }
 
     // DW-1.4: the gizmo's red X arrow lands over the cube (D-2's on-top layer).
@@ -1988,8 +2036,14 @@ scenario("recovery: unsaved work survives a crash; giving it up is remembered", 
     // as above: this is where the race first showed, about one full run in eight.
     await page.locator("canvas").click({ position: { x: 300, y: 300 } });
     await page.keyboard.press("Alt+Shift+N");
-    await page.waitForTimeout(1000);
-    check("a copy exists again", (await autosave()) !== null);
+    // The copy lands on the next autosave tick plus its write; under load that
+    // can take longer than a fixed sleep. Poll, then assert the same thing.
+    let copyAgain = null;
+    for (let i = 0; i < 50 && copyAgain === null; i++) {
+        await page.waitForTimeout(300);
+        copyAgain = await autosave();
+    }
+    check("a copy exists again", copyAgain !== null);
     await slowAutosave(page, 500);
     await page.waitForTimeout(700);
     await menu(page, "File", "Close Project");
@@ -2303,9 +2357,14 @@ scenario("new project wizard: collects, validates, creates; cancelling writes no
     // The chosen location already holds a non-empty folder of that name.
     await seed(page, "WizParent", { "Будова атома/old.txt": "x" });
     await page.getByText("Choose a folder…").click();
-    await page.waitForTimeout(200);
     await page.locator(".dlg-btn.primary").click();
-    await page.waitForTimeout(300);
+    // The refusal is asynchronous (it stats the picked folder), and late in a
+    // full run — every earlier scenario's page is still open — that lands well
+    // after the fixed 300 ms this used to wait. Wait for the error instead.
+    for (let i = 0; i < 50; i++) {
+        if ((await page.locator(".wiz-error").count()) > 0) break;
+        await page.waitForTimeout(100);
+    }
     await shot(page, "e2e-wizard-3");
     check("a taken name is refused with a reason", (await page.locator(".wiz-error").innerText()).includes("already exists"));
     check("and the wizard stays open", (await page.locator(".wiz-steps").innerText()).includes("Step 3 of 3"));
@@ -3215,6 +3274,189 @@ scenario("transform handles: snapping, global vs local, multi-select, the tools 
             (await page.locator(".vp-overlay-tl .chip .v").first().innerText()) === label,
             await page.locator(".vp-overlay-tl .chip .v").first().innerText());
     }
+
+    // ── B1r2: a single object's Scale handle seats on its own axes in Global ──
+    // The scenario ends in Centre mode; Centre also moves the position on a
+    // scale drag, so go back to Pivot first.
+    await page.locator(".vp-subtoolbar .chip", { hasText: "Center" }).click();
+    await page.waitForTimeout(250);
+    await create("Cube");
+    await rename("Seat");
+    await page.locator(".insp-body .field").nth(1).locator("input").nth(1).fill("45");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    // An unrotated twin at the same spot: its scale X is world X whatever the
+    // fix, so it is the reference direction. Both readings go through the
+    // uppercase (handle) path from the same origin, so pre-fix the two client
+    // directions coincide exactly.
+    await create("Cube");
+    await rename("Ref");
+    await page.keyboard.press("r");
+    await page.waitForTimeout(300);
+    const normDir = (a, b) => {
+        if (!a || !b) return null;
+        const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+        return len > 1e-6 ? { x: dx / len, y: dy / len } : null;
+    };
+    const axisDir = () => page.evaluate(() => {
+        const p = window.__wetsProbe;
+        return [p.handlePoint("X", 0), p.handlePoint("X", 1)];
+    });
+    const refDir = normDir(...(await axisDir()));
+    await page.locator("app-hierarchy li", { hasText: "Seat" }).first().click();
+    // The re-seat happens in the frame loop after the selection revision moves;
+    // under load a fixed sleep can read the proxy before it is re-seated on Seat.
+    let seatDir = null;
+    for (let i = 0; i < 120 && (!seatDir || !refDir || seatDir.x * refDir.x + seatDir.y * refDir.y >= 0.985); i++) {
+        await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+        seatDir = normDir(...(await axisDir()));
+    }
+    const seatDot = seatDir && refDir ? seatDir.x * refDir.x + seatDir.y * refDir.y : null;
+    check("the Scale handle's X axis follows the cube's own rotation, not world X",
+        seatDot !== null && seatDot < 0.985, JSON.stringify({ seatDir, refDir }));
+    // Drag along the handle's own client direction. The write-back is a
+    // per-component ratio in either space, so the scale VALUES alone cannot tell
+    // pre-fix from post-fix; the seat orientation (seatDot above) is the
+    // discriminator, and it is required here too. Pre-fix seatDot ≈ 1 → fails.
+    const dragDir = seatDir;
+    const seatBefore = await tf("Seat");
+    const scaleHandle = await findHandle("scale", "X");
+    if (scaleHandle && dragDir) {
+        await drag(scaleHandle, dragDir.x * 60, dragDir.y * 60);
+    }
+    const seatAfter = await tf("Seat");
+    const d = seatAfter.localScale, b = seatBefore.localScale;
+    check("a scale drag along the seated axis changes only localScale.x and leaves the pose alone",
+        seatDot !== null && seatDot < 0.985 && !!scaleHandle && !!dragDir
+        && Math.abs(d.x - b.x) > 1e-3 && near(d.y, b.y, 1e-3) && near(d.z, b.z, 1e-3)
+        && near(seatAfter.localPosition.x, seatBefore.localPosition.x, 1e-3)
+        && near(seatAfter.localPosition.y, seatBefore.localPosition.y, 1e-3)
+        && near(seatAfter.localPosition.z, seatBefore.localPosition.z, 1e-3)
+        && near(seatAfter.localRotation.x, seatBefore.localRotation.x, 1e-3)
+        && near(seatAfter.localRotation.y, seatBefore.localRotation.y, 1e-3)
+        && near(seatAfter.localRotation.z, seatBefore.localRotation.z, 1e-3)
+        && near(seatAfter.localRotation.w, seatBefore.localRotation.w, 1e-3),
+        JSON.stringify({ scaleHandle, dragDir, before: b, after: d }));
+
+    // ── B1r5 #1: the Y (combined) tool's Global scale is uniform ──
+    // Unity's Transform tool offers only the uniform handle in Global
+    // (TransformHandle.cs, s_Default's scale = Handle.XYZ). Three still draws
+    // per-axis boxes on the identity-seated proxy, so a box drag must apply
+    // ONE ratio to all three local axes. Pre-fix only localScale.x changed —
+    // the equal-ratio check below fails on the old code.
+    // The entry state is already Pivot/Global (the B1r2 tail restored Pivot),
+    // and #1's ratios are pivot-independent, so no chip is touched here.
+    await page.locator("app-hierarchy li", { hasText: "Seat" }).first().click();
+    await page.keyboard.press("y");
+    await page.waitForTimeout(300);
+    // The drag must land on a point ONLY the scale set claims: claimPointer
+    // hands the press to the first of translate→rotate→scale that hits, so a
+    // point shared with translate would drag-translate instead. Pre-fix no
+    // exclusive scale point exists at all — three's scale pickers are
+    // translate's cones verbatim (TransformControls.js:1383-1408 vs
+    // :1263-1288) and the XYZ box sits inside rotate's XYZE sphere (:1337) —
+    // so the reachability check is red before the combined-set size fix.
+    // Post-fix the enlarged cones reach past translate's picker extent and
+    // rotate's E ring; the scan radius covers that outer band.
+    const hoverScaleAxis = async (want, radius = 260) => {
+        const hub = await tip("X", 0);
+        for (let dx = -radius; dx <= radius; dx += 20) {
+            for (let dy = -radius; dy <= radius; dy += 20) {
+                await page.mouse.move(hub.x + dx, hub.y + dy);
+                const all = await page.evaluate(() => window.__wetsProbe.hoverAll());
+                if (all.scale === want && !all.translate && !all.rotate) return { x: hub.x + dx, y: hub.y + dy };
+            }
+        }
+        return null;
+    };
+    let uniHandle = await hoverScaleAxis("X");
+    if (!uniHandle) uniHandle = await hoverScaleAxis("XYZ");
+    if (!uniHandle) uniHandle = await hoverScaleAxis("Y");
+    if (!uniHandle) uniHandle = await hoverScaleAxis("Z");
+    check("the combined tool's Global scale box is reachable", !!uniHandle,
+        JSON.stringify(await page.evaluate(() => window.__wetsProbe.hoverAll())));
+    const uniBefore = await tf("Seat");
+    if (uniHandle) await drag(uniHandle, 60, 0);
+    const uniAfter = await tf("Seat");
+    const ub = uniBefore.localScale, ua = uniAfter.localScale;
+    const rx = ua.x / ub.x, ry = ua.y / ub.y, rz = ua.z / ub.z;
+    check("a combined Global scale drag is uniform: x, y and z share one ratio",
+        !!uniHandle && Math.abs(rx - 1) > 1e-3
+        && near(rx, ry, 1e-3) && near(rx, rz, 1e-3),
+        JSON.stringify({ before: ub, after: ua, ratios: [rx, ry, rz] }));
+
+    // ── B1r5 #2: a Centre scale carries the offset through the seated axes ──
+    // Parent turned 45° about Y, child at local (3,0,0); select the parent,
+    // R + Center + Global, scale X by k. Unity (TransformManipulator.cs,
+    // TransformData.SetScaleDelta): pivot + R·((R⁻¹·(pos−pivot)) ⊙ ratio) —
+    // for a parent at the origin the child sits at (2.12,0,−2.12), C is the
+    // midpoint (1.06,0,−1.06), and k=2 puts the parent at (−1.06,0,1.06),
+    // not along world X alone. Pre-fix the z component stays put and the
+    // formula check fails.
+    await create("Cube");
+    await rename("Arm");
+    await page.locator(".insp-body .field").nth(1).locator("input").nth(1).fill("45");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    // The child must be a REAL child (the menu-bar create makes roots): the
+    // object's context menu places it at Arm's local zero, then it is renamed
+    // so tf() cannot hit the duplicate "Cube" roots from the earlier drags.
+    await page.locator("app-hierarchy li", { hasText: "Arm" }).first().click({ button: "right" });
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "Cube" }).last().click();
+    await page.waitForTimeout(300);
+    await rename("ArmKid");
+    await page.locator(".insp-body .field").nth(0).locator("input").nth(0).fill("3");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    await page.locator("app-hierarchy li", { hasText: "Arm" }).first().click();
+    await page.keyboard.press("r");
+    // The chip shows the CURRENT mode: in Pivot it reads "Pivot", and clicking
+    // it toggles to Center (workspace.component.ts:84-91).
+    await page.locator(".vp-subtoolbar .chip", { hasText: "Pivot" }).click();
+    await page.waitForTimeout(300);
+    const armT = await tf("Arm");
+    const kidT = await tf("ArmKid");
+    check("the child sits at local (3,0,0) under the turned parent",
+        near(kidT.localPosition.x, 3, 1e-3) && near(kidT.localPosition.y, 0, 1e-3) && near(kidT.localPosition.z, 0, 1e-3),
+        JSON.stringify(kidT.localPosition));
+    // The Centre pivot C: midpoint of the two world origins. Both cubes are
+    // unit-sized and centred on their origins, so their bounds centres are
+    // the origins — the mirror cannot shift a symmetric box's centre.
+    const C = {
+        x: (armT.position.x + kidT.position.x) / 2,
+        y: (armT.position.y + kidT.position.y) / 2,
+        z: (armT.position.z + kidT.position.z) / 2,
+    };
+    const rotQ = (v, q) => {
+        const tx = 2 * (q.y * v.z - q.z * v.y), ty = 2 * (q.z * v.x - q.x * v.z), tz = 2 * (q.x * v.y - q.y * v.x);
+        return {
+            x: v.x + q.w * tx + q.y * tz - q.z * ty,
+            y: v.y + q.w * ty + q.z * tx - q.x * tz,
+            z: v.z + q.w * tz + q.x * ty - q.y * tx,
+        };
+    };
+    const centreHandle = await findHandle("scale", "X");
+    check("the seated Centre scale handle is reachable", !!centreHandle, await hover());
+    const armBefore = await tf("Arm");
+    if (centreHandle) await drag(centreHandle, 60, 0);
+    const armAfter = await tf("Arm");
+    const k = armAfter.localScale.x / armBefore.localScale.x;
+    check("the Centre scale drag actually scaled", Math.abs(k - 1) > 0.05, String(k));
+    const R = armBefore.rotation;
+    const inv = { x: -R.x, y: -R.y, z: -R.z, w: R.w };
+    const off = { x: armBefore.position.x - C.x, y: armBefore.position.y - C.y, z: armBefore.position.z - C.z };
+    const inSeat = rotQ(off, inv);
+    const scaledOff = rotQ({ x: inSeat.x * k, y: inSeat.y, z: inSeat.z }, R);
+    const want = { x: C.x + scaledOff.x, y: C.y + scaledOff.y, z: C.z + scaledOff.z };
+    const got = armAfter.position;
+    check("the parent lands at C + R·((R⁻¹(p−C)) ⊙ ratio), not on a world axis",
+        !!centreHandle && Math.abs(k - 1) > 0.05
+        && near(got.x, want.x, 1e-3) && near(got.y, want.y, 1e-3) && near(got.z, want.z, 1e-3),
+        JSON.stringify({ k, want, got }));
+
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
@@ -3378,6 +3620,799 @@ scenario("selection: box, modifiers, and the orange outline (B1.5)", async () =>
         !tree.includes("Cube") && tree.length === treeBefore.split(",").length - 1,
         `${treeBefore} -> ${tree.join(",")}`);
 
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1 phase 6 — component gizmos and the Gizmos menu (B1.6, D-11).
+scenario("component gizmos: lights, camera and colliders, switched per type (B1.6)", async () => {
+    const page = await newPage("GizDemo", { probe: true });
+    await openEmptyProject(page);
+
+    /** One entry from the GameObject menu (submenus open on hover). */
+    const menu = async (item, sub) => {
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.waitForTimeout(150);
+        if (sub) {
+            await page.locator(".ctx-item", { hasText: sub }).first().hover();
+            await page.waitForTimeout(150);
+            await page.locator(".ctx-item", { hasText: item }).last().click();
+        } else {
+            await page.locator(".ctx-item", { hasText: item }).last().click();
+        }
+        await page.waitForTimeout(400);
+    };
+    // A previous scenario can leave the Gizmos menu open, which would swallow
+    // every later menu-bar click; close it before anything else.
+    await page.keyboard.press("Escape");
+    const counts = () => page.evaluate(() => window.__wetsProbe.gizmoCounts());
+    const extent = (name, kind) => page.evaluate(([n, k]) => window.__wetsProbe.gizmoExtent(n, k), [name, kind]);
+    const settings = () => page.evaluate(() => window.__wetsProbe.gizmoSettings());
+    const row = (label) => page.locator(".gz-row", { hasText: label }).locator("input");
+
+    // The template's two objects: a camera and a directional light.
+    await menu("Camera");
+    await menu("Directional Light", "Light");
+    await page.locator("app-hierarchy li .label", { hasText: "Camera" }).first().click();
+    await page.waitForTimeout(300);
+
+    // ── DW-6.1: the menu's switches, and that they survive a reload ──
+    let c = await counts();
+    check("the camera draws a frustum", c.cameraFrustum === 1, JSON.stringify(c));
+    await page.keyboard.down("Control");
+    await page.locator("app-hierarchy li .label", { hasText: "Directional Light" }).first().click();
+    await page.keyboard.up("Control");
+    await page.waitForTimeout(300);
+    c = await counts();
+    check("the light draws its rays", c.cameraFrustum === 1 && c.directionalLight === 1, JSON.stringify(c));
+
+    /**
+     * Turns a kind off and waits until the scene agrees, not just the DOM: a
+     * box that is already off is left alone (unchecking it again would time out
+     * waiting for a state that never changes).
+     */
+    /** The panel's rows are only reachable while it is open. */
+    const ensureOpen = async () => {
+        if ((await page.locator(".gz-panel").count()) === 0) {
+            await page.locator(".gz-menu .chip").click();
+            await page.waitForTimeout(250);
+        }
+    };
+    const turnOff = async (label, key) => {
+        await ensureOpen();
+        for (let attempt = 0; attempt < 3; attempt++) {
+            if (await row(label).isChecked()) await row(label).uncheck();
+            await page.waitForTimeout(400);
+            if ((await counts())[key] === undefined) return;
+        }
+    };
+    await turnOff("Camera", "cameraFrustum");
+    c = await counts();
+    check("unchecking Camera hides the frustum", c.cameraFrustum === undefined && c.directionalLight === 1,
+        JSON.stringify(c));
+    check("the light is still drawn", c.directionalLight === 1, JSON.stringify(c));
+
+    await turnOff("Lights", "directionalLight");
+    check("unchecking Lights hides the light too", (await counts()).directionalLight === undefined,
+        JSON.stringify(await counts()));
+
+    await ensureOpen();
+    await row("Lights").check();
+    await row("Camera").check();
+    await page.waitForTimeout(300);
+
+    // DW-6.4: gizmos are editor-owned, so the scene JSON cannot carry them.
+    /** The scene text, once the editor has written it (a null stays null). */
+    const sceneText = async () => {
+        for (let i = 0; i < 30; i++) {
+            const text = await readDisk(page, "GizDemo", "assets/scenes/main.scene.json");
+            if (text !== null && text.length > 0) return text;
+            await page.waitForTimeout(100);
+        }
+        return null;
+    };
+    await menu("Cube", "3D Object");
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    const withGizmos = JSON.parse((await sceneText()) ?? "null");
+    await page.locator(".gz-row.master input").uncheck();
+    await page.waitForTimeout(400);
+    // The checkbox keeps focus, and the shortcut guard stands down inside
+    // inputs — click away first or Ctrl+S is a no-op and this save never lands.
+    await page.locator(".pane-tab").first().click();
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    const withoutGizmos = JSON.parse((await sceneText()) ?? "null");
+    check("the gizmo lines never reach the scene file",
+        JSON.stringify(withGizmos) === JSON.stringify(withoutGizmos),
+        `${JSON.stringify(withGizmos).length} vs ${JSON.stringify(withoutGizmos).length} bytes`);
+    await page.locator(".gz-row.master input").check();
+    await page.waitForTimeout(300);
+
+    /** Closes the Gizmos menu so a menu-bar click reaches the menu. */
+    const closeMenu = async () => {
+        if ((await page.locator(".gz-panel").count()) > 0) {
+            await page.keyboard.press("Escape");
+            await page.waitForTimeout(200);
+        }
+    };
+
+    // ── DW-6.2: a cube's collider wireframe and the range that follows ──
+    await closeMenu();
+    c = await counts();
+    check("a cube's collider draws one wireframe", c.boxCollider === 1, JSON.stringify(c));
+    check("its wireframe spans the cube", Math.abs((await extent("Cube", "boxCollider")) - Math.sqrt(3) / 2) < 1e-3,
+        String(await extent("Cube", "boxCollider")));
+
+    await menu("Point Light", "Light");
+    await page.locator("app-hierarchy li .label", { hasText: "Point Light" }).first().click();
+    await page.waitForTimeout(300);
+    const before = await extent("Point Light", "pointLight");
+    check("the point light's circles are its range", Math.abs(before - 10) < 1e-3, String(before));
+    await page.locator(".insp-body .field", { hasText: "Range" }).locator("input").first().fill("4");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(500);
+    const after = await extent("Point Light", "pointLight");
+    check("the circles follow the range edited in the inspector", Math.abs(after - 4) < 1e-3,
+        `${before} -> ${after}`);
+
+    // ── DW-6.1 again: the menu's state survives a reload ──
+    await ensureOpen();
+    await page.waitForTimeout(200);
+    await page.locator(".gz-row.master input").uncheck();
+    await page.waitForTimeout(500);
+    const everythingOff = await counts();
+    check("the master switch hides everything", Object.keys(everythingOff).length === 0,
+        JSON.stringify(everythingOff));
+    // The Point Light and its range edit came after the last save: leave the
+    // scene dirty and a slow run's autosave writes a copy, whose recovery
+    // dialog then blocks every click after the reopen. Save it away first —
+    // clicking the pane tab because the master checkbox still has focus and
+    // the shortcut guard stands down inside inputs.
+    await page.locator(".pane-tab").first().click();
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(500);
+    await page.reload({ waitUntil: "load" });
+    await page.locator(".recent").first().click();
+    await page.locator(".work").waitFor({ state: "attached", timeout: 90000 });
+    await page.waitForTimeout(600);
+    const stored = await settings();
+    check("the Gizmos menu's switches survive a reload",
+        stored.enabled === false && stored.camera === true && stored.lights === true
+        && stored.colliders === true && stored.audio === true,
+        JSON.stringify(stored));
+
+    /** Opens the menu if it is closed, so a row is always reachable. */
+    const openMenu = async () => {
+        if ((await page.locator(".gz-panel").count()) === 0) {
+            await page.locator(".gz-menu .chip").click();
+            await page.waitForTimeout(250);
+        }
+    };
+
+    // ── DW-6.3: the screenshots for the report ── (the reload closed the menu)
+    await openMenu();
+    await page.locator(".gz-row.master input").check();
+    await page.locator(".gz-row", { hasText: "Camera" }).locator("input").check();
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(400);
+    await shot(page, "b1-gizmos-on");
+    await openMenu();
+    await page.locator(".gz-row.master input").uncheck();
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(500);
+    await shot(page, "b1-gizmos-off");
+
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1r — DW-1.2: creation from the Hierarchy "+" and an object's context menu.
+scenario("create placement: Hierarchy + makes a root at the pivot, the context menu a child at local zero (B1r DW-1.2)", async () => {
+    const page = await newPage("CreateDemo", { probe: true });
+    await openEmptyProject(page);
+
+    const tf = (name) => page.evaluate(n => window.__wetsProbe.transformOf(n), name);
+    const pivot = () => page.evaluate(() => window.__wetsProbe.pivot());
+    const near3 = (v, e, tol = 1e-2) => Math.abs(v.x - e.x) < tol && Math.abs(v.y - e.y) < tol && Math.abs(v.z - e.z) < tol;
+    const row = (name) => page.locator("app-hierarchy li", { hasText: name }).first();
+    /** Inline rename (F2) of the selected row; avoids duplicate-name shadowing. */
+    const rename = async (name) => {
+        await page.keyboard.press("F2");
+        const input = page.locator("app-hierarchy input.rename-input");
+        await input.fill(name);
+        await input.press("Enter");
+        await page.waitForTimeout(300);
+    };
+    /** The Hierarchy "+" opens the shared create menu; it always makes a ROOT. */
+    const createFromPlus = async (item, sub) => {
+        await page.locator("app-hierarchy .create-btn").click();
+        await page.waitForTimeout(200);
+        if (sub) {
+            await page.locator(".ctx-item", { hasText: sub }).first().hover();
+            await page.waitForTimeout(200);
+        }
+        await page.locator(".ctx-item", { hasText: item }).last().click();
+        await page.waitForTimeout(300);
+    };
+
+    // ── Hierarchy "+" ──
+    const origin = await pivot();
+    await createFromPlus("Create Empty");
+    await rename("PlusRoot");
+    const plusT = await tf("PlusRoot");
+    check("Hierarchy + Create Empty lands at the pivot", near3(plusT.localPosition, origin), JSON.stringify(plusT.localPosition));
+    check("and is a root row (padding-left 22px)", (await row("PlusRoot").evaluate(el => el.style.paddingLeft)) === "22px", await row("PlusRoot").evaluate(el => el.style.paddingLeft));
+    check("and is selected", (await page.evaluate(() => window.__wetsProbe.selection())).join() === "PlusRoot", JSON.stringify(await page.evaluate(() => window.__wetsProbe.selection())));
+
+    // A parent away from the origin, turned and scaled: the child must still be
+    // at LOCAL zero with identity rotation and unit scale (Unity SetParentAndAlign).
+    await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+    await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "Cube" }).last().click();
+    await page.waitForTimeout(300);
+    await rename("Holder");
+    const fillField = async (field, axis, value) => {
+        await page.locator(".insp-body .field").nth(field).locator("input").nth(axis).fill(String(value));
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(200);
+    };
+    await fillField(0, 0, 3); await fillField(0, 1, 1); await fillField(0, 2, 2);
+    await fillField(1, 1, 45);
+    await fillField(2, 0, 2); await fillField(2, 1, 2); await fillField(2, 2, 2);
+    const holder = await tf("Holder");
+    check("the parent is at (3,1,2), 45 deg about Y, scaled 2", near3(holder.position, { x: 3, y: 1, z: 2 }) && near3(holder.localScale, { x: 2, y: 2, z: 2 }), JSON.stringify(holder));
+
+    // ── The object's context menu ──
+    await row("Holder").click({ button: "right" });
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "Create Empty" }).last().click();
+    await page.waitForTimeout(300);
+    await rename("Kid");
+    const kid = await tf("Kid");
+    check("context-menu Create Empty is a child at local zero", near3(kid.localPosition, { x: 0, y: 0, z: 0 }), JSON.stringify(kid.localPosition));
+    check("the child keeps the parent's world position", near3(kid.position, holder.position), JSON.stringify(kid.position));
+    check("the child has identity local rotation", near3(kid.localRotation, { x: 0, y: 0, z: 0 }, 1e-3) && Math.abs(kid.localRotation.w - 1) < 1e-3, JSON.stringify(kid.localRotation));
+    check("the child has unit local scale", near3(kid.localScale, { x: 1, y: 1, z: 1 }), JSON.stringify(kid.localScale));
+    check("the child row sits one level deeper (padding-left 36px)", (await row("Kid").evaluate(el => el.style.paddingLeft)) === "36px", await row("Kid").evaluate(el => el.style.paddingLeft));
+
+    // A 3D Object from the same context menu gets the same alignment.
+    await row("Holder").click({ button: "right" });
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "Sphere" }).last().click();
+    await page.waitForTimeout(300);
+    const sphere = await tf("Sphere");
+    check("context-menu 3D Object is a child at local zero too", near3(sphere.localPosition, { x: 0, y: 0, z: 0 }) && near3(sphere.localScale, { x: 1, y: 1, z: 1 }), JSON.stringify(sphere.localPosition));
+
+    // With a child selected, "+" still makes a ROOT, never a sibling/child.
+    await row("Kid").click();
+    await page.waitForTimeout(200);
+    await createFromPlus("Create Empty");
+    await rename("PlusRoot2");
+    const plus2 = await tf("PlusRoot2");
+    check("with a child selected, + still creates a root at the pivot", near3(plus2.localPosition, origin), JSON.stringify(plus2.localPosition));
+    check("and that root is not indented", (await row("PlusRoot2").evaluate(el => el.style.paddingLeft)) === "22px", await row("PlusRoot2").evaluate(el => el.style.paddingLeft));
+
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1r4 — the eight review proofs: gizmo centre/axes, right objects, icons.
+scenario("component gizmos: the review proofs (B1r4)", async () => {
+    const page = await newPage("GizmoProof", { probe: true });
+
+    // Seeded through the scene file: exact poses, collider fields and one
+    // inactive parent without clicking through the Inspector for each.
+    const H = Math.SQRT1_2; // cos/sin 45 deg
+    const go = (name, extra) => ({
+        name, active: true,
+        transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+        components: [], children: [], ...extra,
+    });
+    const at = (x, y, z) => ({ x, y, z });
+    const scene = {
+        name: "Seeded", version: 1,
+        roots: [
+            go("PL", { transform: { position: at(5, 2, -3), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "PointLight", fields: { range: 10 } }] }),
+            // minDistance 0 keeps exactly ONE circle (the max one); 500 is the default max.
+            go("Audio", { transform: { position: at(-4, 1, 6), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "AudioSource", fields: { minDistance: 0, maxDistance: 500 } }] }),
+            go("Cap", { transform: { position: at(0, 3, 0), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "CapsuleCollider", fields: {} }] }),
+            go("Cap2", { transform: { position: at(0, 3, 0), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(2, 2, 2) }, components: [{ type: "CapsuleCollider", fields: {} }] }),
+            go("Spot", { transform: { position: at(2, 4, 1), rotation: { x: H, y: 0, z: 0, w: H }, scale: at(1, 1, 1) }, components: [{ type: "SpotLight", fields: { range: 10, spotAngle: 60 } }] }),
+            go("BoxRot", { transform: { position: at(1, 0, 0), rotation: { x: 0, y: 0, z: H, w: H }, scale: at(2, 2, 2) }, components: [{ type: "BoxCollider", fields: { center: at(0, 1, 0) } }] }),
+            go("Twin", { components: [
+                { type: "BoxCollider", fields: { size: at(1, 1, 1) } },
+                { type: "BoxCollider", fields: { size: at(3, 3, 3) } },
+            ] }),
+            go("HiddenParent", { active: false, children: [
+                go("HiddenLight", { components: [{ type: "PointLight", fields: { range: 5 } }] }),
+            ] }),
+            go("Unsel", { components: [{ type: "PointLight", fields: { range: 5 } }] }),
+            // B1r5 #3: circle normals must be MEASURED from the drawn basis —
+            // a sphere's three great circles and a turned sun's end disc prove it.
+            go("Sph", { transform: { position: at(6, 1, 2), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "SphereCollider", fields: { radius: 2 } }] }),
+            go("Sun", { transform: { position: at(-2, 5, -5), rotation: { x: H, y: 0, z: 0, w: H }, scale: at(1, 1, 1) }, components: [{ type: "DirectionalLight", fields: {} }] }),
+            // B1r5 #4: a tall capsule reads as a capsule — side lines join the caps.
+            go("CapTall", { transform: { position: at(8, 2, -2), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) }, components: [{ type: "CapsuleCollider", fields: { radius: 0.5, height: 4 } }] }),
+            // B1r5 #6 (B1r4 #9): 60 spheres × 3 circles × 24 segments × 2 verts
+            // = 8640 vertices — past the 8192 pool, which must grow, not truncate.
+            ...Array.from({ length: 60 }, (_, i) => go(`Bulk${i}`, {
+                transform: { position: at(20 + i * 2, 0, 20), rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: at(1, 1, 1) },
+                components: [{ type: "SphereCollider", fields: { radius: 1 } }],
+            })),
+        ],
+    };
+    await seed(page, "GizmoProof", {
+        "scenario.meta.json": JSON.stringify({ id: "gizmoproof", name: "GizmoProof", version: "1.0.0" }),
+        "assets/scenes/main.scene.json": JSON.stringify(scene),
+    });
+    await page.getByText("Open folder…").click();
+    await page.locator(".work").waitFor();
+    // Wait for the scene to reach the tree before reading it (the FmtOpen lesson:
+    // under load the scene's arrival lags the workspace's).
+    for (let i = 0; i < 50; i++) {
+        if ((await page.locator("app-hierarchy").innerText()).includes("BoxRot")) break;
+        await page.waitForTimeout(100);
+    }
+
+    // Rotate a vector by a quaternion (the engine's rotation convention), so
+    // expectations are derived, never sign-guessed.
+    const rotate = (v, q) => {
+        const tx = 2 * (q.y * v.z - q.z * v.y), ty = 2 * (q.z * v.x - q.x * v.z), tz = 2 * (q.x * v.y - q.y * v.x);
+        return {
+            x: v.x + q.w * tx + q.y * tz - q.z * ty,
+            y: v.y + q.w * ty + q.z * tx - q.x * tz,
+            z: v.z + q.w * tz + q.x * ty - q.y * tx,
+        };
+    };
+    const add = (a, b, k = 1) => ({ x: a.x + b.x * k, y: a.y + b.y * k, z: a.z + b.z * k });
+    const near3 = (v, e, tol = 1e-2) => !!v && Math.abs(v.x - e.x) < tol && Math.abs(v.y - e.y) < tol && Math.abs(v.z - e.z) < tol;
+    const nearR = (r, e) => Math.abs(r - e) < Math.max(1e-2, Math.abs(e) * 1e-2);
+    const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+    const info = (name, kind) => page.evaluate(([n, k]) => window.__wetsProbe.gizmoInfo(n, k), [name, kind]);
+    const icons = () => page.evaluate(() => window.__wetsProbe.iconCounts());
+
+    // Nothing selected: the proofs must hold for unselected objects too.
+    await page.locator("app-hierarchy li.scene-root").click();
+    await page.waitForTimeout(300);
+
+    // 1 — point light off the origin: three circles on the object, radius = range.
+    const pl = await info("PL", "PointLight");
+    const plRec = pl[0];
+    check("point light: one record with three circles", pl.length === 1 && plRec?.circles.length === 3, JSON.stringify(pl));
+    check("point light: circles centred on the object, radius = range",
+        !!plRec && plRec.circles.every(c => near3(c.center, { x: 5, y: 2, z: -3 }) && nearR(c.radius, 10)), JSON.stringify(plRec?.circles));
+    const plDistinct = !!plRec && plRec.circles.length === 3
+        && Math.abs(dot(plRec.circles[0].normal, plRec.circles[1].normal)) < 0.1
+        && Math.abs(dot(plRec.circles[0].normal, plRec.circles[2].normal)) < 0.1
+        && Math.abs(dot(plRec.circles[1].normal, plRec.circles[2].normal)) < 0.1;
+    check("point light: three distinct planes", plDistinct, JSON.stringify(plRec?.circles.map(c => c.normal)));
+
+    // 2 — AudioSource off the origin: one XY circle (minDistance 0), radius = maxDistance.
+    const au = await info("Audio", "AudioSource");
+    check("audio: one circle centred on the object with radius = maxDistance",
+        au.length === 1 && au[0].circles.length === 1
+        && near3(au[0].circles[0].center, { x: -4, y: 1, z: 6 }) && nearR(au[0].circles[0].radius, 500), JSON.stringify(au));
+    check("audio: the circle lies in the XY plane", !!au[0] && near3(au[0].circles[0].normal, { x: 0, y: 0, z: 1 }), JSON.stringify(au[0]?.circles[0]?.normal));
+
+    // 3 — capsule twins: the scaled one is twice the unscaled one, same centre.
+    const cap = await info("Cap", "CapsuleCollider");
+    const cap2 = await info("Cap2", "CapsuleCollider");
+    check("capsule: one record each, centred on the object",
+        cap.length === 1 && cap2.length === 1 && near3(cap[0]?.center, { x: 0, y: 3, z: 0 }) && near3(cap2[0]?.center, { x: 0, y: 3, z: 0 }),
+        JSON.stringify([cap[0]?.center, cap2[0]?.center]));
+    check("capsule: scaling 2 doubles the half-height",
+        !!cap[0] && !!cap2[0] && cap[0].half.y > 0 && nearR(cap2[0].half.y, cap[0].half.y * 2),
+        JSON.stringify([cap[0]?.half, cap2[0]?.half]));
+
+    // 4 — spot rotated 90 deg about X points down: end circle on the rotated forward.
+    const spotT = await page.evaluate(() => window.__wetsProbe.transformOf("Spot"));
+    const fwd = rotate({ x: 0, y: 0, z: 1 }, spotT.rotation);
+    check("the seeded spot points down", near3(fwd, { x: 0, y: -1, z: 0 }), JSON.stringify(fwd));
+    const sp = await info("Spot", "SpotLight");
+    const spC = sp[0]?.circles[0];
+    check("spot: end circle centre = position + range * forward",
+        sp.length === 1 && !!spC && near3(spC.center, add(spotT.position, fwd, 10)), JSON.stringify(spC?.center));
+    check("spot: end circle normal parallel to forward", !!spC && Math.abs(Math.abs(dot(spC.normal, fwd)) - 1) < 1e-2, JSON.stringify(spC?.normal));
+    check("spot: end circle radius = range * tan(spotAngle/2)", !!spC && nearR(spC.radius, 10 * Math.tan(Math.PI / 6)), JSON.stringify(spC?.radius));
+
+    // 5 — BoxCollider local centre scaled then rotated: pos + rotate((0,2,0)).
+    const boxT = await page.evaluate(() => window.__wetsProbe.transformOf("BoxRot"));
+    const bx = await info("BoxRot", "BoxCollider");
+    check("box: local centre scaled and rotated into place",
+        bx.length === 1 && near3(bx[0]?.center, add(boxT.position, rotate({ x: 0, y: 2, z: 0 }, boxT.rotation))), JSON.stringify(bx[0]?.center));
+    check("box: half-extents follow the scale", bx.length === 1 && near3(bx[0]?.half, { x: 1, y: 1, z: 1 }), JSON.stringify(bx[0]?.half));
+
+    // 6 — two colliders of one type: two wireframes; disable the first, one stays.
+    const twins = await info("Twin", "BoxCollider");
+    const halves = twins.map(r => r.half.x).sort((a, b) => a - b);
+    check("two BoxColliders draw two distinct wireframes", twins.length === 2 && nearR(halves[0], 0.5) && nearR(halves[1], 1.5), JSON.stringify(halves));
+    const disabled = await page.evaluate(() => window.__wetsProbe.setComponentEnabled("Twin", "BoxCollider", 0, false));
+    // At least two frames so the controller rebuilds before the read-back.
+    await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+    await page.waitForTimeout(200);
+    const twinsAfter = await info("Twin", "BoxCollider");
+    check("disabling the first leaves the second",
+        disabled && twinsAfter.length === 1 && nearR(twinsAfter[0]?.half.x, 1.5), JSON.stringify(twinsAfter.map(r => r.half)));
+
+    // 7 — inactive parent: no gizmo, no icon for the child.
+    const hidden = await info("HiddenLight", "PointLight");
+    const hiddenIcons = await icons();
+    const hiddenTf = await page.evaluate(() => window.__wetsProbe.transformOf("HiddenLight"));
+    check("an inactive parent's light draws no gizmo", hidden.length === 0, JSON.stringify(hidden));
+    check("an inactive parent's light has no icon",
+        !!hiddenTf && (hiddenIcons.PointLight ?? 0) === 2, JSON.stringify(hiddenIcons));
+
+    // 8 — an unselected light still has an icon (production bundle, registry names),
+    // and its Drawn record flips `selected` with the selection.
+    check("an unselected light has an icon", (await icons()).PointLight >= 2, JSON.stringify(await icons()));
+    check("an unselected light's record is not selected", (await info("Unsel", "PointLight"))[0]?.selected === false, JSON.stringify(await info("Unsel", "PointLight")));
+    await page.locator("app-hierarchy li", { hasText: "Unsel" }).first().click();
+    // The selected flag is written by the gizmo rebuild one or two frames after
+    // the selection effect runs; under load a fixed sleep can read too early.
+    const selSettled = async (want) => {
+        for (let i = 0; i < 120; i++) {
+            if ((await info("Unsel", "PointLight"))[0]?.selected === want) return true;
+            await page.evaluate(() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r))));
+        }
+        return false;
+    };
+    await selSettled(true);
+    check("selecting it marks the record selected", (await info("Unsel", "PointLight"))[0]?.selected === true, JSON.stringify(await info("Unsel", "PointLight")));
+    await page.locator("app-hierarchy li.scene-root").click();
+    await selSettled(false);
+    check("deselecting clears the record's selected flag", (await info("Unsel", "PointLight"))[0]?.selected === false, JSON.stringify(await info("Unsel", "PointLight")));
+
+    // 9 — B1r5 #3: the sphere's three circles lie in three MEASURED planes.
+    // A basis bug (the old _circlePoint('yz') returning XZ) collapses two
+    // normals onto one plane; with the normal recorded from u × v of the
+    // actual vertex basis, the pairwise dot check catches it.
+    const sph = await info("Sph", "SphereCollider");
+    const sphC = sph[0]?.circles ?? [];
+    const sphDistinct = sphC.length === 3
+        && Math.abs(dot(sphC[0].normal, sphC[1].normal)) < 0.1
+        && Math.abs(dot(sphC[0].normal, sphC[2].normal)) < 0.1
+        && Math.abs(dot(sphC[1].normal, sphC[2].normal)) < 0.1;
+    check("sphere: three circles in three distinct measured planes", sph.length === 1 && sphDistinct,
+        JSON.stringify(sphC.map(c => c.normal)));
+    check("sphere: circles centred on the object with radius = radius field",
+        sphC.length === 3 && sphC.every(c => near3(c.center, { x: 6, y: 1, z: 2 }) && nearR(c.radius, 2)),
+        JSON.stringify(sphC));
+
+    // 10 — B1r5 #3: the sun turned X90 points down; its end disc's measured
+    // normal must be parallel to the ROTATED forward, not a world-fixed axis.
+    const sunT = await page.evaluate(() => window.__wetsProbe.transformOf("Sun"));
+    const sunFwd = rotate({ x: 0, y: 0, z: 1 }, sunT.rotation);
+    const sun = await info("Sun", "DirectionalLight");
+    const sunC = sun[0]?.circles[0];
+    check("sun: end disc centre = position + 1.5 * rotated forward",
+        sun.length === 1 && !!sunC && near3(sunC.center, add(sunT.position, sunFwd, 1.5)), JSON.stringify(sunC?.center));
+    check("sun: end disc normal parallel to the rotated forward (measured)",
+        !!sunC && Math.abs(Math.abs(dot(sunC.normal, sunFwd)) - 1) < 1e-2,
+        JSON.stringify({ normal: sunC?.normal, fwd: sunFwd }));
+
+    // 11 — B1r5 #4: the tall capsule: half.y = height/2 = 2, and the side
+    // lines put vertices at local (±r, 0, 0) — the mid-height waist a
+    // figure-8 of cap circles never reaches. half.x = r proves the sides
+    // exist (the caps' circles alone would too, so also check the extent
+    // covers the waist through half.y while half.x stays r).
+    const tall = await info("CapTall", "CapsuleCollider");
+    check("tall capsule: one record, half-height = height/2",
+        tall.length === 1 && nearR(tall[0]?.half.y, 2), JSON.stringify(tall[0]?.half));
+    check("tall capsule: half.x = radius (the side lines at ±r)",
+        tall.length === 1 && nearR(tall[0]?.half.x, 0.5) && nearR(tall[0]?.half.z, 0.5),
+        JSON.stringify(tall[0]?.half));
+    // The waist proof: the cap circles span ±(h) ± r in Y only around the cap
+    // centres; the side lines are the only geometry at local y = 0, x = ±r.
+    // The record's six circles (3 per cap) must all sit at the cap centres,
+    // and each cap must carry all three measured planes {X, Y, Z}: the old
+    // figure-8 drew TWO circles per cap (normals Y and Z only) plus diameters,
+    // so the count and the per-cap normal set both fail on the old shape.
+    const capCircles = tall[0]?.circles ?? [];
+    const topCap = { x: 8, y: 2 + 1.5, z: -2 }, botCap = { x: 8, y: 2 - 1.5, z: -2 };
+    const capNormals = (cap) => capCircles.filter(c => near3(c.center, cap)).map(c => c.normal);
+    const hasPlane = (ns, axis) => ns.some(n => Math.abs(Math.abs(dot(n, axis)) - 1) < 0.1);
+    const planesXYZ = (ns) => ns.length === 3
+        && hasPlane(ns, { x: 1, y: 0, z: 0 }) && hasPlane(ns, { x: 0, y: 1, z: 0 }) && hasPlane(ns, { x: 0, y: 0, z: 1 });
+    check("tall capsule: six circles, all at the two cap centres (no waist rings)",
+        capCircles.length === 6 && capCircles.every(c => near3(c.center, topCap) || near3(c.center, botCap)),
+        JSON.stringify(capCircles.map(c => c.center)));
+    check("tall capsule: each cap carries the X, Y and Z planes (ring + two arcs)",
+        planesXYZ(capNormals(topCap)) && planesXYZ(capNormals(botCap)),
+        JSON.stringify({ top: capNormals(topCap), bot: capNormals(botCap) }));
+
+    // 12 — B1r5 #6 (B1r4 #9): 60 spheres = 8640 vertices > the 8192 pool.
+    // Every record must still be drawn (the pool grows); truncation drops
+    // the tail records' vertices and the last spheres read empty. The records
+    // are built BEFORE the flush, so the buffer itself is read back too: its
+    // draw count must cover the whole kind (8784 with Sph) and its last vertex
+    // must be Bulk59's.
+    const bulkFirst = await info("Bulk0", "SphereCollider");
+    const bulkLast = await info("Bulk59", "SphereCollider");
+    check("past 8192 vertices: the first sphere still draws three circles",
+        bulkFirst.length === 1 && bulkFirst[0].circles.length === 3 && nearR(bulkFirst[0].extent, 1),
+        JSON.stringify(bulkFirst.map(r => r.circles.length)));
+    check("past 8192 vertices: the LAST sphere draws too (the pool grew, no truncation)",
+        bulkLast.length === 1 && bulkLast[0].circles.length === 3 && nearR(bulkLast[0].extent, 1)
+        && near3(bulkLast[0].center, { x: 20 + 59 * 2, y: 0, z: 20 }),
+        JSON.stringify(bulkLast));
+    // Each circle closes at its first vertex c + u·r. The kind's pool also
+    // holds Sph (3 circles × 48 verts), so 61 spheres flush 61 × 144 = 8784
+    // vertices. Bulk59 is the last root; its third circle (u = local Y) ends
+    // at (138,1,20). A truncated buffer stops at 8192, mid-Bulk56.
+    const buf = await page.evaluate(() => window.__wetsProbe.gizmoBufferStats("SphereCollider"));
+    check("past 8192 vertices: the buffer draws all 8784 and ends on Bulk59's last circle",
+        !!buf && buf.drawn === 8784 && buf.capacity >= 8784
+        && near3(buf.last, { x: 138, y: 1, z: 20 }),
+        JSON.stringify(buf));
+
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+// B1.7 — DW-7.1…7.4: lighting, draw modes and the grid are view state; the
+// picture matches what the platform will show.
+scenario("lighting and view: dark without a light, wireframe, the grid (B1.7)", async () => {
+    const page = await newPage("ViewDemo", { probe: true });
+    await openEmptyProject(page);
+    await page.keyboard.press("Escape");
+
+    const menuGo = async (item, sub) => {
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.waitForTimeout(150);
+        if (sub) {
+            await page.locator(".ctx-item", { hasText: sub }).first().hover();
+            await page.waitForTimeout(150);
+        }
+        await page.locator(".ctx-item", { hasText: item }).last().click();
+        await page.waitForTimeout(400);
+    };
+    const chip = title => page.locator(`.vp-subtoolbar .chip[title="${title}"]`);
+    const probe = fn => page.evaluate(fn);
+    const lum = rgba => rgba ? (0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]) / 255 : -1;
+    const pixelAt = (x, y) => page.evaluate(([px, py]) => window.__wetsProbe.pixel(px, py), [x, y]);
+    const rectOf = name => page.evaluate(n => window.__wetsProbe.objectScreenRect(n), name);
+    const centreOf = async name => {
+        const r = await rectOf(name);
+        return r ? { x: Math.round((r.left + r.right) / 2), y: Math.round((r.top + r.bottom) / 2) } : null;
+    };
+    const sceneText = async () => {
+        for (let i = 0; i < 30; i++) {
+            const text = await readDisk(page, "ViewDemo", "assets/scenes/main.scene.json");
+            if (text !== null && text.length > 0) return text;
+            await page.waitForTimeout(100);
+        }
+        return null;
+    };
+
+    // Gizmos off for the whole scenario: their lines would sit over the very
+    // pixels the luminance checks read (the light's rays cross the cube).
+    await page.locator(".gz-menu .chip").click();
+    await page.waitForTimeout(250);
+    await page.locator(".gz-row.master input").uncheck();
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+
+    await menuGo("Cube", "3D Object");
+    await page.keyboard.press("q"); // View tool: no handles over the cube
+    await page.waitForTimeout(250);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    const baseline = await sceneText();
+    check("the cube was saved", baseline !== null && JSON.parse(baseline).roots.some(r => r.name === "Cube"));
+
+    // ── DW-7.1: lighting on by default, a light-less scene is dark ──
+    check("lighting starts on", await probe(() => window.__wetsProbe.lightingOn()) === true);
+    check("the no-light hint is visible", await page.locator(".vp-nolight-hint").isVisible());
+    check("the hint says what the platform will show",
+        (await page.locator(".vp-nolight-hint").innerText()).includes("No light in the scene"));
+    let c = await centreOf("Cube");
+    const dark = lum(await pixelAt(c.x, c.y));
+    check("with no light the cube is dark (lum < 0.05)", dark >= 0 && dark < 0.05, String(dark));
+
+    await chip("Lighting").click();
+    await page.waitForTimeout(300);
+    const litByHeadlight = lum(await pixelAt(c.x, c.y));
+    check("lighting off shows the cube lit by the headlight (lum > 0.3)", litByHeadlight > 0.3, String(litByHeadlight));
+    check("the hint is gone while lighting is off", (await page.locator(".vp-nolight-hint").count()) === 0);
+    check("the toggle does not mark the scene unsaved", (await page.locator(".statusbar").innerText()).includes("Saved"));
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    check("lighting state never reaches the scene file", (await sceneText()) === baseline);
+
+    // Not undoable: Ctrl+Z undoes the cube's create, not the toggle.
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(400);
+    const names = await page.locator("app-hierarchy li .label").allInnerTexts();
+    check("undo undoes the create, not the lighting toggle", !names.includes("Cube")
+        && await probe(() => window.__wetsProbe.lightingOn()) === false, names.join(","));
+    await page.keyboard.press("Control+y");
+    await page.waitForTimeout(400);
+
+    // A real light: lighting on shows it, and the hint goes away.
+    await menuGo("Directional Light", "Light");
+    await chip("Lighting").click(); // back on
+    await page.waitForTimeout(300);
+    check("adding a light removes the hint", (await page.locator(".vp-nolight-hint").count()) === 0);
+    c = await centreOf("Cube");
+    const litByScene = lum(await pixelAt(c.x, c.y));
+    check("with the scene's own light the cube is lit (lum > 0.3)", litByScene > 0.3, String(litByScene));
+
+    // ── DW-7.2: the lighting-off override leaves nothing behind ──
+    const info0 = await probe(() => window.__wetsProbe.threeInfo());
+    await chip("Lighting").click();
+    await page.waitForTimeout(200);
+    await pixelAt(c.x, c.y); // forces a lighting-off frame
+    const info1 = await probe(() => window.__wetsProbe.threeInfo());
+    check("no headlight children survive the frame", info0.children === info1.children, JSON.stringify([info0, info1]));
+    check("the scene light keeps its visible flag", JSON.stringify(info0.lightsVisible) === JSON.stringify(info1.lightsVisible)
+        && info1.lightsVisible.length > 0 && info1.lightsVisible.every(v => v === true), JSON.stringify([info0, info1]));
+    await chip("Lighting").click(); // on again
+    await page.waitForTimeout(200);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    const withLight = await sceneText();
+
+    // ── DW-7.3: wireframe is an override, not a material edit ──
+    await page.keyboard.press("Escape"); // no selection outline over the edges
+    await chip("Grid").click(); // grid off: a uniform background to compare with
+    await page.waitForTimeout(250);
+    const box = await page.locator("canvas").boundingBox();
+    const bg = await pixelAt(Math.round(box.x + 30), Math.round(box.y + 30));
+    await chip("Wireframe").click();
+    await page.waitForTimeout(300);
+    const r = await rectOf("Cube");
+    // A 5×5 sample grid over the middle 60% of the rect: a face diagonal can
+    // cross any single point (the centre included), so the interior claim is
+    // "most interior pixels read as background", not one lucky pixel.
+    const bgLum = lum(bg);
+    let interiorBg = 0;
+    for (let i = 0; i < 5; i++) {
+        for (let j = 0; j < 5; j++) {
+            const p = await pixelAt(
+                Math.round(r.left + (r.right - r.left) * (0.2 + 0.15 * i)),
+                Math.round(r.top + (r.bottom - r.top) * (0.2 + 0.15 * j)));
+            if (Math.abs(lum(p) - bgLum) < 0.03) interiorBg++;
+        }
+    }
+    check("wireframe: the interior reads as background", interiorBg >= 15, `${interiorBg}/25 interior pixels, bg=${JSON.stringify(bg)}`);
+    let edgeLit = 0;
+    for (let x = Math.round(r.left); x <= Math.round(r.right); x++) {
+        if (lum(await pixelAt(x, c.y)) > 0.3) edgeLit++;
+    }
+    check("wireframe: the edges are drawn", edgeLit >= 2, String(edgeLit));
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    check("wireframe never reaches the scene file", (await sceneText()) === withLight);
+    await chip("Shaded").click();
+    await page.waitForTimeout(300);
+    const filled = lum(await pixelAt(c.x, c.y));
+    check("shaded back: the cube is filled again", filled > 0.3, String(filled));
+    await chip("Grid").click(); // grid on
+    await page.waitForTimeout(250);
+
+    // ── DW-7.4: the grid toggle and its step ──
+    check("the grid step starts at 1", await probe(() => window.__wetsProbe.gridStep()) === 1);
+    // The grid is finite (±25 units) and its lines are antialiased, so a single
+    // scan row can miss them entirely. Count grey-ish pixels over a 2D region
+    // in the left third of the view — empty ground, away from the cube (which
+    // sits centre-right) and the orientation cube (top-right corner).
+    const greyCount = async () => {
+        let n = 0;
+        for (let y = 90; y <= 390; y += 15) {
+            for (let x = 16; x <= 316; x += 15) {
+                const p = await pixelAt(Math.round(box.x + x), Math.round(box.y + y));
+                if (p && Math.max(p[0], p[1], p[2]) >= 10
+                    && Math.abs(p[0] - p[1]) < 20 && Math.abs(p[1] - p[2]) < 20) n++;
+            }
+        }
+        return n;
+    };
+    const gridOn = await greyCount();
+    check("grid on: grid-colour pixels in the empty area", gridOn > 0, String(gridOn));
+    await chip("Grid").click();
+    await page.waitForTimeout(250);
+    const gridOff = await greyCount();
+    check("grid hidden: no grid-colour pixels left", gridOff === 0, String(gridOff));
+    await chip("Grid").click();
+    await page.waitForTimeout(250);
+
+    await page.keyboard.press("Control+,");
+    await page.locator(".prefs-tab", { hasText: "Editor" }).click();
+    await page.locator("#prefs-grid-size").fill("0.5");
+    await page.locator("#prefs-grid-size").press("Tab");
+    await page.waitForTimeout(300);
+    check("Preferences grid step 0.5 halves the spacing (probe read-back)",
+        await probe(() => window.__wetsProbe.gridStep()) === 0.5, String(await probe(() => window.__wetsProbe.gridStep())));
+    await page.locator(".dlg-btn.primary").click();
+    await page.waitForTimeout(200);
+
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1.7 — DW-7.5/7.6: the platform fixtures, made through the wizard and the
+// GameObject menu like any author would, exported for `npm run e2e:build`.
+scenario("platform fixtures: lit, dark and catalog exports (B1.7)", async () => {
+    const page = await newPage("FixtureParent");
+
+    const makeProject = async (title, id, folder, template) => {
+        await page.getByText("Create project").click();
+        await page.locator("#wiz-name").fill(title);
+        await page.locator("#wiz-id").fill(id);
+        await page.locator(".dlg-btn.primary").click();
+        if (template === "empty") await page.locator(".wiz-card", { hasText: "Empty scene" }).click();
+        await page.locator(".dlg-btn.primary").click();
+        await page.getByText("Choose a folder…").click();
+        await page.waitForTimeout(400);
+        await page.locator("#wiz-folder").fill(folder);
+        await page.keyboard.press("Enter");
+        await page.locator(".work").waitFor({ timeout: 90000 });
+        await page.waitForTimeout(800);
+    };
+    const menuGo = async (item, sub) => {
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.waitForTimeout(150);
+        if (sub) {
+            await page.locator(".ctx-item", { hasText: sub }).first().hover();
+            await page.waitForTimeout(150);
+        }
+        await page.locator(".ctx-item", { hasText: item }).last().click();
+        await page.waitForTimeout(400);
+    };
+    const fillField = async (field, axis, value) => {
+        await page.locator(".insp-body .field").nth(field).locator("input").nth(axis).fill(String(value));
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(200);
+    };
+    /** A cube scaled 2 at (0,1,0): big enough to cover the platform canvas's
+     * centre pixel (320,240 of 640×480) from the camera at (0,1,−10). */
+    const fixtureCube = async () => {
+        await menuGo("Cube", "3D Object");
+        await fillField(0, 1, 1);
+        await fillField(2, 0, 2); await fillField(2, 1, 2); await fillField(2, 2, 2);
+    };
+    const saveAndClose = async (folder, key, roots) => {
+        // The Inspector's number input keeps focus after a fill, and the
+        // shortcut guard stands down inside inputs — click the pane tab first,
+        // like a user clicking away before saving.
+        await page.locator(".pane-tab").first().click();
+        await page.keyboard.press("Control+s");
+        await page.waitForTimeout(600);
+        const scene = JSON.parse(await readDisk(page, "FixtureParent", `${folder}/assets/scenes/main.scene.json`));
+        check(`${key}: the scene holds ${roots} objects`, scene.roots.length === roots, JSON.stringify(scene.roots.map(r => r.name)));
+        await exportFolder(page, "FixtureParent", folder, resolve(SHOTS, key));
+        await menu(page, "File", "Close Project");
+        await page.locator(".start-card").waitFor();
+        await page.waitForTimeout(300);
+    };
+
+    // pixels-lit: the wizard's camera and sun, plus the cube.
+    await makeProject("Pixels Lit", "pixels-lit", "Lit", "lightCamera");
+    await fixtureCube();
+    await saveAndClose("Lit", "pixels-lit", 3);
+
+    // pixels-dark: no light at all; the camera is placed by hand like an
+    // author would (the UI creates it at the pivot, inside the cube).
+    await makeProject("Pixels Dark", "pixels-dark", "Dark", "empty");
+    await fixtureCube();
+    await menuGo("Camera");
+    await page.locator("app-hierarchy li .label", { hasText: "Camera" }).first().click();
+    await page.waitForTimeout(300);
+    await fillField(0, 1, 1);
+    await fillField(0, 2, -10);
+    await saveAndClose("Dark", "pixels-dark", 2);
+
+    // catalog: the six primitives, a light and a camera — stage-6 features
+    // only, arranged across the camera's view at (0,1,−10).
+    await makeProject("Catalog", "catalog", "Catalog", "lightCamera");
+    await menuGo("Plane", "3D Object");
+    const PLACE = { Cube: [-3, 0.5, 0], Sphere: [-1.5, 0.5, 0], Capsule: [0, 1, 0], Cylinder: [1.5, 1, 0], Quad: [3, 0.5, 0] };
+    for (const [kind, [x, y, z]] of Object.entries(PLACE)) {
+        await menuGo(kind, "3D Object");
+        await fillField(0, 0, x); await fillField(0, 1, y); await fillField(0, 2, z);
+    }
+    await saveAndClose("Catalog", "catalog", 8);
+
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 

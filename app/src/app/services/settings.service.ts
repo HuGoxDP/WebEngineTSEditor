@@ -19,6 +19,8 @@ export interface Settings {
     scaleSnap: number;
     /** Scene-view fly speed in world units per second (D-4). */
     flySpeed: number;
+    /** Grid line spacing in world units (B1 phase 7). 0.1–100. */
+    gridSize: number;
     /** Writes `.editor/autosave.scene.json` while a scene has unsaved changes. */
     autosave: boolean;
     /** Asks before deleting objects and files. */
@@ -38,6 +40,7 @@ function defaults(): Settings {
         rotateSnap: 15,
         scaleSnap: 0.1,
         flySpeed: 5,
+        gridSize: 1,
         autosave: true,
         confirmDelete: true,
     };
@@ -62,6 +65,7 @@ export class SettingsService {
     public readonly rotateSnap    = signal(15);
     public readonly scaleSnap     = signal(0.1);
     public readonly flySpeed      = signal(5);
+    public readonly gridSize      = signal(1);
     public readonly autosave      = signal(true);
     public readonly confirmDelete = signal(true);
 
@@ -89,6 +93,7 @@ export class SettingsService {
             rotateSnap: this.rotateSnap(),
             scaleSnap: this.scaleSnap(),
             flySpeed: this.flySpeed(),
+            gridSize: this.gridSize(),
             autosave: this.autosave(),
             confirmDelete: this.confirmDelete(),
         };
@@ -104,6 +109,7 @@ export class SettingsService {
         this.density.set(s.density);
         this.gridSnap.set(s.gridSnap);
         this.flySpeed.set(s.flySpeed);
+        this.gridSize.set(s.gridSize);
         this.autosave.set(s.autosave);
         this.confirmDelete.set(s.confirmDelete);
     }
@@ -121,6 +127,7 @@ export class SettingsService {
             if (typeof p.rotateSnap === 'number' && p.rotateSnap >= 0 && Number.isFinite(p.rotateSnap)) out.rotateSnap = p.rotateSnap;
             if (typeof p.scaleSnap === 'number' && p.scaleSnap > 0 && Number.isFinite(p.scaleSnap)) out.scaleSnap = p.scaleSnap;
             if (typeof p.flySpeed === 'number' && p.flySpeed > 0 && Number.isFinite(p.flySpeed)) out.flySpeed = p.flySpeed;
+            if (typeof p.gridSize === 'number' && p.gridSize >= 0.1 && p.gridSize <= 100 && Number.isFinite(p.gridSize)) out.gridSize = p.gridSize;
             if (typeof p.autosave === 'boolean') out.autosave = p.autosave;
             if (typeof p.confirmDelete === 'boolean') out.confirmDelete = p.confirmDelete;
         } catch {

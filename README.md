@@ -114,12 +114,33 @@ origin-private file system, so both project stores are exercised in every run.
   and the file on disk is untouched.
 - **The new project wizard** — collects, validates and creates; cancelling at any step writes
   nothing, not even the parent folder.
+- **Stage-6 scene work** (B1) — Unity navigation (orbit, look, fly, frame/follow), the
+  orientation cube, Hand/Move/Rotate/Scale/combined tools with Pivot/Centre and Local/Global,
+  snapping, selection outline and marquee, component gizmos and icons with the Gizmos menu,
+  lighting/draw-mode/grid view state, and the platform fixture exports below.
 - The ScenarioCreator build check (`npm run e2e:build`) is separate: it needs that repository
   beside this one and is not part of the suite.
 
-**Recorded count:** 274 checks green on the branch this task merges (`.claude-shared/code-foundations/R1r/notes.md`):
-215 on the `origin/master` it branched from, 19 from this task's three R1r scenarios, and 40 from B1's
-navigation and orientation-cube scenarios that merged into `origin/master` while this task ran.
+**Recorded count:** 433 checks / 29 scenarios green on `B1-component-gizmos` (2026-11-21,
+`.workers/logs/B1-verify-37f2a7f3ed3d53e0ac942714c4a2bae180ac2ca5.md`; the phase-6 gate baseline was
+380). Earlier, at the R1r merge, the count was 274 (`.claude-shared/code-foundations/R1r/notes.md`):
+215 on the `origin/master` it branched from, 19 from that task's three R1r scenarios, and 40 from B1's
+navigation and orientation-cube scenarios that merged into `origin/master` while that task ran.
+
+**The debug probe.** The suite reads Scene-view state through `window.__wetsProbe`, installed
+only when `localStorage['wets:debug:probe'] === '1'` — a production editor carries none of it.
+Among its read-backs: `gizmoInfo` / `iconCounts` (component gizmos and billboard icons over the whole
+scene, in engine space), `transformOf` (world + local TRS), `setComponentEnabled` (the one write
+path — the enabled flag is not serialized), `pixel` / `pixelStats` (composed-frame read-back for
+layering and outline proofs), `gridStep`, `threeInfo` (the engine scene as a normal frame leaves it)
+and `gizmoBufferStats` (the flushed line buffer, proving pool growth instead of truncation).
+
+**Platform fixtures (`npm run e2e:build`).** The suite exports editor-made projects to `.shots/`:
+`wizard-project` (required), plus `pixels-lit`, `pixels-dark` and `catalog` (B1.7). The build check
+packs each with ScenarioCreator, runs it in the engine, and for the pixel pair measures one rendered
+pixel through `app/e2e/platform-pixels.mjs`: lit must exceed luminance 0.3, dark must stay below
+0.05 — the editor's lighting toggle is view state, so a lightless scene must be black on the
+platform. ScenarioCreator must sit beside this repository; CI does not run this check.
 
 **Manual checks the suite cannot make** (owner's, recorded in `docs/integration-plan.md`):
 the real `showDirectoryPicker` on Edge with a real folder on disk; Firefox and Safari smoke —

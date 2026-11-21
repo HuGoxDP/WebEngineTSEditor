@@ -14,7 +14,8 @@ import { SceneManager } from 'WebEngineTS';
  * handed to a layer, and the frame composites the layers in the D-2 order:
  *
  * 1. clear
- * 2. engine scene (lit per its own lights; wireframe per a later phase)
+ * 2. engine scene (lit per its own lights, or the D-7 headlight override when
+ *    lighting is off; wireframe per the D-8 override material)
  * 3. grid — depth-tested against the engine scene, so it is occluded by geometry
  * 4. clearDepth — everything after this is on top of the scene
  * 5. outline composite, component gizmos, transform handles
@@ -65,6 +66,34 @@ export class SceneViewRenderer {
     private _rafId = 0;
     private _canvas: HTMLCanvasElement | null = null;
     private _resizeObs: ResizeObserver | null = null;
+
+    /**
+     * View-state overrides for the engine render only (B1 phase 7; D-7, D-8).
+     * Set by the viewport's chips; never written into the scene. Lighting off
+     * hides the engine lights for the one render and draws a headlight instead;
+     * wireframe swaps in an override material. Both are restored before draw()
+     * returns, so a later frame — or the probe — sees the scene untouched.
+     */
+    public lightingOff = false;
+    public drawMode: 'shaded' | 'wireframe' = 'shaded';
+
+    /** Created once, reused every frame (nothing allocated per frame). */
+    private readonly _wireframeMat = new THREE.MeshBasicMaterial({ wireframe: true, color: 0xcccccc });
+    private readonly _headlight = new THREE.DirectionalLight(0xffffff, 1);
+    private readonly _hemi = new THREE.HemisphereLight(0xffffff, 0x666666, 0.6);
+    private readonly _headFwd = new THREE.Vector3();
+    /** The engine lights hidden for a lighting-off render, with their saved `visible`. */
+    private readonly _hiddenLights: { light: THREE.Light; visible: boolean }[] = [];
+    private _hiddenCount = 0;
+    private readonly _hideLight = (o: THREE.Object3D): void => {
+        const light = o as THREE.Light;
+        if (!light.isLight) return;
+        const n = this._hiddenCount++;
+        const slot = this._hiddenLights[n] ?? (this._hiddenLights[n] = { light, visible: true });
+        slot.light = light;
+        slot.visible = light.visible;
+        light.visible = false;
+    };
 
     /** The grid scene (depth-tested against the engine scene). */
     public get gridScene(): THREE.Scene | null { return this._gridScene; }
@@ -159,10 +188,42 @@ export class SceneViewRenderer {
         // The navigation controller owns the camera pose; the OrbitControls
         // target is kept only as the initial target and is not updated here.
 
-        // 1–2: clear, then the engine scene.
+        // 1–2: clear, then the engine scene. The lighting-off headlight and the
+        // wireframe override (D-7, D-8) scope to this one render: the engine
+        // scene's lights and materials are restored before anything else draws,
+        // so the grid, gizmos and the probe never see them.
         r.clear();
         const engineScene = SceneManager.activeScene._internalThreeScene;
-        r.render(engineScene, cam);
+        const overrideWireframe = this.drawMode === 'wireframe';
+        const overrideLighting = this.lightingOff;
+        if (overrideWireframe) engineScene.overrideMaterial = this._wireframeMat;
+        if (overrideLighting) {
+            this._hiddenCount = 0;
+            engineScene.traverse(this._hideLight);
+            // Headlight from the camera: direction = view forward, so the
+            // surfaces facing the viewer are the lit ones (Unity's scene light).
+            cam.getWorldDirection(this._headFwd);
+            this._headlight.position.copy(cam.position);
+            this._headlight.target.position.copy(cam.position).add(this._headFwd);
+            this._headlight.target.updateMatrixWorld();
+            engineScene.add(this._headlight);
+            engineScene.add(this._headlight.target);
+            engineScene.add(this._hemi);
+        }
+        try {
+            r.render(engineScene, cam);
+        } finally {
+            if (overrideLighting) {
+                for (let i = 0; i < this._hiddenCount; i++) {
+                    const slot = this._hiddenLights[i];
+                    slot.light.visible = slot.visible;
+                }
+                engineScene.remove(this._headlight);
+                engineScene.remove(this._headlight.target);
+                engineScene.remove(this._hemi);
+            }
+            if (overrideWireframe) engineScene.overrideMaterial = null;
+        }
         // 3: grid, depth-tested against the scene above.
         r.render(this._gridScene, cam);
         // 4+: depth drop, then the on-top layers.

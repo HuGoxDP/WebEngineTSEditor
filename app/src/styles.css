@@ -772,10 +772,51 @@ body.resizing { cursor: inherit !important; user-select: none; }
 }
 .vp-overlay-tl .chip .k { color: #7e8089; }
 .vp-overlay-tl .chip .v { color: #e8e8ea; }
+/* D-7 no-light hint: bottom of the canvas, over the drawing, never a click target.
+   Dark palette like the overlay chips — the canvas is dark in every theme. */
+.vp-nolight-hint {
+  position: absolute;
+  left: 50%; bottom: 14px;
+  transform: translateX(-50%);
+  max-width: 80%;
+  background: rgba(20,22,27,0.85);
+  border: 1px solid rgba(255,193,94,0.4);
+  border-radius: var(--radius);
+  padding: 5px 12px;
+  font-size: 12px;
+  color: #ffc15e;
+  z-index: 4;
+  pointer-events: none;
+  white-space: nowrap;
+}
 /* Under the orientation cube (top-right, above the canvas edge); it never
    swallows a click. */
 /* The rectangle-select draft (D-10): an editor-owned div over the canvas, so it
    never enters the WebGL frame. */
+/* The Gizmos menu (D-11): opens under its chip, view state not scene data. */
+.gz-menu { position: relative; display: inline-flex; }
+.gz-panel {
+  position: absolute;
+  top: 100%; left: 0;
+  margin-top: 4px;
+  min-width: 168px;
+  background: var(--bg-1);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  padding: 6px;
+  display: flex; flex-direction: column; gap: 2px;
+  z-index: 6;
+  font-size: 11px;
+  color: var(--fg-1);
+}
+.gz-row { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 4px; cursor: pointer; }
+.gz-row:hover { background: var(--bg-2); }
+.gz-row input[type="checkbox"] { accent-color: var(--accent); }
+.gz-row.master { font-weight: 600; color: var(--fg-0); }
+.gz-sep { height: 1px; background: var(--line); margin: 3px 2px; }
+.gz-slider { flex: 1; accent-color: var(--accent); }
+.gz-val { min-width: 18px; text-align: right; color: var(--fg-2); font-variant-numeric: tabular-nums; }
 .vp-rect {
   position: absolute;
   display: none;

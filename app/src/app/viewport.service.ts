@@ -1,27 +1,29 @@
-import { EffectRef, Injectable, Injector, NgZone, effect, inject, signal } from '@angular/core';
+import { EffectRef, Injectable, Injector, NgZone, computed, effect, inject, signal } from '@angular/core';
 import * as THREE from 'three';
 import { SceneViewController } from './scene-view/scene-view-controller';
 import { OrientationGizmo } from './scene-view/orientation-gizmo';
+import { ComponentGizmos, type DrawnInfo, type GizmoKind, type GizmoSettings,
+    kindOfType, loadGizmoSettings, saveGizmoSettings } from './scene-view/component-gizmos';
+import { GizmoIcons, type IconKind } from './scene-view/gizmo-icons';
 import { ScenePicker } from './scene-view/scene-picker';
 import { SelectionOutline } from './scene-view/selection-outline';
 import { TransformHandles, type HandleSpace, type PivotMode, type ToolMode } from './scene-view/transform-handles';
-import {
-    GameObject,
-    SceneManager,
-    Transform,
-    type SerializedScene,
-} from 'WebEngineTS';
+import { Behaviour, GameObject, SceneManager, Transform, TypeRegistry, type Component, type SerializedScene } from 'WebEngineTS';
 import { HistoryService } from './services/history.service';
 import { I18nService, type MessageKey } from './i18n/i18n.service';
 import { SceneService } from './services/scene.service';
 import { SelectionService } from './services/selection.service';
 import { SettingsService } from './services/settings.service';
 import { SceneViewRenderer } from './scene-view/scene-view-renderer';
-import { installProbe, probeEnabled } from './scene-view/debug-probe';
+import { engineDirToThree, enginePointToThree } from './scene-view/space';
+import { installProbe, probeEnabled, type ProbeTransform } from './scene-view/debug-probe';
 
 /** The Scene view's tools: Q view, W/E/R the three handle modes, Y all of them. */
 export type { Tool, PivotMode, HandleSpace } from './scene-view/transform-handles';
 import type { Tool } from './scene-view/transform-handles';
+
+/** The grid's extent in world units (fixed; the step setting changes the cell count). */
+const GRID_SIZE = 50;
 
 /**
  * The Scene view, as the rest of the editor sees it (B1 phase 1).
@@ -42,8 +44,30 @@ export class ViewportService {
     private _handles: TransformHandles | null = null;
     private _selectionEffect: EffectRef | null = null;
     private _snapEffect: EffectRef | null = null;
+    private _gridEffect: EffectRef | null = null;
+    /** The Scene view's grid (D-2 step 3); rebuilt when the step setting changes. */
+    private _grid: THREE.GridHelper | null = null;
+    /** The grid's cell count, kept for the step read-back (GridHelper geometry carries none). */
+    private _gridDivisions = 50;
+    /** The grid's axis lines (D-8): red X, blue Z toward engine +Z. Follows the grid's recentre. */
+    private _gridAxes: THREE.LineSegments | null = null;
     private _outline: SelectionOutline | null = null;
     private _picker: ScenePicker | null = null;
+    private _componentGizmos: ComponentGizmos | null = null;
+    private _icons: GizmoIcons | null = null;
+    /** The selection's backing objects, reused across selection changes (D-11). */
+    private readonly _gizmoSelected = new Set<THREE.Object3D>();
+    /** The icon pass's pooled points and counts — nothing allocated per frame. */
+    private readonly _iconPoints: Record<IconKind, { x: number; y: number; z: number; selected: boolean }[]> =
+        { camera: [], light: [], audio: [] };
+    private readonly _iconMat = new THREE.Matrix4();
+    /** Icons placed per stable component type this frame (the probe's read-back). */
+    private readonly _iconTypeCounts: Record<string, number> =
+        { Camera: 0, DirectionalLight: 0, PointLight: 0, SpotLight: 0, AudioSource: 0 };
+    /** The whole-scene walk's reused list (icons per frame, gizmoInfo for the probe). */
+    private readonly _sceneWalk: GameObject[] = [];
+    /** The Gizmos menu's switches: view state, kept in the browser (D-11). */
+    public readonly gizmoSettings = signal<GizmoSettings>(loadGizmoSettings());
     /** The rectangle draft, in canvas pixels, while the left button drags. */
     private _rect: { x: number; y: number; endX: number; endY: number } | null = null;
     /** The rectangle's div, created on the first draft (D-10). */
@@ -67,6 +91,149 @@ export class ViewportService {
      * centre click, D-5). Set only on a change — the cube draws every frame.
      */
     public readonly orthographic = signal(false);
+
+    /**
+     * Scene-view lighting (B1 phase 7; D-7). ON is the default for every scene:
+     * the editor shows what the platform shows, so a scene without a light reads
+     * dark rather than being secretly lit. OFF is a view aid — a headlight for
+     * this render only, never written into the scene, undo or storage.
+     */
+    public readonly sceneLighting = signal(true);
+
+    /** How the engine scene is drawn: shaded materials or one wireframe override (D-8). */
+    public readonly drawMode = signal<'shaded' | 'wireframe'>('shaded');
+
+    /** Whether the grid overlay is drawn (D-2 step 3). View state, like lighting. */
+    public readonly gridVisible = signal(true);
+
+    /**
+     * Whether the scene has any active light — an enabled light component on an
+     * active object. Reactive on scene revision and selection notify, so adding
+     * or enabling a light clears the hint without a frame's delay.
+     */
+    public readonly hasSceneLight = computed(() => {
+        this._sceneService.revision();
+        this._selection.revision();
+        return this._countActiveLights() > 0;
+    });
+
+    /** The no-light hint: only while lighting is ON and nothing lights the scene. */
+    public readonly noLightHint = computed(() => this.sceneLighting() && !this.hasSceneLight());
+
+    public toggleLighting(): void {
+        this.sceneLighting.update(on => !on);
+        this._renderer.lightingOff = !this.sceneLighting();
+    }
+
+    public setDrawMode(mode: 'shaded' | 'wireframe'): void {
+        this.drawMode.set(mode);
+        this._renderer.drawMode = mode;
+    }
+
+    public toggleGrid(): void {
+        this.gridVisible.update(on => !on);
+        if (this._grid) this._grid.visible = this.gridVisible();
+        if (this._gridAxes) this._gridAxes.visible = this.gridVisible();
+    }
+
+    /** The grid's actual line spacing, in world units (the probe's read-back). */
+    public get gridStep(): number {
+        // GridHelper draws `_gridDivisions` cells across GRID_SIZE; spacing is size / divisions.
+        return GRID_SIZE / this._gridDivisions;
+    }
+
+    /**
+     * Rebuilds the grid for a step setting: the extent stays GRID_SIZE, the cell
+     * count follows the step (at least one cell). The old helper leaves the
+     * layer and is disposed — a rebuild per Preferences change, not per frame.
+     */
+    private _rebuildGrid(step: number): void {
+        const divisions = Math.max(1, Math.round(GRID_SIZE / step));
+        if (this._grid && divisions === this._gridDivisions) return;
+        if (this._grid) {
+            this._renderer.removeOverlayLayer(this._grid);
+            this._grid.dispose();
+        }
+        this._gridDivisions = divisions;
+        this._grid = new THREE.GridHelper(GRID_SIZE, divisions, 0x555555, 0x333333);
+        this._grid.visible = this.gridVisible();
+        this._renderer.addOverlayLayer('grid', this._grid);
+        if (!this._gridAxes) {
+            // Axis lines across the grid's extent, built in engine space and
+            // converted only through space.ts (D-1). A hair above the grid so
+            // the coplanar lines do not z-fight.
+            const half = GRID_SIZE / 2;
+            const y = 0.01;
+            const pts = [
+                enginePointToThree({ x: -half, y, z: 0 }), enginePointToThree({ x: half, y, z: 0 }),
+                enginePointToThree({ x: 0, y, z: -half }), enginePointToThree({ x: 0, y, z: half }),
+            ];
+            // Sanity: engine +Z must map to three −Z (the blue line's far end).
+            if (engineDirToThree({ x: 0, y: 0, z: 1 }).z >= 0) throw new Error('space.ts: engine +Z must map to three −Z');
+            const geo = new THREE.BufferGeometry().setFromPoints(pts);
+            const colors = new Float32Array([
+                0.9, 0.25, 0.25, 0.9, 0.25, 0.25,   // red X
+                0.3, 0.45, 0.95, 0.3, 0.45, 0.95,   // blue Z (toward engine +Z)
+            ]);
+            geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+            this._gridAxes = new THREE.LineSegments(geo,
+                new THREE.LineBasicMaterial({ vertexColors: true }));
+            this._gridAxes.visible = this.gridVisible();
+            this._renderer.addOverlayLayer('grid', this._gridAxes);
+        }
+    }
+
+    /**
+     * Recentres the grid (and its axis lines) on the pivot's XZ, snapped to
+     * 10 steps so the lines never visibly crawl (D-8). Runs per frame —
+     * `_rebuildGrid` early-returns when the step is unchanged, so position
+     * cannot live there.
+     */
+    private _recentreGrid(): void {
+        if (!this._grid) return;
+        const snap = 10 * this.gridStep;
+        const p = this.pivot;
+        const x = Math.round(p.x / snap) * snap;
+        const z = Math.round(p.z / snap) * snap;
+        const at = enginePointToThree({ x, y: 0, z });
+        this._grid.position.copy(at);
+        this._gridAxes?.position.copy(at);
+    }
+
+    /**
+     * Active lights in the whole scene: an enabled light component on an object
+     * active in the hierarchy (the icon pass's rules). A disabled component or
+     * an inactive object lights nothing, so it does not count for the hint.
+     */
+    private _countActiveLights(): number {
+        let count = 0;
+        for (const go of this._sceneObjects()) {
+            if (!go.activeInHierarchy) continue;
+            const components = (go as unknown as { _components: unknown[] })._components;
+            for (let i = 0; i < components.length; i++) {
+                const component = components[i];
+                if ((component as { isActiveAndEnabled?: boolean }).isActiveAndEnabled === false) continue;
+                const typeName = TypeRegistry.getTypeName(component as object);
+                if (typeName === 'DirectionalLight' || typeName === 'PointLight'
+                    || typeName === 'SpotLight' || typeName === 'AmbientLight') count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * The engine three scene as a normal frame leaves it (the probe's DW-7.2
+     * proof): direct child count — no headlight leftovers — and every light's
+     * `visible`, found through the whole graph.
+     */
+    public threeInfo(): { children: number; lightsVisible: boolean[] } {
+        const scene = SceneManager.activeScene._internalThreeScene;
+        const lightsVisible: boolean[] = [];
+        scene.traverse(o => {
+            if ((o as THREE.Light).isLight) lightsVisible.push(o.visible);
+        });
+        return { children: scene.children.length, lightsVisible };
+    }
 
     constructor(
         private readonly _zone: NgZone,
@@ -104,10 +271,22 @@ export class ViewportService {
         // selection (D-10), the screen-space silhouette (D-9).
         this._picker = new ScenePicker(this._renderer);
         this._outline = new SelectionOutline(this._renderer);
+        // Component gizmos and their billboard icons (D-11): rebuilt per frame
+        // from the components' fields, drawn in the depth-tested and on-top
+        // layers respectively.
+        this._componentGizmos = new ComponentGizmos(this._renderer);
+        this._icons = new GizmoIcons(this._renderer);
+        this._icons.mount();
+        this._componentGizmos.setSettings(this.gizmoSettings());
+        this._icons.size = this.gizmoSettings().iconSize;
+        this._syncGizmoSelection();
 
         // ── Grid: depth-tested against the engine scene (D-2 step 3) ──
-        const grid = new THREE.GridHelper(50, 50, 0x555555, 0x333333);
-        this._renderer.addOverlayLayer('grid', grid);
+        // The step comes from Preferences (gridSize); the effect rebuilds the
+        // helper when it changes and applies the visibility chip's state.
+        this._gridEffect = effect(() => {
+            this._rebuildGrid(this._settings.gridSize());
+        }, { injector: this._injector });
 
         // ── Orientation cube (B1 phase 3) ──
         const orientation = new OrientationGizmo(this._renderer);
@@ -155,7 +334,10 @@ export class ViewportService {
         this._selectionEffect = effect(() => {
             this._selection.selected();
             this._selection.revision();
-            this._outline?.setTargets([...this._selection.selectedSet()].map(o => o.transform._internalObject3D));
+            const objects = [...this._selection.selectedSet()].map(o => o.transform._internalObject3D);
+            this._outline?.setTargets(objects);
+            // D-11: the selection's gizmos are drawn brighter.
+            this._syncGizmoSelection();
         }, { injector: this._injector });
 
         // The debug probe (D-13) exists only when the flag is set.
@@ -173,6 +355,20 @@ export class ViewportService {
                 hoverAll: () => this.hoverAll,
                 handlePoint: (axis, t) => this.handlePoint(axis, t),
                 objectScreenRect: name => this._picker?.screenRect(name) ?? null,
+                gizmoCounts: () => this.gizmoCounts,
+                gizmoExtent: (name, kind) => this.gizmoExtent(name, kind),
+                gizmoInfo: (name, kind) => this.gizmoInfo(name, kind),
+                gizmoBufferStats: kind => this.gizmoBufferStats(kind),
+                iconCounts: () => this.iconCounts,
+                transformOf: name => this.transformOf(name),
+                setComponentEnabled: (goName, typeName, index, enabled) =>
+                    this.setComponentEnabled(goName, typeName, index, enabled),
+                gizmoSettings: () => this.gizmoSettings(),
+                lightingOn: () => this.sceneLighting(),
+                drawMode: () => this.drawMode(),
+                gridVisible: () => this.gridVisible(),
+                gridStep: () => this.gridStep,
+                threeInfo: () => this.threeInfo(),
             });
         }
     }
@@ -201,9 +397,29 @@ export class ViewportService {
         this._selectionEffect = null;
         this._snapEffect?.destroy();
         this._snapEffect = null;
+        this._gridEffect?.destroy();
+        this._gridEffect = null;
+        if (this._grid) {
+            this._renderer.removeOverlayLayer(this._grid);
+            this._grid.dispose();
+            this._grid = null;
+        }
+        if (this._gridAxes) {
+            this._renderer.removeOverlayLayer(this._gridAxes);
+            this._gridAxes.geometry.dispose();
+            (this._gridAxes.material as THREE.Material).dispose();
+            this._gridAxes = null;
+        }
         this._outline?.dispose();
         this._outline = null;
         this._picker = null;
+        this._componentGizmos?.dispose();
+        this._componentGizmos = null;
+        this._icons?.dispose();
+        this._icons = null;
+        // The detached view must not keep the closed scene reachable (B1r5 #5).
+        this._sceneWalk.length = 0;
+        this._gizmoSelected.clear();
         this._rectEl?.remove();
         this._rectEl = null;
         this._renderer.detach();
@@ -331,6 +547,9 @@ export class ViewportService {
         // Flush dirty engine transforms before we render the engine scene.
         Transform._syncAllDirty();
 
+        // The grid follows the pivot, snapped to 10 steps (D-8).
+        this._recentreGrid();
+
         // The handles must not outlive their objects: undo, loading and closing a
         // project rebuild the scene, and the proxy can carry a stale pose for a
         // frame. A target whose engine object has left the scene graph is gone.
@@ -340,8 +559,10 @@ export class ViewportService {
         if (!this._handles?.dragging && this._selection.revision() !== this._handlesRevision) this._reseatHandles();
         this._handles?.dropDestroyed(() => this._reseatHandles());
 
-        // Nothing to do per frame for the outline: its post-pass copies the
-        // world matrices itself, and the rectangle div is painted on the move.
+        // Component gizmos: rebuilt from the components' fields each frame
+        // (D-11), and the icons follow the same objects.
+        this._componentGizmos?.update();
+        this._placeIcons();
 
         // The orientation cube, drawn after the frame in its own corner viewport.
         const ori = this._gizmoOri?.draw();
@@ -557,7 +778,229 @@ export class ViewportService {
         return null;
     }
 
-    /** @internal Walks the engine scene once and maps each Object3D to its GameObject. */
+    /** D-11: the selection's gizmos draw brighter — one reused set, no per-change allocation. */
+    private _syncGizmoSelection(): void {
+        const set = this._gizmoSelected;
+        set.clear();
+        for (const go of this._selection.selectedSet()) set.add(go.transform._internalObject3D);
+        this._componentGizmos?.setSelected(set);
+    }
+
+    /** One Gizmos menu switch (D-11): stored for the next session too. */
+    public setGizmoSetting(key: 'enabled' | 'camera' | 'lights' | 'colliders' | 'audio', value: boolean): void {
+        const next = { ...this.gizmoSettings(), [key]: value };
+        this.gizmoSettings.set(next);
+        saveGizmoSettings(next);
+        this._componentGizmos?.setSettings(next);
+        this._icons?.setVisibleIf(next.enabled);
+        // With gizmos off nothing walks the scene per frame, so the walk list
+        // must not pin the last scene's objects across an undo reload or a
+        // Close Project (B1r5 finding 5).
+        if (!next.enabled) {
+            this._sceneWalk.length = 0;
+            this._gizmoSelected.clear();
+        }
+    }
+
+    public setIconSize(size: number): void {
+        const next = { ...this.gizmoSettings(), iconSize: size };
+        this.gizmoSettings.set(next);
+        saveGizmoSettings(next);
+        if (this._icons) this._icons.size = size;
+    }
+
+    /** The gizmos one kind reached over the selection, for the probe (D-11). */
+    public get gizmoCounts(): Record<string, number> {
+        const out: Record<string, number> = {};
+        const gizmos = this._componentGizmos;
+        if (!gizmos) return out;
+        for (const go of this._selection.selectedSet()) {
+            for (const drawn of gizmos.drawnFor(go.transform._internalObject3D)) {
+                out[drawn.kind] = (out[drawn.kind] ?? 0) + 1;
+            }
+        }
+        return out;
+    }
+
+    /** The actual flushed line buffer of a kind: draw count, capacity, last vertex (B1r5 #6). */
+    public gizmoBufferStats(kind: GizmoKind | string): { drawn: number; capacity: number; last: { x: number; y: number; z: number } } | null {
+        const gizmos = this._componentGizmos;
+        if (!gizmos) return null;
+        const resolved = kindOfType(kind) ?? (kind as GizmoKind);
+        return gizmos.bufferStats(resolved);
+    }
+
+    /** How far one object's gizmo of a kind reaches, in engine units (the selection, as the existing e2e asserts). */
+    public gizmoExtent(name: string, kind: GizmoKind | string): number | null {
+        const gizmos = this._componentGizmos;
+        if (!gizmos) return null;
+        for (const go of this._selection.selectedSet()) {
+            if (go.name !== name) continue;
+            const drawn = gizmos.drawnFor(go.transform._internalObject3D).find(d => d.kind === kind);
+            return drawn ? drawn.extent : null;
+        }
+        return null;
+    }
+
+    /**
+     * Every gizmo record of a kind for the named object, searched over the WHOLE
+     * scene (the tests check unselected objects too). `kind` accepts a stable
+     * component type name ("PointLight") or the gizmo kind ("pointLight");
+     * omitted returns every kind. The returned records carry the TYPE name in
+     * `kind` (DrawnInfo); they are copied so a caller never holds the recycled
+     * read-back objects.
+     */
+    public gizmoInfo(name: string, kind?: GizmoKind | string): DrawnInfo[] {
+        const gizmos = this._componentGizmos;
+        const out: DrawnInfo[] = [];
+        if (!gizmos) return out;
+        const filter = kind === undefined ? null : (kindOfType(kind) ?? kind as GizmoKind);
+        for (const go of this._sceneObjects()) {
+            if (go.name !== name) continue;
+            for (const d of gizmos.drawnFor(go.transform._internalObject3D)) {
+                if (filter !== null && d.kind !== filter) continue;
+                out.push({
+                    kind: d.typeName,
+                    extent: d.extent,
+                    center: { ...d.center },
+                    half: { ...d.half },
+                    circles: d.circles.map(c => ({ center: { ...c.center }, normal: { ...c.normal }, radius: c.radius })),
+                    selected: d.selected,
+                });
+            }
+        }
+        return out;
+    }
+
+    /** How many icons per stable component type are placed and visible, whole scene. */
+    public get iconCounts(): Record<string, number> {
+        const out: Record<string, number> = {};
+        if (!this._icons || !this.gizmoSettings().enabled) return out;
+        for (const [name, n] of Object.entries(this._iconTypeCounts)) if (n > 0) out[name] = n;
+        return out;
+    }
+
+    /**
+     * An object's engine-space transform by name, over the WHOLE scene (not only
+     * the selection): world pose plus the local TRS the Inspector edits.
+     */
+    public transformOf(name: string): ProbeTransform | null {
+        for (const go of this._sceneObjects()) {
+            if (go.name !== name) continue;
+            const t = go.transform;
+            const p = t.position, q = t.rotation, s = t.lossyScale, e = t.eulerAngles;
+            const lp = t.localPosition, lq = t.localRotation, ls = t.localScale;
+            return {
+                position: { x: p.x, y: p.y, z: p.z },
+                rotation: { x: q.x, y: q.y, z: q.z, w: q.w },
+                euler: { x: e.x, y: e.y, z: e.z },
+                scale: { x: s.x, y: s.y, z: s.z },
+                localPosition: { x: lp.x, y: lp.y, z: lp.z },
+                localRotation: { x: lq.x, y: lq.y, z: lq.z, w: lq.w },
+                localScale: { x: ls.x, y: ls.y, z: ls.z },
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Toggles one component's enabled flag (the serializer does not persist it,
+     * so the probe is the write path). `typeName` resolves through the engine's
+     * TypeRegistry; `index` picks among the object's components of that type in
+     * add order. Only Behaviours carry an enabled flag.
+     */
+    public setComponentEnabled(goName: string, typeName: string, index: number, enabled: boolean): boolean {
+        const type = TypeRegistry.get(typeName);
+        if (!type) return false;
+        for (const go of this._sceneObjects()) {
+            if (go.name !== goName) continue;
+            const comps = go.getComponents(type as unknown as new (...args: never[]) => Component);
+            const comp = comps[index];
+            if (!comp || !(comp instanceof Behaviour)) return false;
+            comp.enabled = enabled;
+            this._selection.notifyChanged();
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Places the billboard icons over EVERY object carrying a gizmo component
+     * (D-11: icons mark every camera, light and audio object, not only the
+     * selection). Types come from the engine's registry — constructor.name does
+     * not survive the production build's minification. The Gizmos menu gates
+     * each icon kind; children of an inactive parent get none.
+     */
+    private _placeIcons(): void {
+        const icons = this._icons;
+        if (!icons) return;
+        const s = this.gizmoSettings();
+        icons.visible = s.enabled;
+        const camera = this._iconPoints.camera, light = this._iconPoints.light, audio = this._iconPoints.audio;
+        let nCamera = 0, nLight = 0, nAudio = 0;
+        const counts = this._iconTypeCounts;
+        counts.Camera = 0; counts.DirectionalLight = 0; counts.PointLight = 0; counts.SpotLight = 0; counts.AudioSource = 0;
+        if (s.enabled) {
+            for (const go of this._sceneObjects()) {
+                if (!go.activeInHierarchy) continue;
+                // One pose read per object, through the engine's allocation-free
+                // matrix accessor (the position getter returns a clone).
+                const e = go.transform._engineWorldMatrix(this._iconMat).elements;
+                const selected = this._selection.isSelected(go);
+                // The backing store, not getAllComponents() — that copies per call.
+                const components = (go as unknown as { _components: unknown[] })._components;
+                for (let ci = 0; ci < components.length; ci++) {
+                    const component = components[ci];
+                    const isActive = (component as { isActiveAndEnabled?: boolean }).isActiveAndEnabled;
+                    if (isActive === false) continue;
+                    const typeName = TypeRegistry.getTypeName(component as object);
+                    let pool: { x: number; y: number; z: number; selected: boolean }[] | null = null;
+                    switch (typeName) {
+                        case 'Camera':
+                            if (s.camera) pool = camera;
+                            break;
+                        case 'DirectionalLight': case 'PointLight': case 'SpotLight':
+                            if (s.lights) pool = light;
+                            break;
+                        case 'AudioSource':
+                            if (s.audio) pool = audio;
+                            break;
+                    }
+                    if (!pool || !typeName) continue;
+                    let n = 0;
+                    if (pool === camera) n = nCamera++;
+                    else if (pool === light) n = nLight++;
+                    else n = nAudio++;
+                    const p = pool[n] ?? (pool[n] = { x: 0, y: 0, z: 0, selected: false });
+                    p.x = e[12]; p.y = e[13]; p.z = e[14]; p.selected = selected;
+                    counts[typeName]++;
+                }
+            }
+        }
+        icons.place('camera', camera, nCamera);
+        icons.place('light', light, nLight);
+        icons.place('audio', audio, nAudio);
+    }
+
+    /**
+     * Every GameObject in the active scene, in one reused list (per-frame icons,
+     * probe read-backs). Roots come from the engine's backing store — the public
+     * getter copies (the component-gizmos precedent); the walk closure is a
+     * field, so a frame allocates nothing.
+     */
+    private readonly _walkScene = (go: GameObject): void => {
+        this._sceneWalk.push(go);
+        const children = go.transform._internalChildren;
+        for (let i = 0; i < children.length; i++) this._walkScene(children[i].gameObject);
+    };
+    private _sceneObjects(): readonly GameObject[] {
+        const out = this._sceneWalk;
+        out.length = 0;
+        const roots = (SceneManager.activeScene as unknown as { _rootGameObjects: GameObject[] })._rootGameObjects;
+        for (let i = 0; i < roots.length; i++) this._walkScene(roots[i]);
+        return out;
+    }
+
     /** Applies a rectangle's selection (D-10: clear unless Shift/Ctrl). */
     private _rectSelect(rect: { left: number; top: number; right: number; bottom: number }): void {
         const picker = this._picker;

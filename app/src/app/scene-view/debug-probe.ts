@@ -17,6 +17,18 @@ import * as THREE from 'three';
 import type { SceneViewRenderer } from './scene-view-renderer';
 import { TypeRegistry, getClassMeta } from 'WebEngineTS';
 
+/** An object's engine-space transform, as the probe reports it (world + local TRS). */
+export interface ProbeTransform {
+    position: { x: number; y: number; z: number };
+    rotation: { x: number; y: number; z: number; w: number };
+    /** The rotation as Unity's Inspector shows it, in degrees. */
+    euler: { x: number; y: number; z: number };
+    scale: { x: number; y: number; z: number };
+    localPosition: { x: number; y: number; z: number };
+    localRotation: { x: number; y: number; z: number; w: number };
+    localScale: { x: number; y: number; z: number };
+}
+
 /** The probe's shape, as installed on `window`. */
 export interface WetsProbe {
     /** The editor camera pose in engine space. */
@@ -38,14 +50,8 @@ export interface WetsProbe {
     handlePoint(axis: 'x' | 'y' | 'z' | 'X' | 'Y' | 'Z', t: number): { x: number; y: number } | null;
     /** The handle axes under the pointer right now, or null (D-6's tool checks). */
     hoverAxis(): string | null;
-    /** A selected object's engine-space transform, by name (D-6's assertions). */
-    transformOf(name: string): {
-        position: { x: number; y: number; z: number };
-        rotation: { x: number; y: number; z: number; w: number };
-        /** The rotation as Unity's Inspector shows it, in degrees. */
-        euler: { x: number; y: number; z: number };
-        scale: { x: number; y: number; z: number };
-    } | null;
+    /** An object's engine-space transform (world + local TRS), by name over the whole scene (D-6's assertions). */
+    transformOf(name: string): ProbeTransform | null;
     /** RGBA of the composed frame at a client pixel (null if off-canvas). */
     pixel(x: number, y: number): [number, number, number, number] | null;
     /** Client size of the drawing surface. */
@@ -60,6 +66,42 @@ export interface WetsProbe {
     hoverAll(): Record<string, string | null>;
     /** An object's screen-space bounds, or null when it is behind the camera. */
     objectScreenRect(name: string): { left: number; top: number; right: number; bottom: number } | null;
+    /** How many gizmos of each kind the selection draws (D-11's read-back). */
+    gizmoCounts(): Record<string, number>;
+    /** How far one object's gizmo of a kind reaches, in engine units. */
+    gizmoExtent(name: string, kind: string): number | null;
+    /**
+     * Every gizmo record of a kind for the named object, searched over the whole
+     * scene (not only the selection). Engine space: bbox centre/half of the
+     * vertices actually drawn, plus each circle's centre, unit normal, radius.
+     * `kind` is a stable component type name ("PointLight") or the gizmo kind
+     * ("pointLight"); omitted returns every kind the object draws. Each
+     * returned record's `kind` carries the stable component type name.
+     */
+    gizmoInfo(name: string, kind?: string): {
+        kind: string; extent: number;
+        center: { x: number; y: number; z: number };
+        half: { x: number; y: number; z: number };
+        circles: { center: { x: number; y: number; z: number }; normal: { x: number; y: number; z: number }; radius: number }[];
+        selected: boolean;
+    }[];
+    /**
+     * A kind's ACTUAL flushed line buffer (engine space, z un-flipped): the
+     * draw-range vertex count, the attribute capacity and the last vertex.
+     * Records are built before the flush, so only this read-back can prove the
+     * pool grew past 8192 instead of truncating the tail (B1r5 #6 / B1r4 #9).
+     */
+    gizmoBufferStats(kind: string): { drawn: number; capacity: number; last: { x: number; y: number; z: number } } | null;
+    /** How many billboard icons per stable component type are placed and visible (whole scene). */
+    iconCounts(): Record<string, number>;
+    /**
+     * Toggles one component's enabled flag (the serializer does not persist it,
+     * so the tests need a write path). `typeName` is the stable registry name;
+     * `index` picks among that object's components of the type, in add order.
+     */
+    setComponentEnabled(goName: string, typeName: string, index: number, enabled: boolean): boolean;
+    /** The Gizmos menu's switches, as the menu left them. */
+    gizmoSettings(): { enabled: boolean; camera: boolean; lights: boolean; colliders: boolean; audio: boolean; iconSize: number };
     /**
      * Counts pixels by hue inside a client-pixel rectangle: the selection
      * outline's proof (D-9) is a count of orange pixels, not one sample.
@@ -67,6 +109,20 @@ export interface WetsProbe {
     pixelStats(rect: { left: number; top: number; right: number; bottom: number }): {
         total: number; orange: number; green: number; white: number;
     };
+    /** Whether Scene-view lighting is on (B1 phase 7; D-7). */
+    lightingOn(): boolean;
+    /** The engine scene's draw mode: 'shaded' or 'wireframe' (D-8). */
+    drawMode(): string;
+    /** Whether the grid overlay is drawn. */
+    gridVisible(): boolean;
+    /** The grid's actual line spacing in world units (size / divisions). */
+    gridStep(): number;
+    /**
+     * The engine three scene after a normal frame (DW-7.2's proof that the
+     * lighting override leaves nothing behind): direct child count and every
+     * light's `visible` flag, over the whole graph.
+     */
+    threeInfo(): { children: number; lightsVisible: boolean[] };
     /**
      * A script class the registry holds, with a **token**: a number that stays
      * with the class object and is never reused, so a test can tell "the same
@@ -130,8 +186,36 @@ export function installProbe(
         hoverAll?: () => Record<string, string | null>;
         /** An object's projected renderer bounds (D-10's rectangle target). */
         objectScreenRect?: (name: string) => { left: number; top: number; right: number; bottom: number } | null;
+        /** The component gizmos over the selection (D-11). */
+        gizmoCounts?: () => Record<string, number>;
+        gizmoExtent?: (name: string, kind: string) => number | null;
+        /** One object's gizmo records of a kind, whole scene, engine space. */
+        gizmoInfo?: (name: string, kind?: string) => {
+            kind: string; extent: number;
+            center: { x: number; y: number; z: number };
+            half: { x: number; y: number; z: number };
+            circles: { center: { x: number; y: number; z: number }; normal: { x: number; y: number; z: number }; radius: number }[];
+            selected: boolean;
+        }[];
+        iconCounts?: () => Record<string, number>;
+        /** A kind's actual flushed line buffer: draw count, capacity, last vertex (B1r5 #6). */
+        gizmoBufferStats?: (kind: string) => { drawn: number; capacity: number; last: { x: number; y: number; z: number } } | null;
+        /** An object's world + local TRS by name, over the whole scene. */
+        transformOf?: (name: string) => ProbeTransform | null;
+        /** Toggles one component's enabled flag by stable type name + add-order index. */
+        setComponentEnabled?: (goName: string, typeName: string, index: number, enabled: boolean) => boolean;
+        gizmoSettings?: () => { enabled: boolean; camera: boolean; lights: boolean; colliders: boolean; audio: boolean; iconSize: number };
         /** The handle's position and axis directions in engine space (D-6). */
         handlePoint?: (axis: 'X' | 'Y' | 'Z', t: number) => { x: number; y: number; z: number } | null;
+        /** Scene-view lighting state (B1 phase 7; D-7). */
+        lightingOn?: () => boolean;
+        /** The engine scene's draw mode (D-8). */
+        drawMode?: () => string;
+        /** The grid overlay's visibility and actual line spacing. */
+        gridVisible?: () => boolean;
+        gridStep?: () => number;
+        /** The engine three scene as a normal frame leaves it (DW-7.2). */
+        threeInfo?: () => { children: number; lightsVisible: boolean[] };
     },
 ): void {
     const probe: WetsProbe = {
@@ -174,23 +258,16 @@ export function installProbe(
         hoverAxis: () => deps.hoverAxis?.() ?? null,
         hoverAll: () => deps.hoverAll?.() ?? {},
         objectScreenRect: (name) => deps.objectScreenRect?.(name) ?? null,
+        gizmoCounts: () => deps.gizmoCounts?.() ?? {},
+        gizmoExtent: (name, kind) => deps.gizmoExtent?.(name, kind) ?? null,
+        gizmoInfo: (name, kind) => deps.gizmoInfo?.(name, kind) ?? [],
+        gizmoBufferStats: kind => deps.gizmoBufferStats?.(kind) ?? null,
+        iconCounts: () => deps.iconCounts?.() ?? {},
+        setComponentEnabled: (goName, typeName, index, enabled) =>
+            deps.setComponentEnabled?.(goName, typeName, index, enabled) ?? false,
+        gizmoSettings: () => deps.gizmoSettings?.() ?? { enabled: true, camera: true, lights: true, colliders: true, audio: true, iconSize: 1 },
         pixelStats: (rect) => renderer.pixelStats(rect),
-        transformOf: (name) => {
-            for (const go of deps.selection.selectedSet()) {
-                if (go.name !== name) continue;
-                const t = go.transform;
-                const p = t.position;
-                const q = t.rotation;
-                const s = t.localScale;
-                return {
-                    position: { x: p.x, y: p.y, z: p.z },
-                    rotation: { x: q.x, y: q.y, z: q.z, w: q.w },
-                    euler: (() => { const e = t.eulerAngles; return { x: e.x, y: e.y, z: e.z }; })(),
-                    scale: { x: s.x, y: s.y, z: s.z },
-                };
-            }
-            return null;
-        },
+        transformOf: (name) => deps.transformOf?.(name) ?? null,
         size: () => {
             const canvas = deps.canvas();
             return { width: canvas?.clientWidth ?? 0, height: canvas?.clientHeight ?? 0 };
@@ -209,6 +286,11 @@ export function installProbe(
             return handler ? handler(x, y) : false;
         },
         pixel: (x, y) => renderer.readPixel(x, y),
+        lightingOn: () => deps.lightingOn?.() ?? true,
+        drawMode: () => deps.drawMode?.() ?? 'shaded',
+        gridVisible: () => deps.gridVisible?.() ?? true,
+        gridStep: () => deps.gridStep?.() ?? 1,
+        threeInfo: () => deps.threeInfo?.() ?? { children: 0, lightsVisible: [] },
         scriptClass: (name) => {
             const ctor = TypeRegistry.get(name) as (new (...args: never[]) => unknown) | null;
             if (!ctor) return null;
