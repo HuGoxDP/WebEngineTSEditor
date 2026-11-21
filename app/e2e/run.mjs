@@ -1810,6 +1810,126 @@ scenario("transform handles: snapping, global vs local, multi-select, the tools 
         && near(seatAfter.localRotation.z, seatBefore.localRotation.z, 1e-3)
         && near(seatAfter.localRotation.w, seatBefore.localRotation.w, 1e-3),
         JSON.stringify({ scaleHandle, dragDir, before: b, after: d }));
+
+    // ── B1r5 #1: the Y (combined) tool's Global scale is uniform ──
+    // Unity's Transform tool offers only the uniform handle in Global
+    // (TransformHandle.cs, s_Default's scale = Handle.XYZ). Three still draws
+    // per-axis boxes on the identity-seated proxy, so a box drag must apply
+    // ONE ratio to all three local axes. Pre-fix only localScale.x changed —
+    // the equal-ratio check below fails on the old code.
+    // The entry state is already Pivot/Global (the B1r2 tail restored Pivot),
+    // and #1's ratios are pivot-independent, so no chip is touched here.
+    await page.locator("app-hierarchy li", { hasText: "Seat" }).first().click();
+    await page.keyboard.press("y");
+    await page.waitForTimeout(300);
+    // The drag must land on a point ONLY the scale set claims: claimPointer
+    // hands the press to the first of translate→rotate→scale that hits, so a
+    // point shared with translate would drag-translate instead. Pre-fix no
+    // exclusive scale point exists at all — three's scale pickers are
+    // translate's cones verbatim (TransformControls.js:1383-1408 vs
+    // :1263-1288) and the XYZ box sits inside rotate's XYZE sphere (:1337) —
+    // so the reachability check is red before the combined-set size fix.
+    // Post-fix the enlarged cones reach past translate's picker extent and
+    // rotate's E ring; the scan radius covers that outer band.
+    const hoverScaleAxis = async (want, radius = 260) => {
+        const hub = await tip("X", 0);
+        for (let dx = -radius; dx <= radius; dx += 20) {
+            for (let dy = -radius; dy <= radius; dy += 20) {
+                await page.mouse.move(hub.x + dx, hub.y + dy);
+                const all = await page.evaluate(() => window.__wetsProbe.hoverAll());
+                if (all.scale === want && !all.translate && !all.rotate) return { x: hub.x + dx, y: hub.y + dy };
+            }
+        }
+        return null;
+    };
+    let uniHandle = await hoverScaleAxis("X");
+    if (!uniHandle) uniHandle = await hoverScaleAxis("XYZ");
+    if (!uniHandle) uniHandle = await hoverScaleAxis("Y");
+    if (!uniHandle) uniHandle = await hoverScaleAxis("Z");
+    check("the combined tool's Global scale box is reachable", !!uniHandle,
+        JSON.stringify(await page.evaluate(() => window.__wetsProbe.hoverAll())));
+    const uniBefore = await tf("Seat");
+    if (uniHandle) await drag(uniHandle, 60, 0);
+    const uniAfter = await tf("Seat");
+    const ub = uniBefore.localScale, ua = uniAfter.localScale;
+    const rx = ua.x / ub.x, ry = ua.y / ub.y, rz = ua.z / ub.z;
+    check("a combined Global scale drag is uniform: x, y and z share one ratio",
+        !!uniHandle && Math.abs(rx - 1) > 1e-3
+        && near(rx, ry, 1e-3) && near(rx, rz, 1e-3),
+        JSON.stringify({ before: ub, after: ua, ratios: [rx, ry, rz] }));
+
+    // ── B1r5 #2: a Centre scale carries the offset through the seated axes ──
+    // Parent turned 45° about Y, child at local (3,0,0); select the parent,
+    // R + Center + Global, scale X by k. Unity (TransformManipulator.cs,
+    // TransformData.SetScaleDelta): pivot + R·((R⁻¹·(pos−pivot)) ⊙ ratio) —
+    // for a parent at the origin the child sits at (2.12,0,−2.12), C is the
+    // midpoint (1.06,0,−1.06), and k=2 puts the parent at (−1.06,0,1.06),
+    // not along world X alone. Pre-fix the z component stays put and the
+    // formula check fails.
+    await create("Cube");
+    await rename("Arm");
+    await page.locator(".insp-body .field").nth(1).locator("input").nth(1).fill("45");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    // The child must be a REAL child (the menu-bar create makes roots): the
+    // object's context menu places it at Arm's local zero, then it is renamed
+    // so tf() cannot hit the duplicate "Cube" roots from the earlier drags.
+    await page.locator("app-hierarchy li", { hasText: "Arm" }).first().click({ button: "right" });
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "3D Object" }).first().hover();
+    await page.waitForTimeout(200);
+    await page.locator(".ctx-item", { hasText: "Cube" }).last().click();
+    await page.waitForTimeout(300);
+    await rename("ArmKid");
+    await page.locator(".insp-body .field").nth(0).locator("input").nth(0).fill("3");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(300);
+    await page.locator("app-hierarchy li", { hasText: "Arm" }).first().click();
+    await page.keyboard.press("r");
+    // The chip shows the CURRENT mode: in Pivot it reads "Pivot", and clicking
+    // it toggles to Center (workspace.component.ts:84-91).
+    await page.locator(".vp-subtoolbar .chip", { hasText: "Pivot" }).click();
+    await page.waitForTimeout(300);
+    const armT = await tf("Arm");
+    const kidT = await tf("ArmKid");
+    check("the child sits at local (3,0,0) under the turned parent",
+        near(kidT.localPosition.x, 3, 1e-3) && near(kidT.localPosition.y, 0, 1e-3) && near(kidT.localPosition.z, 0, 1e-3),
+        JSON.stringify(kidT.localPosition));
+    // The Centre pivot C: midpoint of the two world origins. Both cubes are
+    // unit-sized and centred on their origins, so their bounds centres are
+    // the origins — the mirror cannot shift a symmetric box's centre.
+    const C = {
+        x: (armT.position.x + kidT.position.x) / 2,
+        y: (armT.position.y + kidT.position.y) / 2,
+        z: (armT.position.z + kidT.position.z) / 2,
+    };
+    const rotQ = (v, q) => {
+        const tx = 2 * (q.y * v.z - q.z * v.y), ty = 2 * (q.z * v.x - q.x * v.z), tz = 2 * (q.x * v.y - q.y * v.x);
+        return {
+            x: v.x + q.w * tx + q.y * tz - q.z * ty,
+            y: v.y + q.w * ty + q.z * tx - q.x * tz,
+            z: v.z + q.w * tz + q.x * ty - q.y * tx,
+        };
+    };
+    const centreHandle = await findHandle("scale", "X");
+    check("the seated Centre scale handle is reachable", !!centreHandle, await hover());
+    const armBefore = await tf("Arm");
+    if (centreHandle) await drag(centreHandle, 60, 0);
+    const armAfter = await tf("Arm");
+    const k = armAfter.localScale.x / armBefore.localScale.x;
+    check("the Centre scale drag actually scaled", Math.abs(k - 1) > 0.05, String(k));
+    const R = armBefore.rotation;
+    const inv = { x: -R.x, y: -R.y, z: -R.z, w: R.w };
+    const off = { x: armBefore.position.x - C.x, y: armBefore.position.y - C.y, z: armBefore.position.z - C.z };
+    const inSeat = rotQ(off, inv);
+    const scaledOff = rotQ({ x: inSeat.x * k, y: inSeat.y, z: inSeat.z }, R);
+    const want = { x: C.x + scaledOff.x, y: C.y + scaledOff.y, z: C.z + scaledOff.z };
+    const got = armAfter.position;
+    check("the parent lands at C + R·((R⁻¹(p−C)) ⊙ ratio), not on a world axis",
+        !!centreHandle && Math.abs(k - 1) > 0.05
+        && near(got.x, want.x, 1e-3) && near(got.y, want.y, 1e-3) && near(got.z, want.z, 1e-3),
+        JSON.stringify({ k, want, got }));
+
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
