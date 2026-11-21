@@ -236,7 +236,9 @@ const noErrors = page => page.logs.filter(l =>
 async function openEmptyProject(page) {
     await page.getByText("Open folder…").click();
     await dialogButton(page, "Set up").click();
-    await page.locator(".work").waitFor();
+    // Late in a full run every earlier scenario's page is still open and the
+    // software GL is slow; the same 90 s the reload waits use (B1.6).
+    await page.locator(".work").waitFor({ timeout: 90000 });
 }
 
 /** A scene file with one object, in the engine's format. */
@@ -2067,6 +2069,9 @@ scenario("component gizmos: lights, camera and colliders, switched per type (B1.
     const withGizmos = JSON.parse((await sceneText()) ?? "null");
     await page.locator(".gz-row.master input").uncheck();
     await page.waitForTimeout(400);
+    // The checkbox keeps focus, and the shortcut guard stands down inside
+    // inputs — click away first or Ctrl+S is a no-op and this save never lands.
+    await page.locator(".pane-tab").first().click();
     await page.keyboard.press("Control+s");
     await page.waitForTimeout(400);
     const withoutGizmos = JSON.parse((await sceneText()) ?? "null");
@@ -2113,7 +2118,10 @@ scenario("component gizmos: lights, camera and colliders, switched per type (B1.
         JSON.stringify(everythingOff));
     // The Point Light and its range edit came after the last save: leave the
     // scene dirty and a slow run's autosave writes a copy, whose recovery
-    // dialog then blocks every click after the reopen. Save it away first.
+    // dialog then blocks every click after the reopen. Save it away first —
+    // clicking the pane tab because the master checkbox still has focus and
+    // the shortcut guard stands down inside inputs.
+    await page.locator(".pane-tab").first().click();
     await page.keyboard.press("Control+s");
     await page.waitForTimeout(500);
     await page.reload({ waitUntil: "load" });
@@ -2398,6 +2406,274 @@ scenario("component gizmos: the review proofs (B1r4)", async () => {
 
     check("no page errors", noErrors(page), page.logs.join(" | "));
 });
+// B1.7 — DW-7.1…7.4: lighting, draw modes and the grid are view state; the
+// picture matches what the platform will show.
+scenario("lighting and view: dark without a light, wireframe, the grid (B1.7)", async () => {
+    const page = await newPage("ViewDemo", { probe: true });
+    await openEmptyProject(page);
+    await page.keyboard.press("Escape");
+
+    const menuGo = async (item, sub) => {
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.waitForTimeout(150);
+        if (sub) {
+            await page.locator(".ctx-item", { hasText: sub }).first().hover();
+            await page.waitForTimeout(150);
+        }
+        await page.locator(".ctx-item", { hasText: item }).last().click();
+        await page.waitForTimeout(400);
+    };
+    const chip = title => page.locator(`.vp-subtoolbar .chip[title="${title}"]`);
+    const probe = fn => page.evaluate(fn);
+    const lum = rgba => rgba ? (0.2126 * rgba[0] + 0.7152 * rgba[1] + 0.0722 * rgba[2]) / 255 : -1;
+    const pixelAt = (x, y) => page.evaluate(([px, py]) => window.__wetsProbe.pixel(px, py), [x, y]);
+    const rectOf = name => page.evaluate(n => window.__wetsProbe.objectScreenRect(n), name);
+    const centreOf = async name => {
+        const r = await rectOf(name);
+        return r ? { x: Math.round((r.left + r.right) / 2), y: Math.round((r.top + r.bottom) / 2) } : null;
+    };
+    const sceneText = async () => {
+        for (let i = 0; i < 30; i++) {
+            const text = await readDisk(page, "ViewDemo", "assets/scenes/main.scene.json");
+            if (text !== null && text.length > 0) return text;
+            await page.waitForTimeout(100);
+        }
+        return null;
+    };
+
+    // Gizmos off for the whole scenario: their lines would sit over the very
+    // pixels the luminance checks read (the light's rays cross the cube).
+    await page.locator(".gz-menu .chip").click();
+    await page.waitForTimeout(250);
+    await page.locator(".gz-row.master input").uncheck();
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+
+    await menuGo("Cube", "3D Object");
+    await page.keyboard.press("q"); // View tool: no handles over the cube
+    await page.waitForTimeout(250);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    const baseline = await sceneText();
+    check("the cube was saved", baseline !== null && JSON.parse(baseline).roots.some(r => r.name === "Cube"));
+
+    // ── DW-7.1: lighting on by default, a light-less scene is dark ──
+    check("lighting starts on", await probe(() => window.__wetsProbe.lightingOn()) === true);
+    check("the no-light hint is visible", await page.locator(".vp-nolight-hint").isVisible());
+    check("the hint says what the platform will show",
+        (await page.locator(".vp-nolight-hint").innerText()).includes("No light in the scene"));
+    let c = await centreOf("Cube");
+    const dark = lum(await pixelAt(c.x, c.y));
+    check("with no light the cube is dark (lum < 0.05)", dark >= 0 && dark < 0.05, String(dark));
+
+    await chip("Lighting").click();
+    await page.waitForTimeout(300);
+    const litByHeadlight = lum(await pixelAt(c.x, c.y));
+    check("lighting off shows the cube lit by the headlight (lum > 0.3)", litByHeadlight > 0.3, String(litByHeadlight));
+    check("the hint is gone while lighting is off", (await page.locator(".vp-nolight-hint").count()) === 0);
+    check("the toggle does not mark the scene unsaved", (await page.locator(".statusbar").innerText()).includes("Saved"));
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    check("lighting state never reaches the scene file", (await sceneText()) === baseline);
+
+    // Not undoable: Ctrl+Z undoes the cube's create, not the toggle.
+    await page.keyboard.press("Control+z");
+    await page.waitForTimeout(400);
+    const names = await page.locator("app-hierarchy li .label").allInnerTexts();
+    check("undo undoes the create, not the lighting toggle", !names.includes("Cube")
+        && await probe(() => window.__wetsProbe.lightingOn()) === false, names.join(","));
+    await page.keyboard.press("Control+y");
+    await page.waitForTimeout(400);
+
+    // A real light: lighting on shows it, and the hint goes away.
+    await menuGo("Directional Light", "Light");
+    await chip("Lighting").click(); // back on
+    await page.waitForTimeout(300);
+    check("adding a light removes the hint", (await page.locator(".vp-nolight-hint").count()) === 0);
+    c = await centreOf("Cube");
+    const litByScene = lum(await pixelAt(c.x, c.y));
+    check("with the scene's own light the cube is lit (lum > 0.3)", litByScene > 0.3, String(litByScene));
+
+    // ── DW-7.2: the lighting-off override leaves nothing behind ──
+    const info0 = await probe(() => window.__wetsProbe.threeInfo());
+    await chip("Lighting").click();
+    await page.waitForTimeout(200);
+    await pixelAt(c.x, c.y); // forces a lighting-off frame
+    const info1 = await probe(() => window.__wetsProbe.threeInfo());
+    check("no headlight children survive the frame", info0.children === info1.children, JSON.stringify([info0, info1]));
+    check("the scene light keeps its visible flag", JSON.stringify(info0.lightsVisible) === JSON.stringify(info1.lightsVisible)
+        && info1.lightsVisible.length > 0 && info1.lightsVisible.every(v => v === true), JSON.stringify([info0, info1]));
+    await chip("Lighting").click(); // on again
+    await page.waitForTimeout(200);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    const withLight = await sceneText();
+
+    // ── DW-7.3: wireframe is an override, not a material edit ──
+    await page.keyboard.press("Escape"); // no selection outline over the edges
+    await chip("Grid").click(); // grid off: a uniform background to compare with
+    await page.waitForTimeout(250);
+    const box = await page.locator("canvas").boundingBox();
+    const bg = await pixelAt(Math.round(box.x + 30), Math.round(box.y + 30));
+    await chip("Wireframe").click();
+    await page.waitForTimeout(300);
+    const r = await rectOf("Cube");
+    // A 5×5 sample grid over the middle 60% of the rect: a face diagonal can
+    // cross any single point (the centre included), so the interior claim is
+    // "most interior pixels read as background", not one lucky pixel.
+    const bgLum = lum(bg);
+    let interiorBg = 0;
+    for (let i = 0; i < 5; i++) {
+        for (let j = 0; j < 5; j++) {
+            const p = await pixelAt(
+                Math.round(r.left + (r.right - r.left) * (0.2 + 0.15 * i)),
+                Math.round(r.top + (r.bottom - r.top) * (0.2 + 0.15 * j)));
+            if (Math.abs(lum(p) - bgLum) < 0.03) interiorBg++;
+        }
+    }
+    check("wireframe: the interior reads as background", interiorBg >= 15, `${interiorBg}/25 interior pixels, bg=${JSON.stringify(bg)}`);
+    let edgeLit = 0;
+    for (let x = Math.round(r.left); x <= Math.round(r.right); x++) {
+        if (lum(await pixelAt(x, c.y)) > 0.3) edgeLit++;
+    }
+    check("wireframe: the edges are drawn", edgeLit >= 2, String(edgeLit));
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(400);
+    check("wireframe never reaches the scene file", (await sceneText()) === withLight);
+    await chip("Shaded").click();
+    await page.waitForTimeout(300);
+    const filled = lum(await pixelAt(c.x, c.y));
+    check("shaded back: the cube is filled again", filled > 0.3, String(filled));
+    await chip("Grid").click(); // grid on
+    await page.waitForTimeout(250);
+
+    // ── DW-7.4: the grid toggle and its step ──
+    check("the grid step starts at 1", await probe(() => window.__wetsProbe.gridStep()) === 1);
+    // The grid is finite (±25 units) and its lines are antialiased, so a single
+    // scan row can miss them entirely. Count grey-ish pixels over a 2D region
+    // in the left third of the view — empty ground, away from the cube (which
+    // sits centre-right) and the orientation cube (top-right corner).
+    const greyCount = async () => {
+        let n = 0;
+        for (let y = 90; y <= 390; y += 15) {
+            for (let x = 16; x <= 316; x += 15) {
+                const p = await pixelAt(Math.round(box.x + x), Math.round(box.y + y));
+                if (p && Math.max(p[0], p[1], p[2]) >= 10
+                    && Math.abs(p[0] - p[1]) < 20 && Math.abs(p[1] - p[2]) < 20) n++;
+            }
+        }
+        return n;
+    };
+    const gridOn = await greyCount();
+    check("grid on: grid-colour pixels in the empty area", gridOn > 0, String(gridOn));
+    await chip("Grid").click();
+    await page.waitForTimeout(250);
+    const gridOff = await greyCount();
+    check("grid hidden: no grid-colour pixels left", gridOff === 0, String(gridOff));
+    await chip("Grid").click();
+    await page.waitForTimeout(250);
+
+    await page.keyboard.press("Control+,");
+    await page.locator(".prefs-tab", { hasText: "Editor" }).click();
+    await page.locator("#prefs-grid-size").fill("0.5");
+    await page.locator("#prefs-grid-size").press("Tab");
+    await page.waitForTimeout(300);
+    check("Preferences grid step 0.5 halves the spacing (probe read-back)",
+        await probe(() => window.__wetsProbe.gridStep()) === 0.5, String(await probe(() => window.__wetsProbe.gridStep())));
+    await page.locator(".dlg-btn.primary").click();
+    await page.waitForTimeout(200);
+
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// B1.7 — DW-7.5/7.6: the platform fixtures, made through the wizard and the
+// GameObject menu like any author would, exported for `npm run e2e:build`.
+scenario("platform fixtures: lit, dark and catalog exports (B1.7)", async () => {
+    const page = await newPage("FixtureParent");
+
+    const makeProject = async (title, id, folder, template) => {
+        await page.getByText("Create project").click();
+        await page.locator("#wiz-name").fill(title);
+        await page.locator("#wiz-id").fill(id);
+        await page.locator(".dlg-btn.primary").click();
+        if (template === "empty") await page.locator(".wiz-card", { hasText: "Empty scene" }).click();
+        await page.locator(".dlg-btn.primary").click();
+        await page.getByText("Choose a folder…").click();
+        await page.waitForTimeout(400);
+        await page.locator("#wiz-folder").fill(folder);
+        await page.keyboard.press("Enter");
+        await page.locator(".work").waitFor({ timeout: 90000 });
+        await page.waitForTimeout(800);
+    };
+    const menuGo = async (item, sub) => {
+        await page.locator(".menubar-item", { hasText: "GameObject" }).click();
+        await page.waitForTimeout(150);
+        if (sub) {
+            await page.locator(".ctx-item", { hasText: sub }).first().hover();
+            await page.waitForTimeout(150);
+        }
+        await page.locator(".ctx-item", { hasText: item }).last().click();
+        await page.waitForTimeout(400);
+    };
+    const fillField = async (field, axis, value) => {
+        await page.locator(".insp-body .field").nth(field).locator("input").nth(axis).fill(String(value));
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(200);
+    };
+    /** A cube scaled 2 at (0,1,0): big enough to cover the platform canvas's
+     * centre pixel (320,240 of 640×480) from the camera at (0,1,−10). */
+    const fixtureCube = async () => {
+        await menuGo("Cube", "3D Object");
+        await fillField(0, 1, 1);
+        await fillField(2, 0, 2); await fillField(2, 1, 2); await fillField(2, 2, 2);
+    };
+    const saveAndClose = async (folder, key, roots) => {
+        // The Inspector's number input keeps focus after a fill, and the
+        // shortcut guard stands down inside inputs — click the pane tab first,
+        // like a user clicking away before saving.
+        await page.locator(".pane-tab").first().click();
+        await page.keyboard.press("Control+s");
+        await page.waitForTimeout(600);
+        const scene = JSON.parse(await readDisk(page, "FixtureParent", `${folder}/assets/scenes/main.scene.json`));
+        check(`${key}: the scene holds ${roots} objects`, scene.roots.length === roots, JSON.stringify(scene.roots.map(r => r.name)));
+        await exportFolder(page, "FixtureParent", folder, resolve(SHOTS, key));
+        await menu(page, "File", "Close Project");
+        await page.locator(".start-card").waitFor();
+        await page.waitForTimeout(300);
+    };
+
+    // pixels-lit: the wizard's camera and sun, plus the cube.
+    await makeProject("Pixels Lit", "pixels-lit", "Lit", "lightCamera");
+    await fixtureCube();
+    await saveAndClose("Lit", "pixels-lit", 3);
+
+    // pixels-dark: no light at all; the camera is placed by hand like an
+    // author would (the UI creates it at the pivot, inside the cube).
+    await makeProject("Pixels Dark", "pixels-dark", "Dark", "empty");
+    await fixtureCube();
+    await menuGo("Camera");
+    await page.locator("app-hierarchy li .label", { hasText: "Camera" }).first().click();
+    await page.waitForTimeout(300);
+    await fillField(0, 1, 1);
+    await fillField(0, 2, -10);
+    await saveAndClose("Dark", "pixels-dark", 2);
+
+    // catalog: the six primitives, a light and a camera — stage-6 features
+    // only, arranged across the camera's view at (0,1,−10).
+    await makeProject("Catalog", "catalog", "Catalog", "lightCamera");
+    await menuGo("Plane", "3D Object");
+    const PLACE = { Cube: [-3, 0.5, 0], Sphere: [-1.5, 0.5, 0], Capsule: [0, 1, 0], Cylinder: [1.5, 1, 0], Quad: [3, 0.5, 0] };
+    for (const [kind, [x, y, z]] of Object.entries(PLACE)) {
+        await menuGo(kind, "3D Object");
+        await fillField(0, 0, x); await fillField(0, 1, y); await fillField(0, 2, z);
+    }
+    await saveAndClose("Catalog", "catalog", 8);
+
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
 // ═══ Run ═══
 const only = process.env.ONLY;
 for (const [name, fn] of scenarios) {
