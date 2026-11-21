@@ -11,6 +11,18 @@ export interface LogEntry {
     /** Best-effort source string (file:line) parsed from the call stack. */
     source: string;
     count: number;  // collapsed-duplicate counter
+    /**
+     * Where a click should take the user, when the entry *is* a location:
+     * a script and a line in it. Absent for everything else.
+     */
+    jump?: { path: string; line: number };
+}
+
+/** A console row a caller wants logged with a place to click through to. */
+export interface LogRequest {
+    level: LogLevel;
+    message: string;
+    jump?: { path: string; line: number };
 }
 
 /**
@@ -114,7 +126,27 @@ export class ConsoleService {
         return '';
     }
 
-    private _push(level: LogLevel, message: string, source: string): void {
+    /**
+     * Logs one row the caller knows the meaning of — a compile diagnostic, with
+     * the file and line its message names, so the Console row can be clicked
+     * through to the Code tab at that line.
+     *
+     * @remarks
+     * `console.error` cannot do this: the source it derives is a call-stack
+     * frame, which for a transpile error points at this service, not at the
+     * script. The patched console is left for everything else.
+     */
+    public push(request: LogRequest): void {
+        const jump = request.jump;
+        this._push(
+            request.level,
+            request.message,
+            jump ? `${jump.path}:${jump.line}` : this._sourceOf(),
+            jump,
+        );
+    }
+
+    private _push(level: LogLevel, message: string, source: string, jump?: { path: string; line: number }): void {
         const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
         const list = this._entries();
 
@@ -122,7 +154,7 @@ export class ConsoleService {
             const last = list[list.length - 1];
             if (last.level === level && last.message === message) {
                 const next = list.slice(0, -1);
-                next.push({ ...last, count: last.count + 1, time });
+                next.push({ ...last, count: last.count + 1, time, jump: jump ?? last.jump });
                 this._entries.set(next);
                 return;
             }
@@ -130,7 +162,7 @@ export class ConsoleService {
 
         const entry: LogEntry = {
             id: this._nextId++,
-            level, message, time, source, count: 1,
+            level, message, time, source, count: 1, jump,
         };
         const next = [...list, entry];
         if (next.length > ConsoleService.MAX_ENTRIES) next.splice(0, next.length - ConsoleService.MAX_ENTRIES);

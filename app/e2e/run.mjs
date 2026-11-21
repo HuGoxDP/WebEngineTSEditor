@@ -179,6 +179,104 @@ const slowAutosave = (page, ms) => page.evaluate(delay => {
     window.__slowAutosave = delay;
 }, ms);
 
+/**
+ * Holds one library file's write open `ms` longer before it closes, and raises
+ * `window.__libWriteClosing` when that close starts — so a scenario can act
+ * while the add is still in flight (C4r5). Test instrumentation only.
+ */
+const slowLibraryWrite = (page, fileName, ms) => page.evaluate(([name, delay]) => {
+    const create = FileSystemFileHandle.prototype.createWritable;
+    FileSystemFileHandle.prototype.createWritable = async function (...args) {
+        const writable = await create.apply(this, args);
+        if (this.name === name) {
+            const close = writable.close.bind(writable);
+            writable.close = async () => {
+                window.__libWriteClosing = true;
+                await new Promise(r => setTimeout(r, delay));
+                return close();
+            };
+        }
+        return writable;
+    };
+}, [fileName, ms]);
+
+/**
+ * Makes the next write of one file throw once — a disk failure mid-add. The
+ * file handle is already created by then, exactly as a real failure leaves it
+ * (C4r5). Test instrumentation only.
+ */
+const failNextWrite = (page, fileName) => page.evaluate(name => {
+    const create = FileSystemFileHandle.prototype.createWritable;
+    FileSystemFileHandle.prototype.createWritable = async function (...args) {
+        if (this.name === name && !window.__libWriteFailed) {
+            window.__libWriteFailed = true;
+            throw new Error("e2e: disk full");
+        }
+        return create.apply(this, args);
+    };
+}, fileName);
+
+/**
+ * Makes every read of one file throw NotAllowedError — a read failure that is
+ * not a vanished file (a permission problem, a locked handle). The seam is
+ * getFile, which readText goes through; listing still works (C4r2).
+ * Test instrumentation only.
+ */
+const failReads = (page, fileName) => page.evaluate(name => {
+    const get = FileSystemFileHandle.prototype.getFile;
+    FileSystemFileHandle.prototype.getFile = function (...args) {
+        if (this.name === name) throw new DOMException("e2e: read refused", "NotAllowedError");
+        return get.apply(this, args);
+    };
+}, fileName);
+
+/**
+ * Holds the first read of the project's entry script until released, so the
+ * script-load step of an open can be acted inside deterministically (C4).
+ * The seam is getFile, which the runtime's readText goes through. Test
+ * instrumentation only.
+ */
+const holdScriptRead = page => page.evaluate(() => {
+    const get = FileSystemFileHandle.prototype.getFile;
+    FileSystemFileHandle.prototype.getFile = function (...args) {
+        if (this.name === "Scenario.ts" && !window.__scriptReadHeld) {
+            window.__scriptReadHeld = true;
+            return new Promise(resolve => {
+                window.__releaseScriptRead = () => resolve(get.apply(this, args));
+            });
+        }
+        return get.apply(this, args);
+    };
+});
+
+/**
+ * Holds the first read of one file after its write closes — the stamp read a
+ * save does between its write and its reload — so a second save can be pressed
+ * inside that window deterministically (C4 review R4). The seam is getFile,
+ * which modifiedAt goes through. Test instrumentation only.
+ */
+const holdStampRead = (page, fileName) => page.evaluate(name => {
+    const create = FileSystemFileHandle.prototype.createWritable;
+    FileSystemFileHandle.prototype.createWritable = async function (...args) {
+        const writable = await create.apply(this, args);
+        if (this.name === name) {
+            const close = writable.close.bind(writable);
+            writable.close = async () => { const r = await close(); window.__stampWriteDone = true; return r; };
+        }
+        return writable;
+    };
+    const get = FileSystemFileHandle.prototype.getFile;
+    FileSystemFileHandle.prototype.getFile = function (...args) {
+        if (this.name === name && window.__stampWriteDone && !window.__stampReadHeld) {
+            window.__stampReadHeld = true;
+            return new Promise(resolve => {
+                window.__releaseStampRead = () => resolve(get.apply(this, args));
+            });
+        }
+        return get.apply(this, args);
+    };
+}, fileName);
+
 /** Copies a folder from the page's "disk" to a real directory, so other tools can be pointed at it. */
 async function exportFolder(page, folder, sub, targetDir) {
     const files = await page.evaluate(async ([name, path]) => {
@@ -220,6 +318,14 @@ const noErrors = page => page.logs.filter(l =>
     && !l.includes("GPU stall")
 ).length === 0;
 
+/** Writes a full project layout (files by project-relative path) the picker will hand back. */
+async function seedScriptProject(page, files) {
+  await seed(page, "ScriptParent", {
+    "scenario.meta.json": JSON.stringify({ id: "script-parent", name: "ScriptParent", version: 1, createdAt: "2026-11-12T00:00:00Z" }),
+    ...files,
+  });
+}
+
 /** From the start screen: open the (empty) folder the picker returns and accept the set-up. */
 async function openEmptyProject(page) {
     await page.getByText("Open folder…").click();
@@ -240,6 +346,1282 @@ const sceneWith = name => JSON.stringify({
 // ═══ Scenarios ═══
 const scenarios = [];
 const scenario = (name, fn) => scenarios.push([name, fn]);
+
+// C4 phase 2: the script runtime. A project whose saved scene names a component
+// script opens with that component attached: the scripts are compiled and linked
+// before the scene is read, exactly as a reload on the platform runs them. The
+// engine is resolved through the runtime's Blob-URL shim, so the script and the editor
+// share one TypeRegistry — a class a script exports reaches the scene the editor
+// deserializes.
+const ROTATOR = `import { ScriptableBehaviour, Serializable, SerializedField, Time } from "WebEngineTS";
+
+@Serializable({ typeName: "Rotator" })
+export default class Rotator extends ScriptableBehaviour {
+    @SerializedField() public speed = 1;
+
+    protected override update(): void {
+        this.transform.position.x += this.speed * Time.deltaTime;
+    }
+}
+`;
+const SCENARIO_ENTRY = `import { ScenarioBehaviour, SceneSerializer } from "WebEngineTS";
+
+const SCENE = "scenes/main.scene.json";
+
+export default class Scenario extends ScenarioBehaviour {
+    override async awake(): Promise<void> {
+        const blob = await this.context.assets.getAsset(SCENE);
+        SceneSerializer.deserializeScene(JSON.parse(await blob.text()));
+    }
+}
+`;
+
+scenario("a component script loads, attaches to its object, and swaps on save", async () => {
+  const page = await newPage("ScriptParent");
+  const scene = {
+    name: "Main", version: 1,
+    roots: [{
+      name: "Spinner", active: true,
+      transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+      components: [{ type: "Rotator", fields: { speed: 3 } }],
+      children: [],
+    }],
+  };
+  await seed(page, "ScriptParent", {
+    "scenario.meta.json": JSON.stringify({ id: "script-parent", name: "ScriptParent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Rotator.ts": ROTATOR,
+    "assets/scenes/main.scene.json": JSON.stringify(scene),
+  });
+
+  // Open through the picker, like any existing project: the picker is faked to
+  // OPFS by `instrument`, so this reads the files just seeded.
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  // The scripts load before the scene, so the object's component is a real
+  // component by the time the hierarchy shows it.
+  await page.waitForFunction(
+    () => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false,
+    null, { timeout: 30000 },
+  );
+
+  check("the scene opened with the object the script drives",
+    (await page.locator("app-hierarchy").innerText()).includes("Spinner"));
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(400);
+  const body = () => page.locator(".insp-body").innerText();
+  check("the component is attached, not a placeholder",
+    (await body()).includes("Rotator"), (await body()).slice(0, 160));
+  const fieldValues = () => page.locator(".insp-body .field input")
+    .evaluateAll(els => els.map(e => e.value));
+  check("and its saved field is shown",
+    (await fieldValues()).includes("3"), JSON.stringify(await fieldValues()));
+
+  // Open the script, change the default, save — the class is swapped.
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: "Rotator.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  check("the Code tab opened on the script", (await page.locator(".code-name").innerText()).includes("Rotator.ts"));
+
+  // Pasted, not typed: Monaco's auto-closing brackets rewrite a typed source,
+  // and the file on disk would no longer be the text the author meant.
+  const context = page.context();
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  const edited = ROTATOR.replace("public speed = 1;", "public speed = 5;");
+  await page.evaluate(text => navigator.clipboard.writeText(text), edited);
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(700);
+  await page.locator(".pane-btn.primary").click();
+  await page.waitForTimeout(2500);
+  const onDisk = await readDisk(page, "ScriptParent", "scripts/components/Rotator.ts");
+  check("the file on disk holds the new default", onDisk.includes("public speed = 5"));
+  check("the typed file is what was typed", JSON.stringify(onDisk).indexOf("public speed = 5;") > 0 && !onDisk.includes("speed = 1;"), JSON.stringify(onDisk).slice(0, 400));
+  check("the workspace is still open after the swap", (await page.locator(".work").count()) === 1);
+  check("the object is still there", (await page.locator("app-hierarchy").innerText()).includes("Spinner"));
+
+  // DW-2.2: a fresh object of the same script sees the new default. The class
+  // was replaced, not re-registered.
+  // The engine canvas, not Monaco's own (the Code tab is open by now).
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().click();
+  await page.waitForTimeout(300);
+  await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+  await page.waitForTimeout(500);
+  await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+  await page.waitForTimeout(600);
+  const added = () => page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  check("a new object gets the script's new default",
+    (await added()).includes("5"), JSON.stringify(await added()));
+
+  // The engine's own advisory about the refused duplicate registration is what
+  // a reload swap looks like from its side: `register` refuses the second
+  // class, and the editor answers with `TypeRegistry.replace` — which is what
+  // the message asks for. Everything else in the console must be quiet.
+  const swapError = "[TypeRegistry] Type name \"Rotator\" is already registered to a different class";
+  check("nothing but the swap advisory in the console",
+    page.logs.filter(l => !l.includes("404") && !l.includes(swapError)).length === 0,
+    page.logs.join(" | "));
+  await shot(page, "e2e-script-runtime");
+});
+
+// C4 DW-2.3: a scene saved with a scripted component reloads into the same
+// class after a full editor reload. Nothing about the script runtime is cached
+// across sessions: the page starts empty, the scripts are compiled and linked
+// again (fresh blob URLs), and the saved field value comes back with them.
+scenario("a saved scripted component survives a full editor reload (DW-2.3)", async () => {
+  const page = await newPage("ReloadParent");
+  await seed(page, "ReloadParent", {
+    "scenario.meta.json": JSON.stringify({ id: "reload-parent", name: "ReloadParent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Rotator.ts": ROTATOR,
+    "assets/scenes/main.scene.json": JSON.stringify({
+      name: "Main", version: 1,
+      roots: [{
+        name: "Spinner", active: true,
+        transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+        components: [{ type: "Rotator", fields: { speed: 3 } }],
+        children: [],
+      }],
+    }),
+  });
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(() => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false, null, { timeout: 30000 });
+
+  // Set a saved field value through the inspector and save the scene.
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(400);
+  const speedInput = page.locator(".insp-body .comp", { hasText: "Rotator" }).first()
+    .locator(".field", { hasText: "speed" }).locator("input").first();
+  await speedInput.fill("6");
+  await speedInput.blur();
+  await page.waitForTimeout(300);
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(800);
+  const savedScene = JSON.parse(await readDisk(page, "ReloadParent", "assets/scenes/main.scene.json"));
+  const savedComp = savedScene.roots[0].components.find(c => c.type === "Rotator");
+  check("the scene was saved with the class name and the edited field",
+    savedComp && savedComp.fields.speed === 6, JSON.stringify(savedScene.roots[0].components));
+
+  // A full reload: OPFS keeps the files, the page keeps nothing else. A saved
+  // scene leaves quietly — no "leave this page?" prompt.
+  const askedBefore = page.beforeUnloads;
+  await page.reload({ waitUntil: "load" });
+  check("a saved scene lets the reload go quietly", page.beforeUnloads === askedBefore);
+  await page.locator(".recent").first().click();
+  await page.waitForFunction(() => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false, null, { timeout: 30000 });
+
+  // The component is the real class again, not a Missing script placeholder,
+  // and the value the author saved is what the inspector shows.
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(500);
+  const body = () => page.locator(".insp-body").innerText();
+  check("after the reload the component is the real class", (await body()).includes("Rotator"), (await body()).slice(0, 160));
+  check("and not a Missing script placeholder", !(await body()).includes("Missing script"), (await body()).slice(0, 160));
+  const fieldValues = () => page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  check("the saved field value survived the reload", (await fieldValues()).includes("6"), JSON.stringify(await fieldValues()));
+
+  // The runtime was built fresh: edit the script, save, and the swap still
+  // works — which it could not if a stale blob URL or class had been cached.
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: "Rotator.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(text => navigator.clipboard.writeText(text), ROTATOR.replace("public speed = 1;", "public speed = 5;"));
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(700);
+  await page.locator(".pane-btn.primary").click();
+  await page.waitForTimeout(2500);
+  check("the edited script is on disk after the reload",
+    (await readDisk(page, "ReloadParent", "scripts/components/Rotator.ts")).includes("public speed = 5;"));
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().click();
+  await page.waitForTimeout(300);
+  await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+  await page.waitForTimeout(500);
+  await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+  await page.waitForTimeout(600);
+  check("a new object gets the freshly compiled class's new default",
+    (await fieldValues()).includes("5"), JSON.stringify(await fieldValues()));
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(400);
+  check("the saved object kept its saved value through the swap",
+    (await fieldValues()).includes("6"), JSON.stringify(await fieldValues()));
+
+  // One swap advisory is the engine's side of a reload swap (as in the phase-2
+  // scenario); the fresh compile after the page reload must add nothing.
+  const swapError = "[TypeRegistry] Type name \"Rotator\" is already registered to a different class";
+  check("nothing but the swap advisory in the console",
+    page.logs.filter(l => !l.includes("404") && !l.includes(swapError)).length === 0,
+    page.logs.join(" | "));
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  await shot(page, "e2e-script-reload");
+});
+
+// C4 phase 3: a script that does not compile never breaks the scene, says so in
+// the Console with the line, and its class stays loaded; a component whose class
+// is missing says that, with the data it kept.
+const BROKEN_ROTATOR = `import { ScriptableBehaviour, Serializable } from "WebEngineTS";
+
+@Serializable({ typeName: "Rotator" })
+export default class Rotator extends ScriptableBehaviour {
+    public speed = 1;
+
+    protected override update(): void {
+        this.transform.position.x += this.speed * Time.deltaTime)   // ) is one too many
+    }
+}
+`;
+const GOOD_ROTATOR = `import { ScriptableBehaviour, Serializable, SerializedField } from "WebEngineTS";
+
+@Serializable({ typeName: "Rotator" })
+export default class Rotator extends ScriptableBehaviour {
+    @SerializedField() public speed = 2;
+}
+`;
+
+scenario("a broken script keeps its class, points at its line, and the scene is intact", async () => {
+  const page = await newPage("BrokenParent");
+  await seed(page, "BrokenParent", {
+    "scenario.meta.json": JSON.stringify({ id: "broken", name: "BrokenParent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": "export {};\n",
+    "scripts/components/Rotator.ts": GOOD_ROTATOR,
+    "assets/scenes/main.scene.json": JSON.stringify({
+      name: "Main", version: 1,
+      roots: [{
+        name: "Spinner", active: true,
+        transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+        components: [{ type: "Rotator", fields: { speed: 4 } }],
+        children: [],
+      }],
+    }),
+  });
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(() => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false, null, { timeout: 30000 });
+  const sceneBefore = await readDisk(page, "BrokenParent", "assets/scenes/main.scene.json");
+
+  // Break the script through the editor, and save.
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: "Rotator.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(text => navigator.clipboard.writeText(text), BROKEN_ROTATOR);
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(600);
+  await page.locator(".pane-btn.primary").click();
+  await page.waitForTimeout(2500);
+
+  // The Console names the line, and the row is a jump target.
+  await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+  await page.waitForTimeout(400);
+  const consoleText = await page.locator(".cons-list").innerText();
+  check("the Console names the file and the line", /Rotator\.ts:\d+/.test(consoleText), consoleText.slice(0, 240));
+  check("and the row is clickable", (await page.locator(".log .src.jump").count()) > 0);
+
+  // The component survived the broken save: the class stays loaded, and the
+  // object keeps it and its saved value — select it again, as the author would.
+  await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+  await page.waitForTimeout(500);
+  const body = () => page.locator(".insp-body").innerText();
+  check("the component is still there", (await body()).includes("Rotator"), (await body()).slice(0, 160));
+  check("with its saved value", (await page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value))).includes("4"));
+  check("the scene file is untouched", (await readDisk(page, "BrokenParent", "assets/scenes/main.scene.json")) === sceneBefore);
+
+  // Clicking the row opens the file at that line.
+  await page.locator(".log .src.jump").first().click();
+  await page.waitForTimeout(900);
+  check("the click opened the script", (await page.locator(".code-name").innerText()).includes("Rotator.ts"));
+  check("the file on disk is the broken one",
+    (await readDisk(page, "BrokenParent", "scripts/components/Rotator.ts")).includes("is one too many"));
+  await shot(page, "e2e-script-broken");
+});
+
+scenario("a component whose class is gone says Missing script and keeps its data", async () => {
+  const page = await newPage("MissingParent");
+  await seed(page, "MissingParent", {
+    "scenario.meta.json": JSON.stringify({ id: "missing", name: "MissingParent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": "export {};\n",
+    "assets/scenes/main.scene.json": JSON.stringify({
+      name: "Main", version: 1,
+      roots: [{
+        name: "Holder", active: true,
+        transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+        components: [{ type: "Rotator", fields: { speed: 7, name: "kept" } }],
+        children: [],
+      }],
+    }),
+  });
+
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(() => document.querySelector("app-hierarchy")?.innerText?.includes("Holder") ?? false, null, { timeout: 30000 });
+  await page.locator("app-hierarchy li", { hasText: "Holder" }).first().click();
+  await page.waitForTimeout(500);
+
+  const body = () => page.locator(".insp-body").innerText();
+  check("the title names the class the scene used", (await body()).includes("Rotator"), (await body()).slice(0, 200));
+  check("and it is marked as a missing script", (await body()).includes("Missing script"));
+  const rows = await page.locator(".missing-fields th, .missing-fields td").allInnerTexts();
+  check("the saved fields are shown read-only",
+    rows.join(" ").includes("speed") && rows.join(" ").includes("7"), rows.join(" | "));
+  // The Transform is hand-rolled and is not the script: only an app-component-section counts.
+  const editable = await page.locator("app-component-section .field input").count();
+  check("and nothing is editable", editable === 0, String(editable));
+
+  // Saving does not lose the data: the engine writes a placeholder back exactly
+  // as it read it, so the scene keeps the component and its fields.
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(900);
+  const after = await readDisk(page, "MissingParent", "assets/scenes/main.scene.json");
+  check("the saved scene keeps the component and its fields",
+    after.includes("Rotator") && after.includes("speed") && after.includes("kept"), after.slice(0, 240));
+  await shot(page, "e2e-missing-script");
+});
+
+// C4 phase 4 (D5): the library. "Add component → Library" offers ten shipped
+// behaviours; adding one copies its source into scripts/library/<Name>.ts — a
+// permanent project file — reloads the script runtime, and attaches the class
+// to the selection, which survives the scene rebuild the reload performs.
+const LIBRARY_NAMES = [
+    "Rotator", "Mover", "Clickable", "ToggleVisibility", "ShowTextOnClick",
+    "QuizQuestion", "Timer", "FollowPath", "LookAtCamera", "PlayAnimation",
+];
+
+/** Seeds a project with one bare object and opens it; returns the page. */
+async function openLibraryProject(page, folder) {
+    await seed(page, folder, {
+        "scenario.meta.json": JSON.stringify({ id: folder.toLowerCase(), name: folder, version: "1.0.0" }, null, 2) + "\n",
+        "scripts/Scenario.ts": SCENARIO_ENTRY,
+        "assets/scenes/main.scene.json": sceneWith("Spinner"),
+    });
+    await page.getByText("Open folder…").click();
+    await page.waitForFunction(
+        () => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false,
+        null, { timeout: 30000 },
+    );
+    await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+    await page.waitForTimeout(400);
+}
+
+/** Opens the add menu, clicks a Library entry, waits for the attach to land. */
+async function addFromLibrary(page, name) {
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: name }).first().click();
+    await page.waitForFunction(
+        n => document.querySelector(".insp-body")?.innerText?.includes(n) ?? false,
+        name, { timeout: 30000 },
+    );
+    await page.waitForTimeout(300);
+}
+
+scenario("library: add Rotator, edit its speed, and the object rotates in play (DW-4.1)", async () => {
+    const page = await newPage("LibraryParent", { probe: true });
+    await openLibraryProject(page, "LibraryParent");
+
+    // The Library section offers all ten, once each, under its own header.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    const menuText = await page.locator(".add-list").innerText();
+    check("the Library section is there", /library/i.test(menuText), menuText.slice(0, 200));
+    const offered = await page.locator(".add-list li").allInnerTexts();
+    check("all ten behaviours are offered",
+        LIBRARY_NAMES.every(n => offered.filter(t => t.trim() === n).length === 1), offered.join(","));
+    await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+    await page.waitForFunction(
+        () => document.querySelector(".insp-body")?.innerText?.includes("Rotator") ?? false,
+        null, { timeout: 30000 },
+    );
+    await page.waitForTimeout(300);
+
+    // The source landed as a permanent project file, and the selection survived
+    // the rebuild the reload performed (the probe only reads selected objects).
+    const source = await readDisk(page, "LibraryParent", "scripts/library/Rotator.ts");
+    check("the source was copied to scripts/library/Rotator.ts",
+        source !== null && source.includes('@Serializable({ typeName: "Rotator" })') && source.includes("public speed = 90"),
+        String(source).slice(0, 200));
+    check("the object is still selected after the reload",
+        (await page.evaluate(() => window.__wetsProbe.transformOf("Spinner"))) !== null);
+
+    // speed is inspector-editable: change it, and it persists through a save.
+    const speedInput = page.locator(".insp-body .comp", { hasText: "Rotator" }).first()
+        .locator(".field", { hasText: "speed" }).locator("input").first();
+    check("speed shows the shipped default", (await speedInput.inputValue()) === "90", await speedInput.inputValue());
+    await speedInput.fill("180");
+    await speedInput.blur();
+    await page.waitForTimeout(300);
+    check("speed is editable", (await speedInput.inputValue()) === "180", await speedInput.inputValue());
+
+    // Play: the object really rotates, at the edited speed. Stop restores.
+    const eulerBefore = await page.evaluate(() => window.__wetsProbe.transformOf("Spinner").euler);
+    await page.locator(".tb-btn[title='Play']").click();
+    await page.waitForFunction(
+        () => Math.abs(window.__wetsProbe.transformOf("Spinner")?.euler.y ?? 0) > 5,
+        null, { timeout: 10000 },
+    );
+    const eulerDuring = await page.evaluate(() => window.__wetsProbe.transformOf("Spinner").euler);
+    check("the object rotates in play", Math.abs(eulerDuring.y - eulerBefore.y) > 5,
+        JSON.stringify({ before: eulerBefore, during: eulerDuring }));
+    await page.locator(".tb-btn[title='Stop']").click();
+    await page.waitForTimeout(500);
+    // Stop clears the selection and restores the snapshot: re-select to read.
+    await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+    await page.waitForTimeout(300);
+    const eulerAfter = await page.evaluate(() => window.__wetsProbe.transformOf("Spinner")?.euler ?? null);
+    check("stop restores the pre-play pose", eulerAfter !== null && Math.abs(eulerAfter.y) < 0.01,
+        JSON.stringify(eulerAfter));
+
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(800);
+    const saved = JSON.parse(await readDisk(page, "LibraryParent", "assets/scenes/main.scene.json"));
+    const comp = saved.roots[0].components.find(c => c.type === "Rotator");
+    check("the saved scene holds Rotator with the edited speed", comp && comp.fields.speed === 180,
+        JSON.stringify(saved.roots[0].components));
+    await shot(page, "e2e-library-rotator");
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("library: second and third adds keep working, nothing offered twice (DW-4.3)", async () => {
+    const page = await newPage("LibraryAgain", { probe: true });
+    await openLibraryProject(page, "LibraryAgain");
+
+    for (const name of ["Rotator", "Mover", "Timer"]) {
+        await addFromLibrary(page, name);
+        const source = await readDisk(page, "LibraryAgain", `scripts/library/${name}.ts`);
+        check(`${name}: the source is on disk`, source !== null && source.includes(`typeName: "${name}"`), String(source).slice(0, 120));
+        check(`${name}: attached to the still-selected object`,
+            (await page.evaluate(() => window.__wetsProbe.transformOf("Spinner"))) !== null);
+    }
+    const body = await page.locator(".insp-body").innerText();
+    check("all three components are on the object",
+        ["Rotator", "Mover", "Timer"].every(n => body.includes(n)), body.slice(0, 300));
+
+    // Installed entries leave the Library section and appear once, in Scripts.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    let items = await page.locator(".add-list li").allInnerTexts();
+    for (const name of ["Rotator", "Mover", "Timer"]) {
+        check(`${name} is offered exactly once now`, items.filter(t => t.trim() === name).length === 1, items.join(","));
+    }
+    const libHead = items.findIndex(t => t.trim().toUpperCase() === "LIBRARY");
+    check("the Library section offers only the seven left",
+        LIBRARY_NAMES.filter(n => !["Rotator", "Mover", "Timer"].includes(n)).every(n => items.includes(n))
+        && libHead >= 0 && !items.slice(libHead + 1).some(t => ["Rotator", "Mover", "Timer"].includes(t.trim())),
+        items.join(","));
+    // The filter narrows both sections without duplicating an entry.
+    await page.locator(".add-menu input").fill("rot");
+    await page.waitForTimeout(300);
+    items = await page.locator(".add-list li").allInnerTexts();
+    check("filtering shows Rotator once, from Scripts", items.filter(t => t.trim() === "Rotator").length === 1, items.join(","));
+    await page.locator(".add-menu .cancel").click();
+
+    // An installed behaviour attaches again through Scripts — no reload, no
+    // second registration, and the console stays quiet throughout.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill(""); // cancel kept the filter
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: "Mover" }).first().click();
+    await page.waitForTimeout(600);
+    const movers = await page.locator(".insp-body .comp", { hasText: "Mover" }).count();
+    check("a second Mover attaches from Scripts", movers === 2, String(movers));
+    check("no page errors, no duplicate-registration advisory", noErrors(page), page.logs.join(" | "));
+    await shot(page, "e2e-library-repeat");
+});
+
+// C4r5, blocker 1: an add whose target is deleted while the library file is
+// still being written must abort — no attach to the destroyed object, no
+// history entry, no selection change — and the written file stays.
+scenario("library: deleting the target mid-add aborts cleanly, first undo restores it (C4r5)", async () => {
+    const page = await newPage("LibraryMidflight", { probe: true });
+    await openLibraryProject(page, "LibraryMidflight");
+    await slowLibraryWrite(page, "LookAtCamera.ts", 1500);
+
+    // Start the add, then delete the target while the file write is in flight.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await page.waitForFunction(() => window.__libWriteClosing === true, null, { timeout: 15000 });
+    await page.keyboard.press("Delete");
+    await page.waitForFunction(
+        () => !(document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false),
+        null, { timeout: 5000 },
+    );
+
+    // Let the write land and the reload/rebuild/attach attempt run its course.
+    await page.waitForFunction(() => window.__wetsProbe.scriptClass("LookAtCamera") !== null, null, { timeout: 30000 });
+    await page.waitForTimeout(1000);
+
+    const src = await readDisk(page, "LibraryMidflight", "scripts/library/LookAtCamera.ts");
+    check("the written library file stays", src !== null && src.includes('typeName: "LookAtCamera"'), String(src).slice(0, 120));
+    const tree = await page.locator("app-hierarchy li .label").allInnerTexts();
+    check("no ghost object in the hierarchy", !tree.includes("Spinner"), tree.join(","));
+    const sel = await page.evaluate(() => window.__wetsProbe.selection());
+    check("the destroyed object is not selected", sel.length === 0, JSON.stringify(sel));
+    const comps = await page.locator(".insp-body .comp", { hasText: "LookAtCamera" }).count();
+    check("no inspector component for the destroyed object", comps === 0, String(comps));
+
+    // The delete must be the FIRST undo step: no 'Add LookAtCamera' on top of it.
+    await page.keyboard.press("Control+z");
+    await page.waitForFunction(
+        () => document.querySelector("app-hierarchy")?.innerText?.includes("Spinner") ?? false,
+        null, { timeout: 5000 },
+    );
+    check("Ctrl+Z restores the deleted object as the first undo step", true);
+
+    await page.locator("app-hierarchy li", { hasText: "Spinner" }).first().click();
+    await page.waitForTimeout(300);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(800);
+    const saved = JSON.parse(await readDisk(page, "LibraryMidflight", "assets/scenes/main.scene.json"));
+    check("the saved scene is clean: Spinner back, no LookAtCamera",
+        saved.roots.length === 1 && saved.roots[0].name === "Spinner" && saved.roots[0].components.length === 0,
+        JSON.stringify(saved.roots).slice(0, 240));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4r5, blocker 2a: a stale library file whose class never registered (here a
+// zero-byte leftover) must not hide the entry — the Library still offers it,
+// and adding heals the file. A healthy installed file is never overwritten.
+scenario("library: a stale empty file stays offered and the add heals it (C4r5)", async () => {
+    const page = await newPage("LibraryStale", { probe: true });
+    const customRotator = `import { ScriptableBehaviour, Serializable, SerializedField } from "WebEngineTS";
+// user-edited: keep me
+@Serializable({ typeName: "Rotator" })
+export default class Rotator extends ScriptableBehaviour {
+    @SerializedField() public speed = 45;
+}
+`;
+    await seed(page, "LibraryStale", {
+        "scripts/library/LookAtCamera.ts": "",
+        "scripts/library/Rotator.ts": customRotator,
+    });
+    await openLibraryProject(page, "LibraryStale");
+
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill("lookat");
+    await page.waitForTimeout(300);
+    const items = await page.locator(".add-list li").allInnerTexts();
+    check("the stale entry is still offered", items.filter(t => t.trim() === "LookAtCamera").length === 1, items.join(","));
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await page.waitForFunction(
+        () => document.querySelector(".insp-body")?.innerText?.includes("LookAtCamera") ?? false,
+        null, { timeout: 30000 },
+    );
+    await page.waitForTimeout(300);
+    const healed = await readDisk(page, "LibraryStale", "scripts/library/LookAtCamera.ts");
+    check("the add heals the empty file", healed !== null && healed.includes('typeName: "LookAtCamera"'), String(healed).slice(0, 120));
+    check("the object is still selected", (await page.evaluate(() => window.__wetsProbe.transformOf("Spinner"))) !== null);
+
+    // The author's own Rotator attaches through Scripts and is never rewritten.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill("rotator");
+    await page.waitForTimeout(300);
+    const rotItems = await page.locator(".add-list li").allInnerTexts();
+    check("the healthy installed file is offered once, from Scripts",
+        rotItems.filter(t => t.trim() === "Rotator").length === 1, rotItems.join(","));
+    await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+    await page.waitForFunction(
+        () => document.querySelector(".insp-body")?.innerText?.includes("Rotator") ?? false,
+        null, { timeout: 30000 },
+    );
+    const kept = await readDisk(page, "LibraryStale", "scripts/library/Rotator.ts");
+    check("the author's non-empty library file is never overwritten", kept === customRotator, String(kept).slice(0, 160));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4r5, blocker 2b: a write that fails mid-add leaves a zero-byte file behind
+// (the handle is created before the writable). The catch must remove that
+// partial — it was created by this add and is empty — keep the error dialog,
+// and the next add must succeed.
+scenario("library: a failed write removes its own partial file, the retry heals (C4r5)", async () => {
+    const page = await newPage("LibraryFailed", { probe: true });
+    await openLibraryProject(page, "LibraryFailed");
+    await failNextWrite(page, "LookAtCamera.ts");
+
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await dialogTitle(page).waitFor({ timeout: 15000 });
+    check("the failure is shown in the error dialog",
+        (await dialogTitle(page).innerText()) === "Something went wrong"
+        && (await page.locator(".dlg-msg").last().innerText()).includes("disk full"),
+        await page.locator(".dlg-msg").last().innerText());
+    await dialogButton(page, "OK").click();
+    await page.waitForTimeout(300);
+
+    const state = await diskState(page, "LibraryFailed");
+    check("the partial file this add created is removed", !state.includes("scripts/library/LookAtCamera.ts"), state.join(","));
+
+    // The entry is offered again and the retry (the write no longer fails) heals.
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill("lookat");
+    await page.waitForTimeout(300);
+    const items = await page.locator(".add-list li").allInnerTexts();
+    check("the entry is offered again after the failure", items.filter(t => t.trim() === "LookAtCamera").length === 1, items.join(","));
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await page.waitForFunction(
+        () => document.querySelector(".insp-body")?.innerText?.includes("LookAtCamera") ?? false,
+        null, { timeout: 30000 },
+    );
+    const healed = await readDisk(page, "LibraryFailed", "scripts/library/LookAtCamera.ts");
+    check("the retry writes the source and attaches", healed !== null && healed.includes('typeName: "LookAtCamera"'), String(healed).slice(0, 120));
+    // The one expected failure log is the dialog's own console.error; nothing else.
+    const expected = page.logs.filter(l => l.includes("e2e: disk full"));
+    const unexpected = page.logs.filter(l => !l.includes("e2e: disk full") && !l.includes("404") && !l.includes("GL Driver Message") && !l.includes("GPU stall"));
+    check("the failure is logged exactly once, nothing else errors",
+        expected.length === 1 && unexpected.length === 0, page.logs.join(" | "));
+});
+
+// C4r5, blocker 2b guard: the catch must never delete a file the add did not
+// create — the author's own non-empty script survives a failed write.
+scenario("library: a failed write never deletes the author's existing file (C4r5)", async () => {
+    const page = await newPage("LibraryOwned", { probe: true });
+    const owned = `// the author's own draft — not a behaviour yet\nexport const draft = true;\n`;
+    await seed(page, "LibraryOwned", { "scripts/library/LookAtCamera.ts": owned });
+    await openLibraryProject(page, "LibraryOwned");
+    await failNextWrite(page, "LookAtCamera.ts");
+
+    await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+    await page.waitForTimeout(300);
+    await page.locator(".add-menu input").fill("lookat");
+    await page.waitForTimeout(300);
+    await page.locator(".add-list li", { hasText: "LookAtCamera" }).first().click();
+    await dialogTitle(page).waitFor({ timeout: 15000 });
+    await dialogButton(page, "OK").click();
+    await page.waitForTimeout(300);
+    const kept = await readDisk(page, "LibraryOwned", "scripts/library/LookAtCamera.ts");
+    check("the author's existing file survives the failed write", kept === owned, String(kept));
+});
+
+// C4r4, F1+F2: every form of the engine import resolves. The clause-level
+// rewrite this replaces spanned statements — a sibling import first, or a
+// comment mentioning the word `import`, turned the engine's import into
+// `from undefined`, which is a SyntaxError, so the module never loaded and the
+// component showed as missing; a default import read an undefined binding, and
+// `export *`, `export { X } from` and a dynamic `import()` never bound at all.
+// The rewrite is now the engine's own token regex pointed at one shim module,
+// so the browser resolves each form. One marker per form is read at module
+// evaluation: a broken form shows as a false, or as a class that never
+// registers.
+const IMPORT_SIBLING = `export class Stats { public value = 42; }
+`;
+const IMPORT_STAR = `export * from "WebEngineTS";
+`;
+const IMPORT_REEXPORT = `export { ScriptableBehaviour as SB } from "WebEngineTS";
+`;
+const IMPORT_FORMS = `import { Stats } from "./sibling";
+// import order matters — a comment that mentions the word import
+import WebEngine, { Vector3, Serializable, SerializedField } from "WebEngineTS";
+import * as Engine from "WebEngineTS";
+import { SceneManager } from "./star";
+import { SB } from "./reexport";
+
+// Each entry is one import form, evaluated at module load: a form that does not
+// bind (or a syntax error the broken rewrite produced) shows up here, and the
+// class below never registers when the module itself fails.
+const dynamic = await import("WebEngineTS");
+const MARKERS = [
+    WebEngine !== undefined,                                     // default import
+    typeof Vector3 === "function",                                // named import
+    Engine !== undefined && Engine.GameObject !== undefined,      // namespace import
+    typeof Stats === "function",                                  // sibling import first
+    SceneManager !== undefined,                                   // export * via a module
+    typeof SB === "function",                                     // export { X } from
+    dynamic.GameObject !== undefined,                             // dynamic import()
+].join(",");
+
+@Serializable({ typeName: "Forms" })
+export default class Forms extends SB {
+    @SerializedField() public markers = MARKERS;
+}
+`;
+scenario("every form of the engine import resolves — sibling first, default, namespace, star, dynamic", async () => {
+  const page = await newPage("ImportForms", { probe: true });
+  const scene = {
+    name: "Main", version: 1,
+    roots: [{
+      name: "Form", active: true,
+      transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+      components: [{ type: "Forms", fields: {} }],
+      children: [],
+    }],
+  };
+  await seed(page, "ImportForms", {
+    "scenario.meta.json": JSON.stringify({ id: "forms", name: "ImportForms", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/sibling.ts": IMPORT_SIBLING,
+    "scripts/components/star.ts": IMPORT_STAR,
+    "scripts/components/reexport.ts": IMPORT_REEXPORT,
+    "scripts/components/Forms.ts": IMPORT_FORMS,
+    "assets/scenes/main.scene.json": JSON.stringify(scene),
+  });
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(
+    () => document.querySelector("app-hierarchy")?.innerText?.includes("Form") ?? false,
+    null, { timeout: 30000 },
+  );
+
+  // A module that failed to evaluate cannot register: the component would read
+  // "Missing script", exactly the old `from undefined` produced.
+  await page.locator("app-hierarchy li", { hasText: "Form" }).first().click();
+  await page.waitForTimeout(500);
+  const body = () => page.locator(".insp-body").innerText();
+  check("the class from the module that uses every form is attached",
+    (await body()).includes("Forms") && !(await body()).includes("Missing script"),
+    (await body()).slice(0, 200));
+  check("the class is in the registry", await page.evaluate(() => window.__wetsProbe.scriptClass("Forms") !== null));
+
+  // One marker per form, evaluated when the module ran.
+  const markers = await page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  const forms = (await markers.find(v => (v || "").includes(",")) ?? "").split(",");
+  check("the default import bound",
+    forms[0] === "true", JSON.stringify(forms));
+  check("a named import bound alongside it",
+    forms[1] === "true", JSON.stringify(forms));
+  check("the namespace import has the engine's exports",
+    forms[2] === "true", JSON.stringify(forms));
+  check("a sibling import before the engine's still made it in",
+    forms[3] === "true", JSON.stringify(forms));
+  check("a module that only does export * resolved",
+    forms[4] === "true", JSON.stringify(forms));
+  check("a module that re-exports a name resolved",
+    forms[5] === "true", JSON.stringify(forms));
+  check("a dynamic import() resolved",
+    forms[6] === "true", JSON.stringify(forms));
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+  await shot(page, "e2e-import-forms");
+});
+
+// C4r4, F3: editing a base module reaches the modules that import it, and F4:
+// a module whose code did not change is not evaluated again, so the class it
+// exports keeps its object identity. `Enemy` extends `BaseMover` — the probe
+// reports the class token of each, and of the parent `Enemy` extends. The proof
+// is in the identity: an importer left on the old base keeps the old parent
+// token, and a base evaluated twice mints a second class object that is not the
+// one the registry holds.
+const F3_BASE = `import { ScriptableBehaviour, Serializable, SerializedField } from "WebEngineTS";
+
+@Serializable({ typeName: "BaseMover" })
+export default class BaseMover extends ScriptableBehaviour {
+    @SerializedField() public speed = 1;
+    // MARK_STEP
+}
+`;
+const F3_ENEMY = `import { ScriptableBehaviour, Serializable, SerializedField } from "WebEngineTS";
+import BaseMover from "./Base";
+
+@Serializable({ typeName: "Enemy" })
+export default class Enemy extends BaseMover {
+    @SerializedField() public label = "idle";
+}
+`;
+const editScript = async (page, name, text) => {
+  // The first edit leaves the bottom pane on the Code tab; the Project panel is
+  // only mounted while its own tab is active, so the second edit must ask for it.
+  await page.locator(".pane-tab", { hasText: "Project" }).first().click();
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: name }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(t => navigator.clipboard.writeText(t), text);
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(600);
+  await page.locator(".pane-btn.primary").click();
+};
+scenario("editing a base module reaches its importer, and leaves the other class its identity", async () => {
+  const page = await newPage("F3Parent", { probe: true });
+  const scene = {
+    name: "Main", version: 1,
+    roots: [{
+      name: "Enemy1", active: true,
+      transform: { position: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0, z: 0, w: 1 }, scale: { x: 1, y: 1, z: 1 } },
+      components: [{ type: "Enemy", fields: {} }, { type: "BaseMover", fields: {} }],
+      children: [],
+    }],
+  };
+  await seed(page, "F3Parent", {
+    "scenario.meta.json": JSON.stringify({ id: "f3", name: "F3Parent", version: "1.0.0" }, null, 2) + "\n",
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Base.ts": F3_BASE,
+    "scripts/components/Enemy.ts": F3_ENEMY,
+    "assets/scenes/main.scene.json": JSON.stringify(scene),
+  });
+  await page.getByText("Open folder…").click();
+  await page.waitForFunction(
+    () => document.querySelector("app-hierarchy")?.innerText?.includes("Enemy1") ?? false,
+    null, { timeout: 30000 },
+  );
+  const classes = () => page.evaluate(() => ({
+    base: window.__wetsProbe.scriptClass("BaseMover"),
+    enemy: window.__wetsProbe.scriptClass("Enemy"),
+  }));
+
+  const first = await classes();
+  check("both classes registered", first.base !== null && first.enemy !== null, JSON.stringify(first));
+  check("Enemy extends BaseMover", first.enemy.parent === "BaseMover", first.enemy.parent);
+  check("and its parent is the very class the registry holds",
+    first.enemy.parentToken === first.base.token, `${first.enemy.parentToken} vs ${first.base.token}`);
+
+  // Edit the base module only. Its importers must be re-linked against the new
+  // class, so Enemy's parent token moves with it (F3).
+  await editScript(page, "Base.ts", F3_BASE.replace("// MARK_STEP", "// MARK_STEP2\n    public tag = \"v2\";"));
+  await page.waitForFunction(old => window.__wetsProbe.scriptClass("BaseMover")?.token !== old, first.base.token, { timeout: 20000 });
+  await page.waitForTimeout(800);                       // the importer is re-imported in the same pass
+  const second = await classes();
+  check("the base class was replaced",
+    second.base.token !== first.base.token, `${first.base.token} → ${second.base.token}`);
+  check("the importer was re-linked against the new base",
+    second.enemy.parentToken === second.base.token, `${second.enemy.parentToken} vs ${second.base.token}`);
+
+  // Edit the importer only. The base module is untouched, so the class it
+  // exported — the same object Enemy extends and the registry holds — stays
+  // (F4: no second evaluation of an unchanged dependency).
+  await editScript(page, "Enemy.ts", F3_ENEMY.replace('public label = "idle";', 'public label = "hunting";'));
+  await page.waitForFunction(old => window.__wetsProbe.scriptClass("Enemy")?.token !== old, second.enemy.token, { timeout: 20000 });
+  const third = await classes();
+  check("the importer was replaced",
+    third.enemy.token !== second.enemy.token, `${second.enemy.token} → ${third.enemy.token}`);
+  check("and the untouched base kept its class object",
+    third.base.token === second.base.token, `${second.base.token} → ${third.base.token}`);
+  check("the new importer extends that same class, not a second copy",
+    third.enemy.parentToken === third.base.token, `${third.enemy.parentToken} vs ${third.base.token}`);
+  check("the scene still holds the object",
+    (await page.locator("app-hierarchy").innerText()).includes("Enemy1"));
+  // Re-registering a class under a name the registry already holds is the swap
+  // itself: the engine's registry refuses the second constructor and the editor
+  // answers with `TypeRegistry.replace` — the same advisory the phase-2 scenario
+  // tolerates. Everything else in the console must be quiet.
+  const swap = "already registered to a different class";
+  check("nothing but the swap advisories in the console",
+    page.logs.filter(l => !l.includes(swap) && !l.includes("404") && !l.includes("GL Driver Message") && !l.includes("GPU stall")).length === 0,
+    page.logs.join(" | "));
+  await shot(page, "e2e-base-edit-reaches-importers");
+});
+
+// C4 phase 1: the Code tab. A script file is a file like any other — it opens
+// in the Code tab, types, saves back through the project store, and an edit of
+// a source never marks the scene unsaved (only its own file). Monaco's own
+// editor is what the tab renders, and the platform CSP allows its blob workers
+// (`worker-src 'self' blob:`).
+scenario("a script file opens in the Code tab, edits, and saves", async () => {
+  const page = await newPage("CodeParent");
+  await openEmptyProject(page);
+  await page.waitForTimeout(600);
+
+  // The layout already ships one script; open it from the Project panel —
+  // the panel shows the project root first, so `scripts` is opened like a
+  // folder click in the other scenarios.
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(600);
+  const script = page.locator(".proj .asset", { hasText: "Scenario.ts" }).first();
+  check("a script file is listed in the project panel", (await script.count()) === 1);
+  await script.dblclick();
+  await page.waitForTimeout(1500);
+
+  check("the Code tab opened", (await page.locator(".pane-tab", { hasText: "Code" }).first().getAttribute("class")).includes("active"));
+  check("the file's text is in the editor",
+    (await page.evaluate(() => document.querySelector(".code-name")?.textContent ?? "")) .includes("Scenario.ts"));
+  check("the scene is not marked unsaved by opening a source",
+    (await page.locator(".statusbar .accent").first().innerText()) !== "Unsaved");
+
+  // Type into Monaco and save. Monaco's textarea is the real input.
+  const before = await readDisk(page, "CodeParent", "scripts/Scenario.ts");
+  check("the file on disk is the one opened", before.includes("Scenario extends ScenarioBehaviour"), before.slice(0, 80));
+  // Monaco's own textarea takes the keys; focusing it is enough, and no click
+  // has to be stable for it.
+  await page.locator(".monaco-editor").waitFor({ timeout: 15000 });
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.type("\n// C4 phase 1: the Code tab saves\n");
+  await page.waitForTimeout(400);
+  check("editing marks the file unsaved", (await page.locator(".pane-tab .dot.unsaved").count()) > 0);
+  check("and the scene still is not", (await page.locator(".statusbar .accent").first().innerText()) !== "Unsaved");
+
+  await page.locator(".pane-btn.primary").click();                       // Save
+  await page.waitForTimeout(700);
+  check("saving clears the file's mark", (await page.locator(".pane-tab .dot.unsaved").count()) === 0);
+
+  const after = await readDisk(page, "CodeParent", "scripts/Scenario.ts");
+  check("the file on disk holds the edit", after.includes("C4 phase 1: the Code tab saves"), after.slice(0, 120));
+
+  // A reload reopens the project, and the file is what was saved.
+  await page.reload({ waitUntil: "load" });
+  await page.locator(".recent").first().click();
+  await page.locator(".work").waitFor();
+  await page.waitForTimeout(600);
+  check("the edited file is still there after a reload",
+    (await readDisk(page, "CodeParent", "scripts/Scenario.ts")).includes("C4 phase 1: the Code tab saves"));
+
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+  await shot(page, "e2e-code-tab");
+});
+
+// C4 phase 5: outside edits to scripts are seen on window focus — recompiled
+// quietly when the buffer is clean, asked about when it is dirty, and a save
+// over an outside-changed file asks before it overwrites. Same OPFS-write +
+// focus pattern as the scene's "changes made outside" scenario.
+scenario("an outside edit to a script recompiles on focus", async () => {
+  const page = await newPage("OutsideScript", { probe: true });
+  await seed(page, "OutsideScript", {
+    "scenario.meta.json": JSON.stringify({ id: "outside-script", name: "OutsideScript", version: 1 }),
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Rotator.ts": ROTATOR,
+    "assets/scenes/main.scene.json": sceneWith("Seeded"),
+  });
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  await page.waitForFunction(() => window.__wetsProbe.scriptClass("Rotator") !== null, null, { timeout: 30000 });
+  const token = await page.evaluate(() => window.__wetsProbe.scriptClass("Rotator").token);
+
+  // Changed on the "disk", the Code tab never opened it.
+  await seed(page, "OutsideScript", { "scripts/components/Rotator.ts": ROTATOR.replace("public speed = 1;", "public speed = 7;") });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  const swapped = await page.waitForFunction(old => window.__wetsProbe.scriptClass("Rotator")?.token !== old, token, { timeout: 30000 })
+    .then(() => true, () => false);
+  check("the outside edit recompiles the script", swapped);
+  check("no dialog was needed", (await page.locator(".dlg").count()) === 0);
+  // A fresh object of the class sees the disk's new default.
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().click();
+  await page.waitForTimeout(300);
+  await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+  await page.waitForTimeout(500);
+  await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+  await page.waitForTimeout(600);
+  const added = await page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  check("a new object gets the outside edit's default", added.includes("7"), JSON.stringify(added));
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  // The swap advisory is what a reload looks like from the engine's side —
+  // `register` refuses the second class and the editor answers with
+  // `TypeRegistry.replace`, exactly as in the save-and-swap scenario.
+  const swapError = "[TypeRegistry] Type name \"Rotator\" is already registered to a different class";
+  check("nothing but the swap advisory in the console",
+    page.logs.filter(l => !l.includes("404") && !l.includes(swapError)).length === 0,
+    page.logs.join(" | "));
+});
+
+scenario("an outside edit to an open dirty script asks; keep mine and reload both respected", async () => {
+  const page = await newPage("OutsideDirty");
+  await openEmptyProject(page);
+  await page.waitForTimeout(600);
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(600);
+  await page.locator(".proj .asset", { hasText: "Scenario.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  const original = await readDisk(page, "OutsideDirty", "scripts/Scenario.ts");
+  check("the Code tab is clean after opening", (await page.locator(".dot.unsaved").count()) === 0);
+
+  // Mine: an unsaved edit appended at the file's end (Monaco opens the cursor
+  // at 1:1, and the buffer read below looks at the end of the file).
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+End");
+  await page.keyboard.type("\n// mine\n");
+  await page.waitForTimeout(400);
+  check("the buffer is dirty", (await page.locator(".dot.unsaved").count()) > 0);
+
+  // Theirs: the file changes on disk underneath.
+  const diskText = original + "\n// from outside\n";
+  await seed(page, "OutsideDirty", { "scripts/Scenario.ts": diskText });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(800);
+  check("changed in both places, it asks", (await dialogTitle(page).innerText()) === "Scenario.ts changed on disk");
+  await dialogButton(page, "Keep mine").click();
+  await page.waitForTimeout(500);
+  // Monaco renders only the lines in view, and setValue scrolls back to the
+  // top — so go to the file's end first (where every marker here sits), then
+  // read. The view-lines carry non-breaking spaces and sit in DOM order, not
+  // line order; normalise both.
+  const buffer = async () => {
+    await page.locator(".monaco-editor textarea").focus();
+    await page.keyboard.press("Control+End");
+    await page.waitForTimeout(200);
+    return page.evaluate(() => [...document.querySelectorAll(".view-lines .view-line")]
+      .map(e => ({ top: e.offsetTop, text: e.textContent }))
+      .sort((a, b) => a.top - b.top).map(l => l.text).join("\n").replace(/\u00a0/g, " "));
+  };
+  check("keep mine keeps my buffer", (await buffer()).includes("// mine"));
+  check("and the disk still holds the outside edit", (await readDisk(page, "OutsideDirty", "scripts/Scenario.ts")) === diskText);
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(800);
+  check("the same change is not asked about again", (await page.locator(".dlg").count()) === 0);
+  check("the buffer is still mine and still dirty", (await buffer()).includes("// mine") && (await page.locator(".dot.unsaved").count()) > 0);
+
+  // A second outside change asks again; this time the disk version is taken.
+  const diskText2 = original + "\n// from outside again\n";
+  await seed(page, "OutsideDirty", { "scripts/Scenario.ts": diskText2 });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(800);
+  check("a new outside change asks again", (await page.locator(".dlg").count()) === 1);
+  await dialogButton(page, "Reload from disk").click();
+  await page.waitForTimeout(800);
+  check("reload takes the disk text into the buffer", (await buffer()).includes("// from outside again") && !(await buffer()).includes("// mine"));
+  check("the reloaded buffer is not marked unsaved", (await page.locator(".dot.unsaved").count()) === 0);
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("saving over an outside-changed script asks before it overwrites", async () => {
+  const page = await newPage("OutsideSave");
+  await openEmptyProject(page);
+  await page.waitForTimeout(600);
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(600);
+  await page.locator(".proj .asset", { hasText: "Scenario.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+  const original = await readDisk(page, "OutsideSave", "scripts/Scenario.ts");
+
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.type("\n// my save\n");
+  await page.waitForTimeout(400);
+  const diskText = original + "\n// from outside\n";
+  await seed(page, "OutsideSave", { "scripts/Scenario.ts": diskText });
+
+  // Ctrl+S is Monaco's own command, wired to the same save the button uses.
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(800);
+  check("saving over an outside change asks", (await dialogTitle(page).innerText()) === "Replace the changed file?");
+  await dialogButton(page, "Cancel").click();
+  await page.waitForTimeout(500);
+  check("cancel leaves the disk untouched", (await readDisk(page, "OutsideSave", "scripts/Scenario.ts")) === diskText);
+  check("and the buffer stays dirty", (await page.locator(".dot.unsaved").count()) > 0);
+
+  // Confirming replaces — with a say, never silently.
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(800);
+  check("it asks again while the file is still changed outside", (await page.locator(".dlg").count()) === 1);
+  await dialogButton(page, "Replace").click();
+  await page.waitForTimeout(800);
+  const saved = await readDisk(page, "OutsideSave", "scripts/Scenario.ts");
+  check("confirming writes my buffer", saved.includes("// my save") && !saved.includes("// from outside"), saved.slice(-120));
+  check("the mark is cleared", (await page.locator(".dot.unsaved").count()) === 0);
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4 review R4: two rapid saves of one dirty script must coalesce. The second
+// press lands inside the first save's write→stamp window (held there by the
+// seam), where an unguarded save sees the editor's own just-written file as an
+// outside change and asks to replace it — and two unguarded reloads revoke each
+// other's Blob URLs mid-import. One save, one reload, newest code registered.
+scenario("a double save coalesces: one reload, no spurious import error, no self-overwrite ask (C4 review R4)", async () => {
+  const page = await newPage("DoubleSave", { probe: true });
+  await seed(page, "DoubleSave", {
+    "scenario.meta.json": JSON.stringify({ id: "double-save", name: "DoubleSave", version: 1 }),
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "scripts/components/Rotator.ts": ROTATOR,
+    "assets/scenes/main.scene.json": sceneWith("Seeded"),
+  });
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  await page.waitForFunction(() => window.__wetsProbe.scriptClass("Rotator") !== null, null, { timeout: 30000 });
+  const token = await page.evaluate(() => window.__wetsProbe.scriptClass("Rotator").token);
+
+  await page.locator(".proj .folders .folder", { hasText: "scripts" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .folders .folder", { hasText: "components" }).first().click();
+  await page.waitForTimeout(400);
+  await page.locator(".proj .asset", { hasText: "Rotator.ts" }).first().dblclick();
+  await page.locator(".monaco-editor").waitFor({ timeout: 20000 });
+
+  // Pasted, not typed: Monaco's auto-closing brackets rewrite a typed source.
+  const context = page.context();
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await page.evaluate(text => navigator.clipboard.writeText(text), ROTATOR.replace("public speed = 1;", "public speed = 5;"));
+  await page.locator(".monaco-editor textarea").focus();
+  await page.keyboard.press("Control+a");
+  await page.keyboard.press("Control+v");
+  await page.waitForTimeout(700);
+  check("the buffer is dirty before the double save", (await page.locator(".dot.unsaved").count()) > 0);
+
+  // Hold the first save between its write and its stamp read, then press save
+  // again inside that window — the race, made deterministic.
+  await holdStampRead(page, "Rotator.ts");
+  await page.keyboard.press("Control+s");
+  await page.waitForFunction(() => window.__stampReadHeld === true, null, { timeout: 15000 });
+  await page.keyboard.press("Control+s");
+  await page.waitForTimeout(800);
+  const asks = await page.locator(".dlg").count();
+  check("the second save does not ask to replace the editor's own write",
+    asks === 0, asks ? await dialogTitle(page).innerText() : "");
+  // Unfixed: the ask is up; answer it so the rest of the race plays out and is
+  // recorded too. Fixed: nothing to answer.
+  if (asks) await dialogButton(page, "Replace").click();
+  // G2: a focus event inside the same window must stand down too — the focus
+  // check would read the save's own write as an outside change and ask.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(300);
+  check("a focus check mid-save does not ask either", (await page.locator(".dlg").count()) === 0);
+  await page.evaluate(() => window.__releaseStampRead());
+  const swapped = await page.waitForFunction(old => window.__wetsProbe.scriptClass("Rotator")?.token !== old, token, { timeout: 30000 })
+    .then(() => true, () => false);
+  check("the class is swapped to the newest code", swapped);
+  await page.waitForTimeout(1500);
+  check("the mark is cleared", (await page.locator(".dot.unsaved").count()) === 0);
+  check("the disk holds the newest code",
+    (await readDisk(page, "DoubleSave", "scripts/components/Rotator.ts")).includes("public speed = 5;"));
+
+  // A fresh object of the class sees the new default — what is registered is
+  // the newest class, not a stale or half-imported module. The shortcut guard
+  // stands down inside a TEXTAREA, and Monaco's is one — blur it explicitly so
+  // the canvas click's focus is what the keydown sees.
+  await page.evaluate(() => document.activeElement?.blur());
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().waitFor({ timeout: 10000 });
+  await page.locator("app-hierarchy li", { hasText: "GameObject" }).last().click();
+  await page.waitForTimeout(300);
+  await page.locator(".insp-body .add-comp", { hasText: "Add component" }).first().click();
+  await page.waitForTimeout(500);
+  await page.locator(".add-list li", { hasText: "Rotator" }).first().click();
+  await page.waitForTimeout(600);
+  const added = await page.locator(".insp-body .field input").evaluateAll(els => els.map(e => e.value));
+  check("a new object gets the newest default", added.includes("5"), JSON.stringify(added));
+
+  // The runtime's load summary is an info row; identical repeats collapse into
+  // a ×n counter, so count the counter too. Open loaded once; the double save
+  // must add exactly one more, with no import-failure note.
+  await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+  await page.waitForTimeout(400);
+  // The swap advisory is the engine's own note about the intended replacement
+  // (the same one the other reload scenarios filter); an import failure is not.
+  const swapError = "[TypeRegistry] Type name \"Rotator\" is already registered to a different class";
+  const errRows = (await page.locator(".cons-list .log.error").allInnerTexts()).filter(t => !t.includes(swapError));
+  check("no Console error row", errRows.length === 0, errRows.join(" | "));
+  const loads = await page.evaluate(() => [...document.querySelectorAll(".cons-list .log.info")]
+    .filter(e => (e.querySelector(".msg")?.textContent ?? "").includes("module(s) loaded"))
+    .map(e => ({ text: e.querySelector(".msg").textContent, n: Number((e.querySelector(".rep")?.textContent ?? "×1").slice(1)) })));
+  const reloads = loads.reduce((n, l) => n + l.n, 0);
+  check("one reload for the double save (the open's plus one)", reloads === 2, JSON.stringify(loads));
+  check("no spurious import-failure note", loads.every(l => l.text.includes("notes: none")), JSON.stringify(loads));
+  check("nothing but the swap advisory in the console",
+    page.logs.filter(l => !l.includes("404") && !l.includes(swapError)).length === 0,
+    page.logs.join(" | "));
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  await shot(page, "e2e-double-save");
+});
+
+// C4r2: a script read that fails is only silent when the file is gone. The
+// whole project cleared under the editor is the supported case; any other
+// failure is a problem the author must see in the Console.
+scenario("a script file that vanished mid-reload is skipped silently", async () => {
+  const page = await newPage("OutsideVanish");
+  await seed(page, "OutsideVanish", {
+    "scenario.meta.json": JSON.stringify({ id: "outside-vanish", name: "OutsideVanish", version: 1 }),
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "assets/scenes/main.scene.json": sceneWith("Seeded"),
+  });
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  await page.waitForTimeout(600);
+
+  // Listed, then gone before the read: the file disappears under the reload.
+  const get = await page.evaluateHandle(() => FileSystemFileHandle.prototype.getFile);
+  await page.evaluate(orig => {
+    FileSystemFileHandle.prototype.getFile = function (...args) {
+      if (this.name === "Scenario.ts") throw new DOMException("gone", "NotFoundError");
+      return orig.apply(this, args);
+    };
+  }, get);
+  // A real outside change to another script drives the focus reload; the
+  // vanished one must not cost a Console row or break the reload.
+  await seed(page, "OutsideVanish", { "scripts/Other.ts": "export const other = 1;\n" });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(1500);
+  await page.evaluate(orig => { FileSystemFileHandle.prototype.getFile = orig; }, get);
+
+  await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+  await page.waitForTimeout(400);
+  const consoleText = await page.locator(".cons-list").innerText();
+  check("no read error reached the Console", !consoleText.includes("Scenario.ts"), consoleText.slice(0, 240));
+  check("the editor is still usable", await page.locator(".work").isVisible());
+  await page.locator("canvas[data-engine]").first().click({ position: { x: 300, y: 300 } });
+  await page.keyboard.press("Alt+Shift+N");
+  await page.waitForTimeout(600);
+  check("an object can still be created", (await page.locator("app-hierarchy li", { hasText: "GameObject" }).count()) > 0);
+  check("no native dialogs were used", page.nativeDialogs === 0);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+scenario("a script read failure other than a vanished file reaches the Console", async () => {
+  const page = await newPage("OutsideReadFail");
+  await seed(page, "OutsideReadFail", {
+    "scenario.meta.json": JSON.stringify({ id: "outside-readfail", name: "OutsideReadFail", version: 1 }),
+    "scripts/Scenario.ts": SCENARIO_ENTRY,
+    "assets/scenes/main.scene.json": sceneWith("Seeded"),
+  });
+  await page.getByText("Open folder…").click();
+  await page.locator(".work").waitFor({ timeout: 30000 });
+  await page.waitForTimeout(600);
+
+  await failReads(page, "Scenario.ts");
+  await seed(page, "OutsideReadFail", { "scripts/Other.ts": "export const other = 1;\n" });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await page.waitForTimeout(1500);
+
+  await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+  await page.waitForTimeout(400);
+  const consoleText = await page.locator(".cons-list").innerText();
+  check("the failure reached the Console as an error",
+    (await page.locator(".log.error .msg", { hasText: "Scenario.ts" }).count()) > 0, consoleText.slice(0, 240));
+  check("the row names the read, not a compile", consoleText.includes("could not be read"), consoleText.slice(0, 240));
+  check("the row is a jump to the file", (await page.locator(".log .src.jump").count()) > 0);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+  check("no native dialogs were used", page.nativeDialogs === 0);
+});
+
+// C4r1: the engine the page runs is the installed tarball's — not a committed
+// copy that release:local never refreshes. BuildInfo.builtAt is stamped into
+// the dist at engine build time, so equality with node_modules' copy proves
+// the identity of what actually executes.
+scenario("the running engine is the installed tarball (BuildInfo)", async () => {
+  const dist = readFileSync(resolve(HERE, "../node_modules/webenginets/dist/WebEngineTS.esm.js"), "utf8");
+  const builtAt = dist.match(/_BUILT_AT = "([^"]+)"/)?.[1];
+  const version = dist.match(/const _VERSION = "([^"]+)"/)?.[1];
+  check("the installed engine is a stamped build", !!builtAt && !!version, `builtAt=${builtAt} version=${version}`);
+
+  const page = await newPage("BuildIdentity");
+  await openEmptyProject(page);
+  const running = await page.evaluate(() => {
+    const b = globalThis.__wetsEngine?.BuildInfo;
+    return b ? { builtAt: b.builtAt, version: b.version, isBuild: b.isBuild } : null;
+  });
+  check("the page publishes its engine's BuildInfo", running !== null);
+  check("the running builtAt is the installed package's", running?.builtAt === builtAt, `${running?.builtAt} vs ${builtAt}`);
+  check("the running version is the installed package's", running?.version === version, `${running?.version} vs ${version}`);
+  check("the running engine is a build, not sources", running?.isBuild === true);
+  check("no page errors", noErrors(page), page.logs.join(" | "));
+});
 
 scenario("start screen: no workspace without a project; open, close, recent, forget", async () => {
     const page = await newPage("LifeDemo");
@@ -948,6 +2330,21 @@ scenario("new project wizard: collects, validates, creates; cancelling writes no
     const cam = scene.roots.find(r => r.components.some(c => c.type === "Camera"));
     check("the camera looks at the scene from the back", cam && cam.transform.position.z === -10, JSON.stringify(cam?.transform.position));
 
+    // DW-4.2: the exported project carries a library behaviour too, so the
+    // ScenarioCreator build check compiles scripts/library/ as well. Attach to
+    // the existing Camera — no new object, the two-object scene stays two.
+    await page.locator("app-hierarchy li", { hasText: "Camera" }).first().click();
+    await page.waitForTimeout(300);
+    await addFromLibrary(page, "Rotator");
+    check("the wizard project holds the library source",
+        (await readDisk(page, "WizParent", "Atom/scripts/library/Rotator.ts")) !== null);
+    await page.keyboard.press("Control+s");
+    await page.waitForTimeout(800);
+    const withLibrary = JSON.parse(await readDisk(page, "WizParent", "Atom/assets/scenes/main.scene.json"));
+    check("the saved wizard scene keeps two objects, one with Rotator",
+        withLibrary.roots.length === 2 && withLibrary.roots.some(r => r.components.some(c => c.type === "Rotator")),
+        JSON.stringify(withLibrary.roots.map(r => [r.name, r.components.map(c => c.type)])));
+
     await exportFolder(page, "WizParent", "Atom", resolve(SHOTS, "wizard-project"));
     check("no native dialogs were used", page.nativeDialogs === 0);
     check("no page errors", noErrors(page), page.logs.join(" | "));
@@ -1115,6 +2512,112 @@ scenario("dialogs: Esc cancels, Enter confirms, shortcuts stand down", async () 
     check("an empty name cannot be confirmed", await page.locator(".dlg-btn.primary").isDisabled());
     await page.keyboard.press("Escape");
     check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+});
+
+// C4: opening a project runs its script load and then resets the scene to load
+// the saved one. The workspace must not appear — and its shortcuts must not be
+// live — until that is done, or an edit made in the gap is wiped by the reset.
+// The entry script's read is held so the gap is wide and deterministic.
+scenario("an open settles its scene before the workspace accepts edits (C4)", async () => {
+    const page = await newPage("SettleDemo");
+    await holdScriptRead(page);
+    await page.getByText("Open folder…").click();
+    await dialogButton(page, "Set up").click();
+    for (let i = 0; i < 50 && !(await page.evaluate(() => window.__scriptReadHeld === true)); i++) await page.waitForTimeout(100);
+    check("the open reaches its script load", await page.evaluate(() => window.__scriptReadHeld === true));
+    check("while it settles, no workspace is shown", (await page.locator(".work").count()) === 0);
+    await page.keyboard.press("Alt+Shift+N");
+    await page.evaluate(() => window.__releaseScriptRead?.());
+    await page.locator(".work").waitFor();
+    await page.waitForTimeout(400);
+    check("the workspace opens clean", (await page.locator("app-hierarchy").innerText()).includes("Default Scene"));
+    check("no edit was lost to the settle", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+    check("no phantom object from the gap", (await page.locator("app-hierarchy").innerText()).match(/GameObject/g) === null);
+    // Now that it is open, the shortcut works.
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(300);
+    check("once open, the shortcut creates", (await page.locator("app-hierarchy").innerText()).includes("GameObject"));
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
+});
+
+// C4 review R4-G3: the settle guard must hold for a project SWITCH too, not
+// only for an open from the start screen. On 2400f86 status never leaves
+// 'open' during _enter, so the workspace, its menus and its shortcuts stay
+// live through the new project's script load — an Alt+Shift+N in that gap
+// creates an object the scene reset then wipes, and Open Project is still
+// clickable mid-settle. Failing-first by construction: with the workspace
+// still mounted, the ".work"/menubar checks below see it, and the keypress
+// leaves a GameObject in the hierarchy that the fixed code never creates.
+// The entry script's read is held (armed AFTER the first project is open, so
+// the hold catches the switch's load, not the first open's).
+scenario("a project switch settles before the workspace accepts edits (C4 review R4-G3)", async () => {
+    const page = await newPage("SwitchFrom");
+    // The first project carries a script the second does not: its outside-edit
+    // stamp must not survive the switch, or the next focus check reads the old
+    // project's file as "deleted outside" and reloads for nothing.
+    await seed(page, "SwitchFrom", {
+        "scenario.meta.json": JSON.stringify({ id: "switch-from", name: "SwitchFrom", version: 1 }),
+        "scripts/Scenario.ts": SCENARIO_ENTRY,
+        "scripts/components/Extra.ts": "export {};\n",
+        "assets/scenes/main.scene.json": sceneWith("FromAnchor"),
+    });
+    await seed(page, "SwitchTo", {
+        "scenario.meta.json": JSON.stringify({ id: "switch-to", name: "SwitchTo", version: 1 }),
+        "scripts/Scenario.ts": SCENARIO_ENTRY,
+        "assets/scenes/main.scene.json": sceneWith("ToAnchor"),
+    });
+    await page.getByText("Open folder…").click();
+    await page.locator(".work").waitFor({ timeout: 30000 });
+    for (let i = 0; i < 50 && !(await page.locator("app-hierarchy").innerText()).includes("FromAnchor"); i++) await page.waitForTimeout(100);
+    check("the first project is open and settled", (await page.locator("app-hierarchy").innerText()).includes("FromAnchor"));
+
+    // Switch through the menu, the way an author does. The second project's
+    // entry-script read is held, so the settle gap is wide and deterministic.
+    await holdScriptRead(page);
+    await pick(page, "SwitchTo");
+    await menu(page, "File", "Open Project");
+    for (let i = 0; i < 50 && !(await page.evaluate(() => window.__scriptReadHeld === true)); i++) await page.waitForTimeout(100);
+    check("the switch reaches its script load", await page.evaluate(() => window.__scriptReadHeld === true));
+    await page.waitForTimeout(250);
+    check("while the switch settles, no workspace is shown", (await page.locator(".work").count()) === 0);
+    check("and no menu offers Open Project mid-settle", (await page.locator(".menubar-item").count()) === 0);
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(300);
+    check("the create shortcut is inert in the gap",
+        (await page.locator("app-hierarchy li", { hasText: "GameObject" }).count()) === 0);
+    await page.evaluate(() => window.__releaseScriptRead?.());
+    await page.locator(".work").waitFor({ timeout: 30000 });
+    for (let i = 0; i < 50 && !(await page.locator("app-hierarchy").innerText()).includes("ToAnchor"); i++) await page.waitForTimeout(100);
+    check("the second project opens clean", (await page.locator("app-hierarchy").innerText()).includes("ToAnchor"));
+    check("the project tag names the new project", (await page.locator(".project-tag").innerText()).includes("SwitchTo"));
+    check("no phantom object from the gap", (await page.locator("app-hierarchy").innerText()).match(/GameObject/g) === null);
+    check("no edit was lost to the settle", (await page.locator(".statusbar .accent").first().innerText()) === "Saved");
+
+    // The previous project's stamps are gone: a focus check finds nothing
+    // changed and nothing deleted, so it must not reload. Two loads in the
+    // Console — the first open's and the switch's — and no third.
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+    await page.waitForTimeout(800);
+    await page.locator(".pane-tab", { hasText: "Console" }).first().click();
+    await page.waitForTimeout(400);
+    const loads = await page.evaluate(() => [...document.querySelectorAll(".cons-list .log.info")]
+        .filter(e => (e.querySelector(".msg")?.textContent ?? "").includes("module(s) loaded"))
+        .map(e => ({ text: e.querySelector(".msg").textContent, n: Number((e.querySelector(".rep")?.textContent ?? "×1").slice(1)) })));
+    const reloads = loads.reduce((n, l) => n + l.n, 0);
+    check("a focus check after the switch does not reload the old project's scripts", reloads === 2, JSON.stringify(loads));
+    check("no Console error row", (await page.locator(".cons-list .log.error").count()) === 0);
+
+    // Now that it is open, the shortcut works — and what it creates stays:
+    // nothing after the settle resets the scene again.
+    await page.locator("canvas").click({ position: { x: 300, y: 300 } });
+    await page.keyboard.press("Alt+Shift+N");
+    await page.waitForTimeout(400);
+    check("once open, the shortcut creates and the object stays",
+        (await page.locator("app-hierarchy").innerText()).includes("GameObject"));
+    check("no native dialogs were used", page.nativeDialogs === 0, String(page.nativeDialogs));
+    check("no page errors", noErrors(page), page.logs.join(" | "));
 });
 
 /**
@@ -1888,6 +3391,16 @@ for (const [name, fn] of scenarios) {
         await lastPage?.screenshot({ path: `${SHOTS}/e2e-failure.png` }).catch(() => {});
         check("scenario completed", false, String(err.message ?? err).split("\n").slice(0, 12).join(" | "));
     }
+    // Every context the scenario opened is closed before the next one starts.
+    // A live context keeps a whole editor running - its WebGL renderer, its
+    // requestAnimationFrame loop, its workers - and the suite opens ~30 of them.
+    // Left open they accumulate: measured over 14 project opens, the time from
+    // "Open folder" to a visible workspace grew 192 ms -> 20463 ms, which is the
+    // late-suite `.work` timeout the whole suite kept flaking on (ROADMAP T2).
+    // Closed, the same 14 opens stay between 250 and 890 ms. No timeout is
+    // raised and no check retried: every scenario still gets the same 30 s.
+    for (const context of browser.contexts()) await context.close().catch(() => {});
+    lastPage = null;
 }
 await browser.close();
 console.log(failed === 0 ? "\nAll checks passed." : `\n${failed} check(s) failed.`);
