@@ -258,6 +258,14 @@ async function main() {
         // inner box comes out 640x480, the size the pixel coords assume.
         "--window-size=656,631",
         "--no-first-run", "--no-default-browser-check",
+        // Chrome's field trials can start background services (observed: GCM
+        // registration retrying against live endpoints) that race the network
+        // service restart after the sandbox warning and leave the initial page
+        // load hung until the 300s harness timeout — intermittently, whichever
+        // fixture runs first. Playwright's own launch always passes these
+        // (playwright-core chromiumSwitches), which is why run.mjs never hangs.
+        // Harness environment only: no threshold, check or measurement changes.
+        "--disable-field-trial-config", "--disable-component-update", "--no-service-autorun",
         "--disable-extensions", "--disable-background-networking",
         `--user-data-dir=${profile}`,
         base,
