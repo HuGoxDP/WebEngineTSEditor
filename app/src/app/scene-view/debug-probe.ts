@@ -15,6 +15,7 @@
 
 import * as THREE from 'three';
 import type { SceneViewRenderer } from './scene-view-renderer';
+import { TypeRegistry, getClassMeta } from 'WebEngineTS';
 
 /** An object's engine-space transform, as the probe reports it (world + local TRS). */
 export interface ProbeTransform {
@@ -122,6 +123,14 @@ export interface WetsProbe {
      * light's `visible` flag, over the whole graph.
      */
     threeInfo(): { children: number; lightsVisible: boolean[] };
+    /**
+     * A script class the registry holds, with a **token**: a number that stays
+     * with the class object and is never reused, so a test can tell "the same
+     * class" from "a second class under the same name". `parent` is the script
+     * class it extends (null when it extends an engine class): C4's proof that
+     * editing a base module reaches its importers is the parent token.
+     */
+    scriptClass(name: string): { token: number; parent: string | null; parentToken: number | null } | null;
 }
 
 declare global {
@@ -282,6 +291,29 @@ export function installProbe(
         gridVisible: () => deps.gridVisible?.() ?? true,
         gridStep: () => deps.gridStep?.() ?? 1,
         threeInfo: () => deps.threeInfo?.() ?? { children: 0, lightsVisible: [] },
+        scriptClass: (name) => {
+            const ctor = TypeRegistry.get(name) as (new (...args: never[]) => unknown) | null;
+            if (!ctor) return null;
+            const parent = Object.getPrototypeOf(ctor) as (new (...args: never[]) => unknown) | null;
+            const parentName = parent ? (getClassMeta(parent)?.typeName ?? null) : null;
+            return {
+                token: tokenOf(ctor),
+                parent: parentName,
+                parentToken: parentName && parent ? tokenOf(parent) : null,
+            };
+        },
     };
     window.__wetsProbe = probe;
+}
+
+/** A token that stays with a class object and is never reused (see `scriptClass`). */
+const classTokens = new WeakMap<object, number>();
+let classTokenSeq = 0;
+function tokenOf(ctor: object): number {
+    let token = classTokens.get(ctor);
+    if (token === undefined) {
+        token = ++classTokenSeq;
+        classTokens.set(ctor, token);
+    }
+    return token;
 }

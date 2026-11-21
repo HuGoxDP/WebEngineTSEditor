@@ -1,6 +1,6 @@
 import { Injectable, computed, signal } from '@angular/core';
 import { defaultMeta, metaJson, SCENARIO_TEMPLATE, type ProjectMeta } from './project-templates';
-import { FileSystemAccessStore, OpfsStore, type ProjectStore } from './project-store';
+import { FileSystemAccessStore, OpfsStore, type ProjectStore, type StoreEntry } from './project-store';
 
 /** What a file is, as far as the Project panel cares — drives icon and double-click. */
 export type ProjectEntryKind =
@@ -187,12 +187,12 @@ export class ProjectService {
      *
      * @param layout - when given, the scenario layout is written into the folder
      *   first. The project only counts as open — and the workspace only appears —
-     *   once that is done, so nothing ever shows a project that is half set up.
+     *   once the caller has settled it (scripts loaded, scene in place), so
+     *   nothing ever shows a project that is half set up.
      */
     public async adopt(handle: ProjectFolderHandle, layout?: ProjectMeta): Promise<void> {
         await this._adopt(new FileSystemAccessStore(handle));
         if (layout) await this.initializeLayout(layout);
-        this.status.set('open');
         this.projectId.set(await this._remember(handle, 'disk'));
     }
 
@@ -209,7 +209,6 @@ export class ProjectService {
         await store.keepAcrossRestarts();
         await this._adopt(store, layout.name);
         await this.initializeLayout(layout);
-        this.status.set('open');
         this.projectId.set(await this._rememberOpfs(store));
     }
 
@@ -236,7 +235,6 @@ export class ProjectService {
             if (!(await OpfsStore.exists(recent.id))) return 'missing';
             const store = await OpfsStore.create(recent.id);
             await this._adopt(store, recent.name);
-            this.status.set('open');
             this.projectId.set(recent.id);
             return 'ok';
         }
@@ -291,6 +289,17 @@ export class ProjectService {
     }
 
     // ── Files ────────────────────────────────────────────────────────
+
+    /**
+     * The entries directly under `path`, for a caller that walks the project
+     * itself — the script runtime enumerating `scripts/`. Empty when no project
+     * is open, or the folder is not there, so a caller never has to try/catch.
+     */
+    public async entries(path: string): Promise<StoreEntry[]> {
+        if (!this._store) return [];
+        try { return await this._store.entries(path); }
+        catch { return []; }
+    }
 
     public async readFile(path: string): Promise<File> {
         return (await this._store!.file(path, false)).getFile();
@@ -387,6 +396,7 @@ export class ProjectService {
         }
         await this._store!.mkdir('assets/scenes');
         await this._store!.mkdir('scripts/components');
+        await this._store!.mkdir('scripts/library');
         await this._scan();
     }
 

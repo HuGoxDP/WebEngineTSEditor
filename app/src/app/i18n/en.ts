@@ -103,8 +103,18 @@ export const en = {
     'panel.inspector': 'Inspector',
     'panel.project': 'Project',
     'panel.console': 'Console',
+    'panel.code': 'Code',
     'panel.lock': 'Lock',
     'panel.menu': 'Menu',
+
+    // ── code tab ─────────────────────────────────────────────────────
+    'code.empty': 'No script open',
+    'code.emptyHint': 'Double-click a .ts or .js file in the Project panel to edit it here.',
+    'code.save': 'Save',
+    'code.unsaved': 'This file has unsaved changes',
+    'code.changedMessage': 'The script file was changed outside the editor, and you have unsaved changes here. Reload to take the version from disk, or keep yours.',
+    'code.overwriteTitle': 'Replace the changed file?',
+    'code.overwriteMessage': '{path} was changed outside the editor since you opened it. Saving will replace that version.',
 
     // ── viewport ────────────────────────────────────────────────────
     'vp.pivot': 'Pivot',
@@ -191,8 +201,16 @@ export const en = {
     'insp.searchComponents': 'Search components...',
     'insp.noMatch': 'No components match.',
     'insp.held': 'This object already has one — an object holds only one.',
+    'insp.library': 'Library',
+    'insp.libraryFailed': 'The library behaviour "{name}" did not load — check the Console for the script error.',
 
     'comp.reset': 'Reset',
+    'comp.addWaypoint': 'Add waypoint',
+    'comp.removeWaypoint': 'Remove waypoint',
+    'comp.missingTag': 'Missing script',
+    'comp.missingHint': 'The class this scene was saved with is not loaded — its script is missing or does not compile.',
+    'comp.missingBody': 'The saved data is kept exactly as it was. Fix or add the script and it becomes a component again.',
+    'comp.missingKey': 'Saved field',
     'comp.menu': 'Component menu',
     'comp.pick': 'Pick',
     'comp.clear': 'Clear',
@@ -208,6 +226,7 @@ export const en = {
     'cons.clear': 'Clear',
     'cons.collapse': 'Collapse',
     'cons.empty': 'Console is empty.',
+    'cons.jumpHint': 'Open this file at that line',
 
     // ── project panel ───────────────────────────────────────────────
     'proj.unsupportedTitle': 'Project folders are not available in this browser',

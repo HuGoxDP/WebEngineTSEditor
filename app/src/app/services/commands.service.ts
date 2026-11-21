@@ -1,4 +1,5 @@
 import { Injectable, inject } from '@angular/core';
+import { CodeEditorService } from './code-editor.service';
 import {
     BoxCollider,
     Camera,
@@ -8,6 +9,7 @@ import {
     MeshFilter,
     MeshRenderer,
     Quaternion,
+    SceneManager,
     SceneSerializer,
     SphereCollider,
     StandardMaterial,
@@ -17,6 +19,7 @@ import {
 } from 'WebEngineTS';
 import { SceneService } from './scene.service';
 import { SelectionService } from './selection.service';
+import { LibraryService, type LibraryEntry } from './library.service';
 import { HistoryService } from './history.service';
 import { ClipboardService } from './clipboard.service';
 import { ComponentRegistryService } from './component-registry.service';
@@ -101,10 +104,12 @@ export class CommandsService {
     private readonly _registry = inject(ComponentRegistryService);
     private readonly _fileIo = inject(FileIoService);
     private readonly _project = inject(ProjectService);
+    private readonly _code = inject(CodeEditorService);
     private readonly _viewport = inject(ViewportService);
     private readonly _dialog = inject(DialogService);
     private readonly _i18n = inject(I18nService);
     private readonly _doc = inject(DocumentService);
+    private readonly _library = inject(LibraryService);
 
     constructor() {
         window.addEventListener('focus', () => void this._checkDisk());
@@ -201,6 +206,54 @@ export class CommandsService {
         this._history.record(`Add ${name}`, () => {
             target.addComponent(ctor as any);
             this._selection.notifyChanged();
+        });
+    }
+
+    /**
+     * Add a library behaviour to the selection (C4 phase 4, D5). The source is
+     * copied into `scripts/library/<Name>.ts` — a permanent project file — then
+     * the script runtime reloads, which rebuilds the scene and clears the
+     * selection when the class is new. The target is therefore re-found by name
+     * after the reload; if it no longer exists (deleted while the write was in
+     * flight) the add aborts — nothing attached, no history entry, no selection
+     * change. The attach itself is one undoable scene step (the written file is
+     * not undone).
+     */
+    public addLibrary(entry: LibraryEntry): void {
+        const target = this._selection.selected();
+        if (!target) return;
+        const targetName = target.name;
+        this.run(async () => {
+            if (!this._library.isInstalled(entry)) {
+                const path = LibraryService.pathOf(entry.name);
+                const existed = this._project.exists(path);
+                try {
+                    await this._project.write(path, entry.source);
+                } catch (err) {
+                    // The write creates the file handle before the writable, so
+                    // a failure can leave a zero-byte partial behind. Remove it
+                    // only when this add created it and it is empty — never a
+                    // file the author already had (C4 review).
+                    if (!existed) {
+                        try {
+                            if ((await this._project.readFile(path)).size === 0) await this._project.removeQuietly(path);
+                        } catch { /* already gone */ }
+                    }
+                    throw err;
+                }
+                await this._code.reloadScripts();
+            }
+            const ctor = this._library.ctorOf(entry.name);
+            if (!ctor) {
+                await this.fail(this._i18n.t('insp.libraryFailed', { name: entry.name }));
+                return;
+            }
+            const go = SceneManager.activeScene.findGameObject(targetName);
+            if (!go) return;
+            this._history.record(`Add ${entry.name}`, () => {
+                go.addComponent(ctor as any);
+                this._selection.select(go);
+            });
         });
     }
 
@@ -328,6 +381,9 @@ export class CommandsService {
                 await this._enter(folder, result.meta);
             } else {
                 // The browser's own store: no folder to make, no permission to ask.
+                // The same settle guard as _enter: from an open workspace, the
+                // switch stands the workspace down until the scene is in place.
+                this._project.status.set('closed');
                 await this._project.createInBrowser(result.meta);
                 await this._settle();
             }
@@ -427,6 +483,11 @@ export class CommandsService {
      *   the instruction to lay out the scenario files before the project opens.
      */
     private async _enter(handle: ProjectFolderHandle, layout?: ProjectMeta): Promise<void> {
+        // A switch settles like an open from the start screen: the workspace —
+        // and its menus and shortcuts — stands down until _settle is done, or
+        // an edit made while the new project's scripts load is wiped by the
+        // scene reset that follows (C4 review R4-G3).
+        this._project.status.set('closed');
         this._resetScene();
         await this._project.adopt(handle, layout);
         await this._settle();
@@ -438,6 +499,10 @@ export class CommandsService {
      *
      * If another tab already has the project open, this one lets go of it —
      * two tabs on one folder overwrite each other's saves.
+     *
+     * The project is marked open only at the end, once the scene is in place:
+     * the workspace (and its shortcuts) must not exist while the scene is still
+     * being reset and loaded, or an edit made in that gap would be wiped.
      */
     private async _settle(): Promise<void> {
         if (!await this._doc.acquireLock(this._project.projectId())) {
@@ -446,9 +511,16 @@ export class CommandsService {
             await this.fail(this._i18n.t('open.elsewhere', { name }));
             return;
         }
+        // The classes before the scene: a saved scene names its components by
+        // type name, and only the project's own scripts know those names, so
+        // the scripts are compiled and loaded first — the scene then
+        // deserializes into the real component instead of the placeholder the
+        // engine keeps for an unknown type.
+        await this._code.reloadScripts();
         this._resetScene();
         await this._loadDefaultScene();
         await this._offerRecovery();
+        this._project.status.set('open');
     }
 
     /** An empty scene, with nothing selected and nothing to undo — and nothing unsaved. */
