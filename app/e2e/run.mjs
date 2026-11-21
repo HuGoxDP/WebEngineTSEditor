@@ -255,6 +255,30 @@ const sceneWith = name => JSON.stringify({
 const scenarios = [];
 const scenario = (name, fn) => scenarios.push([name, fn]);
 
+// B1r5 #6 (B1r3's missing proof): the filter itself, fed synthetic lines.
+// The old filter excused the whole `GL Driver Message` prefix, so an
+// Error-severity GL fault passed the suite silently; these checks fail on
+// that old filter and pin the narrow one. Pure logic — no page needed.
+scenario("harness: noErrors excuses only performance notes, never GL errors (B1r5)", async () => {
+    const withLogs = lines => ({ logs: lines });
+    check("a synthetic GL Driver Message of Error severity FAILS noErrors",
+        noErrors(withLogs(["[error] GL Driver Message (OpenGL, Error, GL_INVALID_OPERATION in glDrawElements)"])) === false);
+    check("a plain page error fails noErrors",
+        noErrors(withLogs(["[pageerror] TypeError: x is not a function"])) === false);
+    check("the performance note is still excused",
+        noErrors(withLogs(["[warning] GL Driver Message (OpenGL, Performance, GPU stall due to ReadPixels)"])) === true);
+    check("the ReadPixels stall warning alone is excused",
+        noErrors(withLogs(["[warning] GPU stall due to ReadPixels"])) === true);
+    check("an asset 404 is excused",
+        noErrors(withLogs(["[error] Failed to load resource: the server responded with a status of 404"])) === true);
+    check("an empty log passes", noErrors(withLogs([])) === true);
+    check("a real error among excused lines still fails",
+        noErrors(withLogs([
+            "[warning] GL Driver Message (OpenGL, Performance, GPU stall due to ReadPixels)",
+            "[error] GL Driver Message (OpenGL, Error, GL_OUT_OF_MEMORY)",
+        ])) === false);
+});
+
 scenario("start screen: no workspace without a project; open, close, recent, forget", async () => {
     const page = await newPage("LifeDemo");
     check("no workspace before a project", (await page.locator(".work").count()) === 0);
