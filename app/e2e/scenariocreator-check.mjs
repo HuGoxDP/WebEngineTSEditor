@@ -118,6 +118,13 @@ for (const fixture of FIXTURES) {
         check("the ZIP renders in the engine", lines.some(l => /^\s*zip\s+id=/.test(l)), out.split("\n").slice(-8).join(" | "));
         check("the manifest renders in the engine", lines.some(l => /^\s*manifest\s+id=/.test(l)));
         check("both paths agree on what they built", lines.some(l => l.includes("MATCH")));
+        // C4r8 (D-4): an unresolvable component becomes a MissingComponent and
+        // the engine warns `Unknown component type "<type>"`. The object count
+        // alone passed with the component missing, so it proved nothing about
+        // the Library-added script actually running on the platform.
+        const unknownTypes = [...new Set([...out.matchAll(/Unknown component type "([^"]+)"/g)].map(m => m[1]))];
+        check("no component went missing on the platform", unknownTypes.length === 0,
+            `Unknown component type: ${unknownTypes.join(", ")}`);
         if (fixture.key === "wizard-project") {
             check("the scene's two objects were built", lines.filter(l => /objects=2\b/.test(l)).length === 2, lines.filter(l => l.includes("objects=")).join(" | "));
         } else {
