@@ -92,6 +92,15 @@ Run it under the shared `editor-e2e.lock` while several workers are live (`node 
 lock editor-e2e W<n> <ID>`). The suite's URL is its first argument, so a port other than 8044 —
 the platform's own catalog has 8044 — is `npm run e2e -- http://localhost:<port>/editor/`.
 
+### Edit mode and Play
+
+The editor opens every project in edit mode, and user scripts stay asleep while you edit: opening a
+project, adding a component, saving, undoing and saving a script never run a script's `awake` or
+`onEnable`. **Play** switches the engine into play mode and wakes each script instance exactly once;
+**Stop** returns to edit mode on the scene as it was before Play, pairing each `onEnable` with an
+`onDisable`. `@ExecuteAlways` is the opt-in for a script that must run in the edit world. The
+black-box proof lives at `app/e2e/checks/C4r9.mjs` (`npm run e2e:checks -- http://localhost:4200/`).
+
 ### What the suite covers, scenario by scenario
 
 Every scenario drives the editor only the way a user does, and the folder picker is faked to the
