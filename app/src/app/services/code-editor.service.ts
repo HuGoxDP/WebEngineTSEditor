@@ -250,10 +250,15 @@ export class CodeEditorService {
 
     /** Whether the file changed on disk since this editor last read or wrote it. */
     private async _changedOnDisk(path: string): Promise<boolean> {
-        const stamp = this._stamps.get(path);
-        if (stamp === undefined) return false;
         const now = await this._project.modifiedAt(path).catch(() => null);
-        return now !== null && now !== stamp;
+        if (now === null) return false;
+        const stamp = this._stamps.get(path);
+        // A listed script with no stamp is new to this editor — written into
+        // the project folder from outside. It has never been read or compiled
+        // here, so its class is not registered yet: treat it as changed so the
+        // focus check reloads the project and offers the class (C4r18). Stamped
+        // files keep the old "differs from the baseline" answer.
+        return stamp === undefined || now !== stamp;
     }
 
     /**
