@@ -1,8 +1,9 @@
-import { Injectable, signal } from '@angular/core';
+import { inject, Injectable, signal } from '@angular/core';
 import { ProjectService } from './project.service';
 import { ConsoleService } from './console.service';
 import { SelectionService } from './selection.service';
 import { SceneService } from './scene.service';
+import { PlayModeService } from './play-mode.service';
 import {
     GameObject,
     SceneManager,
@@ -81,6 +82,11 @@ export class ScriptRuntimeService {
         private readonly _selection: SelectionService,
         private readonly _scene: SceneService,
     ) {
+        // Edit-mode guarantee before the first `reload()`: constructing the mode
+        // owner here means no user class can be registered before edit mode is in
+        // force. A statement, not a parameter property, keeps noUnusedLocals quiet.
+        // Do not remove — without it scripts wake while merely editing (R-3).
+        inject(PlayModeService);
         // The editor's own engine module, for a scenario script to import. One
         // instance is the whole point: the classes a script exports are the
         // ones the editor's TypeRegistry resolves.
@@ -425,6 +431,8 @@ export class ScriptRuntimeService {
      * panels. Rebuilding by hand would leave the hierarchy holding destroyed
      * objects — a click on such a row selects an object whose components are
      * gone, which is exactly what the author must never see after a save.
+     * In edit mode the rebuilt objects do not wake, so a save never runs a
+     * script's `awake` or `onEnable`.
      */
     private _rebuildScene(): void {
         const scene = SceneManager.activeScene;
