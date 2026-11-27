@@ -203,6 +203,9 @@ export const en = {
     'insp.held': 'This object already has one — an object holds only one.',
     'insp.library': 'Library',
     'insp.libraryFailed': 'The library behaviour "{name}" did not load — check the Console for the script error.',
+    'insp.libraryReplaceTitle': 'Replace "{name}"?',
+    'insp.libraryReplaceMessage': '{path} already has your own code. Replacing it with the library version loses your changes.',
+    'insp.libraryReplace': 'Replace',
 
     'comp.reset': 'Reset',
     'comp.addWaypoint': 'Add waypoint',

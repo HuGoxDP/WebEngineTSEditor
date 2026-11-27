@@ -9,13 +9,13 @@ import {
     MeshFilter,
     MeshRenderer,
     Quaternion,
-    SceneManager,
     SceneSerializer,
     SphereCollider,
     StandardMaterial,
     Vector3,
     type GameObject,
     type SerializedScene,
+    type Transform,
 } from 'WebEngineTS';
 import { SceneService } from './scene.service';
 import { SelectionService } from './selection.service';
@@ -213,22 +213,42 @@ export class CommandsService {
      * Add a library behaviour to the selection (C4 phase 4, D5). The source is
      * copied into `scripts/library/<Name>.ts` — a permanent project file — then
      * the script runtime reloads, which rebuilds the scene and clears the
-     * selection when the class is new. The target is therefore re-found by name
-     * after the reload; if it no longer exists (deleted while the write was in
-     * flight) the add aborts — nothing attached, no history entry, no selection
-     * change. The attach itself is one undoable scene step (the written file is
-     * not undone).
+     * selection when the class is new. The target is therefore found again
+     * after the reload — by the path it had, never by name (C4r13: a scene may
+     * hold several objects of one name) — and only when the object at that path
+     * still carries the original name; otherwise the add aborts, as it does when
+     * the target was deleted while the write was in flight — nothing attached,
+     * no history entry, no selection change. The attach itself is one undoable
+     * scene step (the written file is not undone).
+     *
+     * The file belongs to the author, so a file that is already there and holds
+     * something — most often a draft whose class never registered — is not
+     * overwritten on a guess: the add asks first, and a decline ends the add
+     * right there (C4r12). A missing or zero-byte file is written without a
+     * question; the question carries the path, so the author sees what is at
+     * stake.
      */
     public addLibrary(entry: LibraryEntry): void {
         const target = this._selection.selected();
         if (!target) return;
-        const targetName = target.name;
+        const path = this._pathOf(target);
         this.run(async () => {
             if (!this._library.isInstalled(entry)) {
-                const path = LibraryService.pathOf(entry.name);
-                const existed = this._project.exists(path);
+                const file = LibraryService.pathOf(entry.name);
+                const state = await this._library.fileState(entry);
+                if (state === 'present') {
+                    const replace = await this._dialog.confirm({
+                        title: this._i18n.t('insp.libraryReplaceTitle', { name: entry.name }),
+                        message: this._i18n.t('insp.libraryReplaceMessage', { path: file }),
+                        confirmLabel: this._i18n.t('insp.libraryReplace'),
+                        cancelLabel: this._i18n.t('dialog.cancel'),
+                        danger: true,
+                    });
+                    if (!replace) return;
+                }
+                const existed = this._project.exists(file);
                 try {
-                    await this._project.write(path, entry.source);
+                    await this._project.write(file, entry.source);
                 } catch (err) {
                     // The write creates the file handle before the writable, so
                     // a failure can leave a zero-byte partial behind. Remove it
@@ -236,7 +256,7 @@ export class CommandsService {
                     // file the author already had (C4 review).
                     if (!existed) {
                         try {
-                            if ((await this._project.readFile(path)).size === 0) await this._project.removeQuietly(path);
+                            if ((await this._project.readFile(file)).size === 0) await this._project.removeQuietly(file);
                         } catch { /* already gone */ }
                     }
                     throw err;
@@ -248,7 +268,7 @@ export class CommandsService {
                 await this.fail(this._i18n.t('insp.libraryFailed', { name: entry.name }));
                 return;
             }
-            const go = SceneManager.activeScene.findGameObject(targetName);
+            const go = path ? this._resolveTarget(target, path) : null;
             if (!go) return;
             this._history.record(`Add ${entry.name}`, () => {
                 go.addComponent(ctor as any);
@@ -696,6 +716,65 @@ export class CommandsService {
     private _sceneLabel(): string {
         const path = this._project.scenePath();
         return path ? path.slice(path.lastIndexOf('/') + 1) : this._i18n.t('scene.untitled');
+    }
+
+    /**
+     * Where an object sits in the scene, as a path a reload can walk again:
+     * the root's index in {@link SceneService.roots}, then one child index per
+     * level down to the object (C4r13).
+     *
+     * The rebuild that follows a new script re-creates every object from its
+     * serialized form, in the same order, so a path taken before the write
+     * still lands on the same object afterwards — even when another object of
+     * the same name exists, which a name lookup could not promise.
+     *
+     * @returns the path, or null for an object no longer in the live scene
+     *   (destroyed, or a root that is no longer one).
+     */
+    private _pathOf(go: GameObject): { name: string; indices: number[] } | null {
+        if (!go.exists()) return null;
+        const indices: number[] = [];
+        let t: Transform | null = go.transform;
+        while (t.parent !== null) {
+            indices.unshift(t.getSiblingIndex());
+            t = t.parent;
+        }
+        const root = indices.length === 0 ? go : t.gameObject;
+        const at = this._scene.roots().indexOf(root);
+        if (at === -1) return null;
+        indices.unshift(at);
+        return { name: go.name, indices };
+    }
+
+    /**
+     * The add target after the reload that followed the write (C4r13): the same
+     * object when it survived the reload in place, otherwise where its path now
+     * leads.
+     *
+     * The path is only trusted when the object there still carries the original
+     * name — a rebuild that dropped, renamed or reordered the siblings between
+     * is not the same object, and the add stops rather than attaching to a
+     * different one (the object may have been deleted while the write was in
+     * flight; C4r5).
+     */
+    private _resolveTarget(target: GameObject, path: { name: string; indices: number[] }): GameObject | null {
+        // The same object, when the reload left the scene's own structure alone
+        // (an already installed class): it is not destroyed and its root is
+        // still one of the live scene's roots.
+        if (target.exists() && this._scene.roots().includes(target.transform.root.gameObject)) return target;
+        const walk = this._walk(path.indices);
+        return walk && walk.name === path.name ? walk : null;
+    }
+
+    /** The object at root index `indices[0]`, then one child index per level; null off the path. */
+    private _walk(indices: number[]): GameObject | null {
+        let go: GameObject | null = this._scene.roots()[indices[0]] ?? null;
+        for (let i = 1; i < indices.length && go; i++) {
+            const t: Transform = go.transform;
+            const at = indices[i];
+            go = at >= 0 && at < t.childCount ? t.getChild(at).gameObject : null;
+        }
+        return go;
     }
 
     private async _confirmReplace(path: string): Promise<boolean> {
