@@ -218,6 +218,13 @@ export class CommandsService {
      * flight) the add aborts — nothing attached, no history entry, no selection
      * change. The attach itself is one undoable scene step (the written file is
      * not undone).
+     *
+     * The file belongs to the author, so a file that is already there and holds
+     * something — most often a draft whose class never registered — is not
+     * overwritten on a guess: the add asks first, and a decline ends the add
+     * right there (C4r12). A missing or zero-byte file is written without a
+     * question; the question carries the path, so the author sees what is at
+     * stake.
      */
     public addLibrary(entry: LibraryEntry): void {
         const target = this._selection.selected();
@@ -226,6 +233,17 @@ export class CommandsService {
         this.run(async () => {
             if (!this._library.isInstalled(entry)) {
                 const path = LibraryService.pathOf(entry.name);
+                const state = await this._library.fileState(entry);
+                if (state === 'present') {
+                    const replace = await this._dialog.confirm({
+                        title: this._i18n.t('insp.libraryReplaceTitle', { name: entry.name }),
+                        message: this._i18n.t('insp.libraryReplaceMessage', { path }),
+                        confirmLabel: this._i18n.t('insp.libraryReplace'),
+                        cancelLabel: this._i18n.t('dialog.cancel'),
+                        danger: true,
+                    });
+                    if (!replace) return;
+                }
                 const existed = this._project.exists(path);
                 try {
                     await this._project.write(path, entry.source);

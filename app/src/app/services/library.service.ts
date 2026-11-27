@@ -45,6 +45,25 @@ export class LibraryService {
     /** Where adding copies the source: a permanent project file, D5. */
     public static pathOf(name: string): string { return `scripts/library/${name}.ts`; }
 
+    /**
+     * What `scripts/library/<Name>.ts` looks like right now, for an add that is
+     * about to ship that source into it (C4r12): no file, an empty one, or a
+     * file with something in it.
+     *
+     * A file that is there but cannot be read counts as `present` — the size is
+     * unknown, so the caller must ask rather than overwrite it blind.
+     */
+    public async fileState(entry: LibraryEntry): Promise<'missing' | 'empty' | 'present'> {
+        const path = LibraryService.pathOf(entry.name);
+        if (!this._project.exists(path)) return 'missing';
+        try {
+            return (await this._project.readFile(path)).size === 0 ? 'empty' : 'present';
+        } catch (err) {
+            console.error('[Editor]', err);
+            return 'present';
+        }
+    }
+
     /** Installed = the file is on disk AND its class is registered. A registered
      *  class alone is not enough (the previous session's registry can outlive
      *  the project); neither is a stale or empty file whose class never loaded —
