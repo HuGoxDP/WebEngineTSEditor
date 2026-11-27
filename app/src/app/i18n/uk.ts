@@ -198,6 +198,9 @@ export const uk: Record<MessageKey, string> = {
     'insp.held': 'Об’єкт уже має один — об’єкт тримає лише один.',
     'insp.library': 'Бібліотека',
     'insp.libraryFailed': 'Поведінку «{name}» з бібліотеки не завантажено — перевірте помилку скрипта в Консолі.',
+    'insp.libraryReplaceTitle': 'Замінити «{name}»?',
+    'insp.libraryReplaceMessage': '{path} уже містить ваш власний код. Заміна бібліотечною версією видалить ваші зміни.',
+    'insp.libraryReplace': 'Замінити',
 
     'comp.reset': 'Скинути',
     'comp.addWaypoint': 'Додати точку',
