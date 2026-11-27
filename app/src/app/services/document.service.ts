@@ -1,4 +1,5 @@
-import { Injectable, computed, effect, inject, signal } from '@angular/core';
+import { Injectable, Injector, computed, effect, inject, signal } from '@angular/core';
+import { CodeEditorService } from './code-editor.service';
 import { HistoryService } from './history.service';
 import { PlayModeService } from './play-mode.service';
 import { ProjectService } from './project.service';
@@ -31,6 +32,7 @@ export class DocumentService {
     private readonly _scene = inject(SceneService);
     private readonly _settings = inject(SettingsService);
     private readonly _play = inject(PlayModeService);
+    private readonly _injector = inject(Injector);
 
     /** `HistoryService.revision` at the last save or load. */
     private readonly _savedRevision = signal(0);
@@ -56,7 +58,7 @@ export class DocumentService {
         });
 
         window.addEventListener('beforeunload', e => {
-            if (!this.dirty()) return;
+            if (!this.dirty() && !this._scriptDirty()) return;
             e.preventDefault();
             e.returnValue = '';   // required by some browsers for the prompt to show
         });
@@ -64,6 +66,20 @@ export class DocumentService {
         // The interval is a knob for the automated check, which cannot wait a minute.
         const override = Number(localStorage.getItem('wets:debug:autosaveMs'));
         setInterval(() => void this.autosaveNow(), override > 0 ? override : DEFAULT_AUTOSAVE_MS);
+    }
+
+    /**
+     * The open script's unsaved buffer deserves the browser's warning too.
+     * Resolved at event time, not in the constructor: CodeEditorService depends
+     * on services still being constructed here, so a direct injection would
+     * close a cycle. A failed lookup is treated as "no script dirty".
+     */
+    private _scriptDirty(): boolean {
+        try {
+            return this._injector.get(CodeEditorService).dirty();
+        } catch {
+            return false;
+        }
     }
 
     // ── Telling it what happened ─────────────────────────────────────

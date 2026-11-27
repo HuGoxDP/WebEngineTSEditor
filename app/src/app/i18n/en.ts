@@ -115,6 +115,8 @@ export const en = {
     'code.changedMessage': 'The script file was changed outside the editor, and you have unsaved changes here. Reload to take the version from disk, or keep yours.',
     'code.overwriteTitle': 'Replace the changed file?',
     'code.overwriteMessage': '{path} was changed outside the editor since you opened it. Saving will replace that version.',
+    'code.discardTitle': 'Discard unsaved changes?',
+    'code.discardMessage': '{name} has unsaved changes. Opening {path} replaces them.',
 
     // ── viewport ────────────────────────────────────────────────────
     'vp.pivot': 'Pivot',
