@@ -67,11 +67,30 @@ export class CodeEditorService {
         window.addEventListener('focus', () => void this.checkOutsideEdits());
     }
 
-    /** Reads `path` into the Code tab. A read failure is reported, not swallowed. */
+    /**
+     * Reads `path` into the Code tab. A read failure is reported, not swallowed.
+     * Returns false when the author declines to discard a dirty buffer, or the
+     * read failed — in both cases the current file and its buffer are untouched.
+     */
     public async open(path: string): Promise<boolean> {
-        let text: string;
+        const open = this.file();
+        // D2: reopening the file already shown keeps its unsaved buffer — no ask.
+        if (open?.path === path) return true;
+        // D3: a different file replaces a dirty buffer only after the author agrees.
+        if (open && this._dirty()) {
+            const discard = await this._dialog.confirm({
+                title: this._i18n.t('code.discardTitle'),
+                message: this._i18n.t('code.discardMessage', { name: open.name, path }),
+                confirmLabel: this._i18n.t('scene.replace'),
+                cancelLabel: this._i18n.t('dialog.cancel'),
+                danger: true,
+            });
+            if (!discard) return false;   // declined: no state change at all
+        }
         try {
-            text = await this._project.readText(path);
+            // The read is the failure check; the panel reads the text again for
+            // its model, so the value is deliberately not held here.
+            await this._project.readText(path);
         } catch (err) {
             // Through console, which the Console panel captures — so the failure
             // reaches the same place a compile diagnostic will.
@@ -81,6 +100,9 @@ export class CodeEditorService {
         this.file.set({ path, name: path.slice(path.lastIndexOf('/') + 1), language: languageOf(path) });
         this._dirty.set(false);
         this._revision.update(n => n + 1);
+        // D3: a model kept at this path can still hold an older edit (a discard
+        // does not dispose it). Force the panel to take the disk text afresh.
+        this.diskReload.update(n => n + 1);
         await this._stamp(path);
         return true;
     }
@@ -92,8 +114,12 @@ export class CodeEditorService {
      *
      * A file changed outside since the last read is never overwritten without
      * a say: the same question the focus check asks, here before the write.
+     *
+     * @param current - reads the live buffer after the write. Typing during the
+     *   awaited write must keep the file dirty (D5); the panel passes a closure
+     *   over its Monaco model, which stays valid even if the editor is disposed.
      */
-    public async save(text: string): Promise<boolean> {
+    public async save(text: string, current?: () => string): Promise<boolean> {
         const file = this.file();
         // A second press while a save is in flight is the same save: the first
         // has the buffer, and letting the second run would see the first's own
@@ -112,7 +138,9 @@ export class CodeEditorService {
                 console.error(`[Script] Could not save ${file.path}: ${String(err)}`);
                 return false;
             }
-            this._dirty.set(false);
+            // D5: the buffer may have moved while the write was in flight. Clear
+            // the mark only when it still equals what was actually written.
+            if (current === undefined || current() === text) this._dirty.set(false);
             this._revision.update(n => n + 1);
             await this._stamp(file.path);
             await this._reload();
@@ -179,7 +207,9 @@ export class CodeEditorService {
      * click from the Console works whether or not the Code tab was open.
      */
     public async reveal(path: string, line: number): Promise<void> {
-        if (this.file()?.path !== path) await this.open(path);
+        // D4: a declined discard leaves the current buffer in place — the jump
+        // must not fire either, or the Console would silently switch files.
+        if (!await this.open(path)) return;
         this.jumpTo.set({ path, line });
         this.showRequest.update(n => n + 1);
     }

@@ -94,7 +94,7 @@ export class CodeComponent implements AfterViewInit, OnDestroy {
             const file = this.code.file();
             if (!file || !this._editor) return;
             this._ready.set(false);
-            void this._sync(file);
+            void this._sync(file, true);
         });
     }
 
@@ -106,14 +106,23 @@ export class CodeComponent implements AfterViewInit, OnDestroy {
 
     /** Saves the buffer. The keyboard path is the panel's Ctrl+S, below. */
     public async save(): Promise<void> {
-        if (!this._editor) return;
-        await this.code.save(this._editor.getValue());
+        await this._saveBuffer();
+    }
+
+    /**
+     * Captures the model, not the editor: a tab switch during the awaited write
+     * disposes the editor but leaves the Monaco model alive, so the service can
+     * still compare the buffer with what it wrote (D5).
+     */
+    private async _saveBuffer(): Promise<void> {
+        const model = this._editor?.getModel();
+        if (!model) return;
+        await this.code.save(model.getValue(), () => model.getValue());
     }
 
     /** Monaco's own save, wired in `_mount` so the browser's Ctrl+S also lands here. */
     private async _saveFromEditor(): Promise<void> {
-        if (!this._editor) return;
-        await this.code.save(this._editor.getValue());
+        await this._saveBuffer();
     }
 
     /**
@@ -160,7 +169,7 @@ export class CodeComponent implements AfterViewInit, OnDestroy {
             if (!this._ready()) return;
             this.code.markEdited();
         });
-        await this._sync(file);
+        await this._sync(file, !this.code.dirty());
 
         // A Console row asked for this file before the editor existed — the
         // line is revealed once the model is in place.
@@ -173,8 +182,13 @@ export class CodeComponent implements AfterViewInit, OnDestroy {
         }
     }
 
-    /** Reads the file from the store into the model, without marking it dirty. */
-    private async _sync(file: { path: string; language: string }): Promise<void> {
+    /**
+     * Reads the file from the store into the model. The model is the buffer's
+     * source of truth across tab switches: Monaco keeps models by URI even after
+     * the editor is disposed, so a mount overwrites it only when the disk text
+     * is authoritative — a real open, a diskReload bump, or a clean mount.
+     */
+    private async _sync(file: { path: string; language: string }, force: boolean): Promise<void> {
         if (!this._editor) return;
         const monaco = this._monaco!;
         let text: string;
@@ -187,9 +201,17 @@ export class CodeComponent implements AfterViewInit, OnDestroy {
         // adds; the project path does not. Compare the whole URI, or the
         // second sync of one file creates a duplicate model and Monaco throws.
         const uri = monaco.Uri.parse(`file:///${file.path}`);
-        const model = monaco.editor.getModels().find(m => m.uri.toString() === uri.toString())
-            ?? monaco.editor.createModel(text, file.language, uri);
-        if (model.getValue() !== text) model.setValue(text);
+        let model = monaco.editor.getModels().find(m => m.uri.toString() === uri.toString());
+        if (!model) {
+            if (!force) {
+                // A dirty mount with no surviving model: the edit cannot be
+                // restored, so fall back to disk text and say so.
+                console.warn(`[Code] No saved model for ${file.path}; showing the disk version`);
+            }
+            model = monaco.editor.createModel(text, file.language, uri);
+        } else if (force && model.getValue() !== text) {
+            model.setValue(text);
+        }
         this._editor.setModel(model);
         this._ready.set(true);
     }
