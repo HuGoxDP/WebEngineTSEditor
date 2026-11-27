@@ -158,6 +158,9 @@ await runCheck(async () => {
     check("same-file reopen keeps the marker", (await readBuffer(page)).includes("C4R7_SAME"));
 
     // 5. Save writes the buffer and clears the dot; typing during the write does not (D5).
+    // Re-establish the dirty buffer so the save leg runs even when an older
+    // build dropped the mark on the preceding same-file reopen.
+    await pasteAll(page, A_TEXT + "// C4R7_SAME\n");
     await page.locator(".pane-btn.primary").click();
     await page.waitForTimeout(900);
     check("Save writes the typed buffer",
